@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -35,80 +34,6 @@ func (r *IdentityRepository) Create(ctx context.Context, identity *domain.Identi
 		return fmt.Errorf("failed to create identity: %w", err)
 	}
 	return nil
-}
-
-// ErrParentNotActive is returned by CreateUnderParent when, at insert time,
-// the parent is not an active, unexpired identity in the child's account and
-// project.
-var ErrParentNotActive = errors.New("parent identity is not active in this account and project")
-
-// CreateUnderParent inserts identity, whose ParentIdentityID is set, provided
-// that parent is still an active, unexpired identity in the same account and
-// project.
-//
-// The parent row is share-locked in the insert's transaction. A deactivation
-// of the parent updates that row, so the two serialize: either the
-// deactivation commits first and this insert is refused, or it waits for the
-// insert, and the cascade, which lists a parent's children only after the
-// parent's deactivation has committed, then finds the new child. Without the
-// lock, a child inserted while its parent was being deactivated could stay
-// active below a deactivated parent.
-//
-// Joins the caller's transaction when ctx carries one.
-func (r *IdentityRepository) CreateUnderParent(ctx context.Context, identity *domain.Identity) error {
-	if identity.ParentIdentityID == "" {
-		return errors.New("failed to create identity: CreateUnderParent needs a parent_identity_id")
-	}
-	insert := func(ctx context.Context, db bun.IDB) error {
-		var parentID string
-		err := db.NewSelect().
-			TableExpr("identities").
-			Column("id").
-			Where("id = ?", identity.ParentIdentityID).
-			Where("account_id = ?", identity.AccountID).
-			Where("project_id = ?", identity.ProjectID).
-			Where("status = ?", string(domain.IdentityStatusActive)).
-			Where("(expires_at IS NULL OR expires_at > ?)", time.Now()).
-			For("SHARE").
-			Scan(ctx, &parentID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrParentNotActive
-		}
-		if err != nil {
-			return fmt.Errorf("failed to lock parent identity: %w", err)
-		}
-		if _, err := db.NewInsert().Model(identity).Exec(ctx); err != nil {
-			return fmt.Errorf("failed to create identity: %w", err)
-		}
-		return nil
-	}
-
-	if tx, ok := txFromContext(ctx); ok {
-		return insert(ctx, tx)
-	}
-	return r.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-		return insert(ctx, tx)
-	})
-}
-
-// ListChildren returns the identities registered by any of parentIDs (their
-// direct children) within the given account and project, whatever their
-// status, in creation order. An empty parentIDs matches nothing.
-func (r *IdentityRepository) ListChildren(ctx context.Context, parentIDs []string, accountID, projectID string) ([]*domain.Identity, error) {
-	if len(parentIDs) == 0 {
-		return nil, nil
-	}
-	var identities []*domain.Identity
-	db := dbOrTx(ctx, r.db)
-	if err := db.NewSelect().Model(&identities).
-		Where("account_id = ?", accountID).
-		Where("project_id = ?", projectID).
-		Where("parent_identity_id IN (?)", bun.List(parentIDs)).
-		OrderExpr("created_at ASC, id ASC").
-		Scan(ctx); err != nil {
-		return nil, fmt.Errorf("list child identities: %w", err)
-	}
-	return identities, nil
 }
 
 // GetByID retrieves an identity by its UUID, scoped to account + project.
@@ -423,7 +348,9 @@ func (r *IdentityRepository) ListByOwnerForOffboard(ctx context.Context, ownerUs
 	err := dbOrTx(ctx, r.db).NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
 		Where("owner_user_id = ?", ownerUserID).
-		Where("status <> ?", string(domain.IdentityStatusDeactivated)).
+		// A deactivated identity still marked cascade_pending is listed too:
+		// its deactivation cascade did not finish, and the retry finishes it.
+		Where("(status <> ? OR cascade_pending_at IS NOT NULL)", string(domain.IdentityStatusDeactivated)).
 		OrderExpr("created_at ASC").
 		Scan(ctx)
 	if err != nil {
@@ -614,17 +541,6 @@ func (r *IdentityRepository) GetFacets(ctx context.Context, accountID, projectID
 // Update saves changes to an existing identity. Participates in a caller-
 // provided transaction via postgres.WithTx(ctx, tx); falls through to a
 // single auto-commit update otherwise.
-func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identity) error {
-	identity.ModifiedBy = middleware.GetCallerName(ctx)
-	db := dbOrTx(ctx, r.db)
-	_, err := db.NewUpdate().Model(identity).
-		Where("id = ? AND account_id = ? AND project_id = ?", identity.ID, identity.AccountID, identity.ProjectID).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to update identity: %w", err)
-	}
-	return nil
-}
 
 // Delete removes an identity.
 //
@@ -679,8 +595,12 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 	// modified_by must be set in the UPDATE itself — the audit trigger
 	// reads NEW.modified_by, so a caller_name on the context only reaches
 	// the audit log when it's written into this row's column.
+	// cascade_pending_at is set in the same UPDATE: the caller walks the
+	// identities below this one next, and a walk that does not finish is
+	// resumed from the mark (docs/identity-tree.md).
 	q := db.NewUpdate().Model(identity).
 		Set("status = ?", string(domain.IdentityStatusDeactivated)).
+		Set("cascade_pending_at = now()").
 		Set("updated_at = ?", time.Now())
 	if callerID := middleware.GetCallerName(ctx); callerID != "" {
 		q = q.Set("modified_by = ?", callerID)

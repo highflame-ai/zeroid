@@ -154,7 +154,9 @@ SDK / Cedar / DB contract for no functional gain).
 - An identity that another identity registered is that identity's child
   ([identity-tree.md](identity-tree.md)). A transition into `deactivated` or
   `expired`, by any path, deactivates every identity below it with the same key
-  and credential revocation; reactivation and suspension do not cascade.
+  and credential revocation; reactivation and suspension do not cascade, but
+  no identity below a suspended, deactivated or expired one receives a token,
+  and none can be reactivated while one above it is not active.
 
 ## Ownership: relaxed for `discovered` only
 

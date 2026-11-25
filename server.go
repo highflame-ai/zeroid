@@ -371,6 +371,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	reservedScopes := &service.ReservedScopes{}
 	apiKeySvc.SetReservedScopes(reservedScopes)
 	credentialSvc.SetReservedScopes(reservedScopes)
+	identitySvc.SetReservedScopes(reservedScopes)
+	identitySvc.SetTreeLimits(service.TreeLimits{MaxDepth: cfg.IdentityTree.MaxDepth, MaxChildren: cfg.IdentityTree.MaxChildren})
+	credentialSvc.SetAncestorChain(identityRepo.AncestorChain)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
 
 	// RevocationNotifier plumbing. One shared
@@ -1820,11 +1823,13 @@ var ErrClientNotOwned = errors.New("oauth client exists and is not owned by this
 
 // IsRegisteredBy reports whether the identity identityID, in the given
 // tenant, was registered by the identity parent names: whether that identity
-// is its parent (parent_identity_id). Name the parent by id, by WIMSE URI, or
-// both, as with WithCallerIdentity. Only the direct parent counts: an identity
-// is not registered by its grandparent. An identity outside the tenant, one
-// with no parent, or a reference that names no identity in the tenant reports
-// false; an error means the lookup itself failed.
+// is its parent (parent_identity_id), and that parent and every identity
+// above it are still active and unexpired. Name the parent by id, by WIMSE
+// URI, or both, as with WithCallerIdentity. Only the direct parent counts: an
+// identity is not registered by its grandparent. An identity outside the
+// tenant, one with no parent, a reference that names no identity in the
+// tenant, or a parent that is not active reports false; an error means the
+// lookup itself failed.
 //
 // Use it to authorize a calling identity's changes to identities it
 // registered, for example in the AdminAuth layer:

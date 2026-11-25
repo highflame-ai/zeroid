@@ -234,8 +234,12 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 	// from its parent; the request's created_by is the caller's to choose and
 	// must not name someone else.
 	keyCreatedBy := req.CreatedBy
+	keyExpiresAt := req.ExpiresAt
 	if identity.ParentIdentityID != "" {
 		keyCreatedBy = identity.OwnerUserID
+		// A child's expiry may have been capped at its parent's bound; the
+		// key goes no further.
+		keyExpiresAt = identity.ExpiresAt
 	}
 	skResp, err := s.apiKeySvc.CreateKey(ctx, CreateAPIKeyRequest{
 		AccountID:          req.AccountID,
@@ -244,7 +248,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		Name:               fmt.Sprintf("Agent: %s", req.Name),
 		IdentityID:         identity.ID,
 		CredentialPolicyID: apiKeyPolicyID,
-		ExpiresAt:          req.ExpiresAt,
+		ExpiresAt:          keyExpiresAt,
 	})
 	if err != nil {
 		// Compensating action — hard-purge the half-created identity if key

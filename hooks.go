@@ -515,8 +515,8 @@ func ReservedScopeWrite(ctx context.Context) bool {
 }
 
 // CallerIdentity names the registered identity an admin request was
-// authenticated as, when the caller is that identity acting as itself. Set
-// IdentityID, WIMSEURI or both (they must then agree). See WithCallerIdentity.
+// authenticated as, when the caller is that identity acting as itself, and
+// what the token it presented holds. See WithCallerIdentity.
 //
 // See internal/service/identity_tree.go for the canonical doc comment.
 type CallerIdentity = service.CallerIdentity
@@ -525,20 +525,37 @@ type CallerIdentity = service.CallerIdentity
 // registered identity, acting as itself. An identity registered by such a
 // request (POST /identities, POST /agents/register) becomes the caller's
 // child: it records the caller as parent_identity_id, takes the caller's
-// owner, takes the caller's allowed_scopes and credential policy where the
-// request names none, may hold no scope the caller cannot nor a trust_level
-// above the caller's, and is deactivated whenever the caller is. See
-// docs/identity-tree.md.
+// owner, takes what the caller and its token hold where the request names no
+// allowed_scopes or credential policy, may hold no scope, policy, trust level
+// or lifetime beyond the caller's and its token's, and is deactivated whenever
+// the caller is. Any other write such a request makes is held to the same
+// bound, and it can change no identity's owner. See docs/identity-tree.md.
 //
-// Set it in the AdminAuth layer, from the credential that layer verified, and
-// only when that credential is the identity's own: its API key, client
-// credentials or signed assertion, or a token issued to it for itself (no
-// actor, not held for a person). Never derive it from a header or body field
-// the client controls. The identity must belong to the account and project
-// the request is made in; a caller from another tenant, or one that is not
-// active, is refused with 403. Without the mark, registration is unchanged.
+// Set it in the AdminAuth layer, from an access token that layer verified,
+// and only when the token is the identity's own, issued to it for itself (no
+// act claim, not held for a person). Fill the fields from the verified
+// claims: WIMSEURI from sub (or IdentityID), Scopes from scopes, and APIKeyID
+// from api_key_id when present. Never derive any of them from a header or
+// body field the client controls. The identity must belong to the account and
+// project the request is made in; a caller from another tenant, or one that is
+// not active, is refused with 403. Without the mark, registration is unchanged.
 func WithCallerIdentity(ctx context.Context, c CallerIdentity) context.Context {
 	return service.WithCallerIdentity(ctx, c)
+}
+
+// WithTrustedOwnerWrite returns ctx marked as the deployer's trusted path,
+// which may change the owner_user_id of an identity registered by another
+// identity. Without it, such a change is refused with 403. A request marked
+// with WithCallerIdentity can change no identity's owner, with or without
+// this mark. Set it in the AdminAuth layer for the most trusted caller class
+// only.
+func WithTrustedOwnerWrite(ctx context.Context) context.Context {
+	return service.WithTrustedOwnerWrite(ctx)
+}
+
+// TrustedOwnerWrite reports whether ctx carries WithTrustedOwnerWrite.
+func TrustedOwnerWrite(ctx context.Context) bool {
+	return service.TrustedOwnerWrite(ctx)
 }
 
 // CallerIdentityFromContext returns the identity set by WithCallerIdentity.

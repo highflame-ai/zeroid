@@ -461,6 +461,15 @@ type Identity struct {
 	// identity below it. See docs/identity-tree.md.
 	ParentIdentityID string `bun:"parent_identity_id,type:uuid,nullzero" json:"parent_identity_id,omitempty"`
 
+	// CascadePendingAt marks a retired identity whose deactivation cascade
+	// (or, for an identity the cascade deactivated, whose own cleanup) has not
+	// been confirmed finished. It is set in the same UPDATE that retires the
+	// identity and cleared when the work completes; the cleanup worker and a
+	// repeated deactivation resume any identity that still carries it. Nil for
+	// every identity with nothing pending. Internal: never returned by the API.
+	// See docs/identity-tree.md.
+	CascadePendingAt *time.Time `bun:"cascade_pending_at,nullzero" json:"-"`
+
 	// Ownership and governance.
 	//
 	// CredentialPolicyID is the identity policy — the authority ceiling for

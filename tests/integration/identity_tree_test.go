@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,10 +39,23 @@ func (tn treeTenant) headers() map[string]string {
 	return map[string]string{"X-Account-ID": tn.account, "X-Project-ID": tn.project}
 }
 
-// as returns headers for a request authenticated as the identity with id.
+// treeTokenScopes are the scopes as() says the caller's token holds.
+var treeTokenScopes = []string{"data:read", "data:write"}
+
+// as returns headers for a request authenticated as the identity with id,
+// with a token holding treeTokenScopes.
 func (tn treeTenant) as(id string) map[string]string {
+	return tn.asWith(id, treeTokenScopes...)
+}
+
+// asWith returns headers for a request authenticated as the identity with
+// id, with a token holding scopes (none when empty).
+func (tn treeTenant) asWith(id string, scopes ...string) map[string]string {
 	h := tn.headers()
 	h[testCallerIdentityIDHeader] = id
+	if len(scopes) > 0 {
+		h[testCallerScopesHeader] = strings.Join(scopes, " ")
+	}
 	return h
 }
 
@@ -171,6 +185,7 @@ func TestIdentityTree_ParentFromAuthenticatedCaller(t *testing.T) {
 
 	byURI := tn.headers()
 	byURI[testCallerWIMSEHeader] = parent.WIMSEURI
+	byURI[testCallerScopesHeader] = "data:read"
 	assert.Equal(t, parent.ID, mustTreeIdentity(t, byURI, map[string]any{}).ParentIdentityID,
 		"the caller may be named by its WIMSE URI")
 
@@ -340,8 +355,8 @@ func TestIdentityTree_ScopeCeiling(t *testing.T) {
 	assert.Equal(t, []string{"data:read"}, getTreeIdentity(t, tn, child.ID).AllowedScopes, "a refused update changes nothing")
 
 	open := mustTreeIdentity(t, tn.headers(), map[string]any{})
-	anything := mustTreeIdentity(t, tn.as(open.ID), map[string]any{"allowed_scopes": []string{"admin:all"}})
-	assert.Equal(t, []string{"admin:all"}, anything.AllowedScopes, "nothing exceeds a parent with no ceiling")
+	anything := mustTreeIdentity(t, tn.asWith(open.ID, "admin:all"), map[string]any{"allowed_scopes": []string{"admin:all"}})
+	assert.Equal(t, []string{"admin:all"}, anything.AllowedScopes, "nothing but the token bounds a parent with no ceiling")
 }
 
 // TestIdentityTree_EmptyCeilingPolicyRefused verifies that a child of a
@@ -517,8 +532,13 @@ func TestIdentityTree_CascadeReachesThroughDeactivated(t *testing.T) {
 	status, raw := treeRequest(t, http.MethodDelete, adminPath("/identities/"+chain[1].ID), nil, tn.headers())
 	require.Equal(t, http.StatusOK, status, "%s", raw)
 	require.Equal(t, "deactivated", getTreeIdentity(t, tn, chain[3].ID).Status)
+	// Reactivating it below a deactivated identity is refused; a row left
+	// active there anyway (written directly, as a lost race once could) is
+	// what the walk must still reach.
 	status, raw = treeRequest(t, http.MethodPatch, adminPath("/identities/"+chain[3].ID), map[string]any{"status": "active"}, tn.headers())
-	require.Equal(t, http.StatusOK, status, "%s", raw)
+	require.Equal(t, http.StatusConflict, status, "%s", raw)
+	_, err := testDB.NewUpdate().TableExpr("identities").Set("status = 'active'").Where("id = ?", chain[3].ID).Exec(context.Background())
+	require.NoError(t, err)
 
 	status, raw = treeRequest(t, http.MethodDelete, adminPath("/identities/"+chain[0].ID), nil, tn.headers())
 	require.Equal(t, http.StatusOK, status, "%s", raw)
@@ -657,7 +677,7 @@ func TestIdentityTree_RegistrationRacingDeactivation(t *testing.T) {
 		require.NoError(t, err)
 
 		done := make(chan error, 1)
-		go func() { done <- repo.CreateUnderParent(ctx, treeChildRow(tn, parent.ID)) }()
+		go func() { done <- repo.CreateUnderParent(ctx, treeChildRow(tn, parent.ID), postgres.TreeLimits{}) }()
 		waitBlockedBy(t, pid)
 		require.NoError(t, tx.Commit())
 
@@ -673,7 +693,7 @@ func TestIdentityTree_RegistrationRacingDeactivation(t *testing.T) {
 
 		tx, pid := hold(t)
 		child := treeChildRow(tn, parent.ID)
-		require.NoError(t, repo.CreateUnderParent(postgres.WithTx(ctx, tx), child))
+		require.NoError(t, repo.CreateUnderParent(postgres.WithTx(ctx, tx), child, postgres.TreeLimits{}))
 
 		done := make(chan error, 1)
 		go func() {

@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/highflame-ai/zeroid/domain"
 )
@@ -37,72 +39,72 @@ func TestCheckChildCeilings(t *testing.T) {
 	}{
 		{
 			name:     "an open parent allows any child",
-			parent:   ceilingLayers{policy: open},
-			child:    ceilingLayers{rowScopes: []string{"x", "y"}, policy: open},
+			parent:   childLayers(nil, open),
+			child:    childLayers([]string{"x", "y"}, open),
 			rowNamed: true,
 		},
 		{
 			name:   "an open parent allows an open child",
-			parent: ceilingLayers{policy: open},
-			child:  ceilingLayers{policy: open},
+			parent: childLayers(nil, open),
+			child:  childLayers(nil, open),
 		},
 		{
 			name:   "a child that copied both layers equals its parent",
-			parent: ceilingLayers{rowScopes: []string{"a", "b"}, policy: open},
-			child:  ceilingLayers{rowScopes: []string{"a", "b"}, policy: open},
+			parent: childLayers([]string{"a", "b"}, open),
+			child:  childLayers([]string{"a", "b"}, open),
 		},
 		{
 			name:     "named allowed_scopes within the parent",
-			parent:   ceilingLayers{rowScopes: []string{"a", "b"}, policy: open},
-			child:    ceilingLayers{rowScopes: []string{"a"}, policy: open},
+			parent:   childLayers([]string{"a", "b"}, open),
+			child:    childLayers([]string{"a"}, open),
 			rowNamed: true,
 		},
 		{
 			name:     "named allowed_scopes outside the parent names the scope",
-			parent:   ceilingLayers{rowScopes: []string{"a", "b"}, policy: open},
-			child:    ceilingLayers{rowScopes: []string{"a", "c"}, policy: open},
+			parent:   childLayers([]string{"a", "b"}, open),
+			child:    childLayers([]string{"a", "c"}, open),
 			rowNamed: true,
 			wantErr:  `allowed_scopes lists "c"`,
 		},
 		{
 			name:     "named allowed_scopes is checked against the parent's policy too",
-			parent:   ceilingLayers{policy: onlyA},
-			child:    ceilingLayers{rowScopes: []string{"a", "b"}, policy: onlyA},
+			parent:   childLayers(nil, onlyA),
+			child:    childLayers([]string{"a", "b"}, onlyA),
 			rowNamed: true,
 			wantErr:  `allowed_scopes lists "b"`,
 		},
 		{
 			name:        "a named policy within the parent",
-			parent:      ceilingLayers{rowScopes: []string{"a", "b"}, policy: open},
-			child:       ceilingLayers{rowScopes: []string{"a", "b"}, policy: onlyA},
+			parent:      childLayers([]string{"a", "b"}, open),
+			child:       childLayers([]string{"a", "b"}, onlyA),
 			policyNamed: true,
 		},
 		{
 			name:        "a named policy outside the parent names the scope",
-			parent:      ceilingLayers{policy: ab},
-			child:       ceilingLayers{policy: withD},
+			parent:      childLayers(nil, ab),
+			child:       childLayers(nil, withD),
 			policyNamed: true,
 			wantErr:     `credential policy "with-d" lists "d"`,
 		},
 		{
 			name:        "a named policy with no ceiling is refused under a restricted parent",
-			parent:      ceilingLayers{rowScopes: []string{"a"}, policy: open},
-			child:       ceilingLayers{rowScopes: []string{"a"}, policy: open},
+			parent:      childLayers([]string{"a"}, open),
+			child:       childLayers([]string{"a"}, open),
 			policyNamed: true,
 			wantErr:     `credential policy "open" places no scope ceiling`,
 		},
 		{
 			name:        "a named policy with no ceiling is allowed under an open parent",
-			parent:      ceilingLayers{policy: open},
-			child:       ceilingLayers{policy: open},
+			parent:      childLayers(nil, open),
+			child:       childLayers(nil, open),
 			policyNamed: true,
 		},
 		{
 			// The escape this rule exists to stop: a restricted parent, a child
 			// on a policy with no ceiling, and nothing else restricting it.
 			name:     "a child left open under a restricted parent is refused",
-			parent:   ceilingLayers{rowScopes: []string{"a"}, policy: open},
-			child:    ceilingLayers{rowScopes: []string{}, policy: open},
+			parent:   childLayers([]string{"a"}, open),
+			child:    childLayers([]string{}, open),
 			rowNamed: true,
 			wantErr:  "would have no scope ceiling",
 		},
@@ -111,20 +113,20 @@ func TestCheckChildCeilings(t *testing.T) {
 			// it. Copying that policy is fine while the child's allowed_scopes
 			// removes b too; clearing allowed_scopes would expose it.
 			name:     "a copied policy wider than the parent is caught through the intersection",
-			parent:   ceilingLayers{rowScopes: []string{"a"}, policy: ab},
-			child:    ceilingLayers{rowScopes: []string{}, policy: ab},
+			parent:   childLayers([]string{"a"}, ab),
+			child:    childLayers([]string{}, ab),
 			rowNamed: true,
 			wantErr:  `the identity could hold "b"`,
 		},
 		{
 			name:   "a copied policy wider than the parent is fine while allowed_scopes narrows it",
-			parent: ceilingLayers{rowScopes: []string{"a"}, policy: ab},
-			child:  ceilingLayers{rowScopes: []string{"a"}, policy: ab},
+			parent: childLayers([]string{"a"}, ab),
+			child:  childLayers([]string{"a"}, ab),
 		},
 		{
 			name:        "named user_grant_scopes outside what the parent may hold for a person",
-			parent:      ceilingLayers{policy: forPersonA},
-			child:       ceilingLayers{policy: forPersonC},
+			parent:      childLayers(nil, forPersonA),
+			child:       childLayers(nil, forPersonC),
 			policyNamed: true,
 			wantErr:     `credential policy "for-person-c" lists "c" in user_grant_scopes`,
 		},
@@ -132,8 +134,8 @@ func TestCheckChildCeilings(t *testing.T) {
 			// The child's own authority (a) fits, but with no user_grant_scopes
 			// it could hold b for a person, which the parent cannot.
 			name:        "a child that could hold more for a person than its parent is refused",
-			parent:      ceilingLayers{policy: forPersonA},
-			child:       ceilingLayers{rowScopes: []string{"a", "b"}, policy: ab},
+			parent:      childLayers(nil, forPersonA),
+			child:       childLayers([]string{"a", "b"}, ab),
 			rowNamed:    true,
 			policyNamed: true,
 			wantErr:     `the identity could hold "b" for a person`,
@@ -201,9 +203,12 @@ func TestCallerIdentityContext(t *testing.T) {
 	if _, ok := CallerIdentityFromContext(context.Background()); ok {
 		t.Fatal("a bare context must carry no caller identity")
 	}
-	want := CallerIdentity{IdentityID: "0b4b4c5e-5b7a-4d36-9a52-1b9f6c0e7d11", WIMSEURI: "spiffe://example.org/a/p/agent/x"}
+	want := CallerIdentity{
+		IdentityID: "0b4b4c5e-5b7a-4d36-9a52-1b9f6c0e7d11", WIMSEURI: "spiffe://example.org/a/p/agent/x",
+		Scopes: []string{"data:read"}, APIKeyID: "5c0f8f8e-1d2b-4c3a-9e8f-7a6b5c4d3e2f",
+	}
 	got, ok := CallerIdentityFromContext(WithCallerIdentity(context.Background(), want))
-	if !ok || got != want {
+	if !ok || !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v (ok=%v), want %+v", got, ok, want)
 	}
 }
@@ -306,5 +311,154 @@ func TestCheckChildTrustRaise(t *testing.T) {
 				t.Errorf("refusal %v must wrap ErrExceedsParentTrust", err)
 			}
 		})
+	}
+}
+
+// TestCheckChildPolicy pins the full policy subset check a child's named
+// credential policy must pass against its parent's effective policy: same
+// scopes but a wider grant type, lifetime, delegation depth, principal, trust
+// or attestation requirement, or a later expiry, is refused.
+func TestCheckChildPolicy(t *testing.T) {
+	t.Parallel()
+	soon := time.Now().Add(time.Hour)
+	later := soon.Add(time.Hour)
+	parentPolicy := func() *domain.CredentialPolicy {
+		return &domain.CredentialPolicy{
+			ID: "11111111-1111-4111-8111-111111111111", Name: "parent", IsActive: true,
+			AllowedScopes:         []string{"read", "write"},
+			AllowedGrantTypes:     []string{"api_key"},
+			MaxTTLSeconds:         300,
+			MaxDelegationDepth:    0,
+			RequiredPrincipalType: "user",
+			RequiredTrustLevel:    "first_party",
+			RequiredAttestation:   "hardware",
+			ExpiresAt:             &soon,
+		}
+	}
+	svc := &IdentityService{policySvc: &CredentialPolicyService{}}
+	b := &treeBound{identity: &domain.Identity{}}
+	b.policy = parentPolicy()
+
+	same := parentPolicy()
+	same.ID, same.Name = "22222222-2222-4222-8222-222222222222", "same"
+	if err := svc.checkChildPolicy(b, same); err != nil {
+		t.Fatalf("an equal policy must pass: %v", err)
+	}
+
+	wider := map[string]func(p *domain.CredentialPolicy){
+		"grant types": func(p *domain.CredentialPolicy) {
+			p.AllowedGrantTypes = append(p.AllowedGrantTypes, "client_credentials")
+		},
+		"max ttl":       func(p *domain.CredentialPolicy) { p.MaxTTLSeconds = 7776000 },
+		"delegation":    func(p *domain.CredentialPolicy) { p.MaxDelegationDepth = 5 },
+		"principal":     func(p *domain.CredentialPolicy) { p.RequiredPrincipalType = "" },
+		"trust":         func(p *domain.CredentialPolicy) { p.RequiredTrustLevel = "" },
+		"attestation":   func(p *domain.CredentialPolicy) { p.RequiredAttestation = "" },
+		"later expiry":  func(p *domain.CredentialPolicy) { p.ExpiresAt = &later },
+		"no expiry":     func(p *domain.CredentialPolicy) { p.ExpiresAt = nil },
+		"another scope": func(p *domain.CredentialPolicy) { p.AllowedScopes = append(p.AllowedScopes, "admin") },
+	}
+	for name, widen := range wider {
+		child := parentPolicy()
+		child.ID, child.Name = "33333333-3333-4333-8333-333333333333", "child"
+		widen(child)
+		err := svc.checkChildPolicy(b, child)
+		if !errors.Is(err, ErrExceedsParentPolicy) || !errors.Is(err, ErrInvalidIdentityField) {
+			t.Errorf("%s: want ErrExceedsParentPolicy, got %v", name, err)
+		}
+	}
+
+	inactive := parentPolicy()
+	inactive.IsActive = false
+	if err := usablePolicy(inactive); err == nil {
+		t.Error("an inactive parent policy must refuse")
+	}
+	expired := parentPolicy()
+	past := time.Now().Add(-time.Minute)
+	expired.ExpiresAt = &past
+	if err := usablePolicy(expired); err == nil {
+		t.Error("an expired parent policy must refuse")
+	}
+}
+
+// TestCheckWithinToken pins the token layer: a child can hold no scope the
+// caller's token does not, and a token with no scopes lets it hold none.
+func TestCheckWithinToken(t *testing.T) {
+	t.Parallel()
+	b := &treeBound{identity: &domain.Identity{}, hasToken: true, tokenScopes: []string{"read"}}
+	open := policy("open", nil, nil)
+	if err := checkWithinToken(b, childLayers([]string{"read"}, open)); err != nil {
+		t.Fatalf("a child within the token: %v", err)
+	}
+	if err := checkWithinToken(b, childLayers([]string{"read", "write"}, open)); !errors.Is(err, ErrExceedsParentCeiling) {
+		t.Fatalf("a scope beyond the token: %v", err)
+	}
+	if err := checkWithinToken(b, childLayers(nil, open)); !errors.Is(err, ErrExceedsParentCeiling) {
+		t.Fatalf("an open child under a token: %v", err)
+	}
+	if err := checkWithinToken(b, childLayers([]string{"read"}, policy("p", nil, []string{"write"}))); err != nil {
+		t.Fatalf("user_grant_scopes are bounded by the row, which is within the token: %v", err)
+	}
+	none := &treeBound{identity: &domain.Identity{}, hasToken: true}
+	if err := checkWithinToken(none, childLayers([]string{"read"}, open)); !errors.Is(err, ErrExceedsParentCeiling) {
+		t.Fatalf("a token with no scopes: %v", err)
+	}
+	if s := (&IdentityService{}).inheritedScopes(none); len(s) != 0 {
+		t.Fatalf("a token with no scopes leaves nothing to inherit: %v", s)
+	}
+}
+
+// TestCheckExpiry pins the expiry cap: a child may not outlive the earliest
+// expiry above it, and naming none under a cap outlives it.
+func TestCheckExpiry(t *testing.T) {
+	t.Parallel()
+	limit := time.Now().Add(time.Hour)
+	b := &treeBound{identity: &domain.Identity{ID: "p"}, expiryCap: &limit}
+	before, after := limit.Add(-time.Minute), limit.Add(time.Minute)
+	if err := checkExpiry(b, &before); err != nil {
+		t.Fatalf("before the cap: %v", err)
+	}
+	if err := checkExpiry(b, &limit); err != nil {
+		t.Fatalf("at the cap: %v", err)
+	}
+	for name, at := range map[string]*time.Time{"after": &after, "never": nil} {
+		if err := checkExpiry(b, at); !errors.Is(err, ErrExceedsParentExpiry) {
+			t.Errorf("%s: want ErrExceedsParentExpiry, got %v", name, err)
+		}
+	}
+	if err := checkExpiry(&treeBound{identity: &domain.Identity{}}, nil); err != nil {
+		t.Fatalf("no cap: %v", err)
+	}
+	if got := earliest(&after, &before); !got.Equal(before) {
+		t.Fatalf("earliest: %v", got)
+	}
+}
+
+// TestCeilingLayersWithin pins the "no wider than stored" test a re-sent or
+// narrowing write passes.
+func TestCeilingLayersWithin(t *testing.T) {
+	t.Parallel()
+	open := policy("open", nil, nil)
+	stored := childLayers([]string{"a", "b"}, open)
+	if !stored.within(childLayers([]string{"a", "b"}, open)) || !stored.within(childLayers([]string{"a"}, open)) {
+		t.Fatal("equal or narrower must be within")
+	}
+	if stored.within(childLayers([]string{"a", "c"}, open)) || stored.within(childLayers(nil, open)) {
+		t.Fatal("wider or open must not be within")
+	}
+	if !childLayers(nil, open).within(childLayers([]string{"x"}, open)) {
+		t.Fatal("anything is within an open identity")
+	}
+}
+
+// TestTreeLimitsResolved pins the defaults and the hard depth cap.
+func TestTreeLimitsResolved(t *testing.T) {
+	t.Parallel()
+	got := TreeLimits{}.resolved()
+	if got.MaxDepth != DefaultTreeMaxDepth || got.MaxChildren != DefaultTreeMaxChildren {
+		t.Fatalf("defaults: %+v", got)
+	}
+	if got := (TreeLimits{MaxDepth: 1000, MaxChildren: 3}).resolved(); got.MaxDepth != 64 || got.MaxChildren != 3 {
+		t.Fatalf("capped: %+v", got)
 	}
 }

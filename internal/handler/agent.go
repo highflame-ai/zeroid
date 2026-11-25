@@ -38,14 +38,20 @@ func callerIdentity(ctx context.Context) *service.CallerIdentity {
 	return nil
 }
 
-// treeWriteError maps the registration-tree refusals: a registration the
-// calling identity may not make (403), and a deactivation that did not reach
-// every identity below the target (500, with a message that says the request
-// can be repeated). It returns nil for any other error.
+// treeWriteError maps the registration-tree refusals: a registration or
+// change the calling identity may not make, or an owner change outside the
+// trusted path (403); a tree limit, an activation below an inactive
+// identity or while a cascade is pending, or a write that raced a status
+// change (409); and a deactivation that did not reach every identity below
+// the target (500, with a message that says the request can be repeated).
+// It returns nil for any other error.
 func treeWriteError(err error) error {
 	switch {
-	case errors.Is(err, service.ErrParentIdentityRefused):
+	case errors.Is(err, service.ErrParentIdentityRefused), errors.Is(err, service.ErrOwnerWriteNotTrusted):
 		return huma.Error403Forbidden(err.Error())
+	case errors.Is(err, service.ErrIdentityTreeLimit), errors.Is(err, service.ErrAncestorNotActive),
+		errors.Is(err, service.ErrCascadeStillPending), errors.Is(err, service.ErrIdentityChanged):
+		return huma.Error409Conflict(err.Error())
 	case errors.Is(err, service.ErrCascadeIncomplete):
 		log.Error().Err(err).Msg("identity deactivation did not reach every identity below it")
 		return huma.Error500InternalServerError("the identity was deactivated, but not every identity it registered was; repeat the request to finish")

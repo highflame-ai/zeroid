@@ -284,13 +284,22 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		// write here previously demoted it, and with issuance judging the
 		// post-write identity, a first_party-gated policy then turned the
 		// verify into a rollback).
+		//
+		// The attestation level is the submitter's claim, so for an identity
+		// registered by another identity the promotion is capped at its
+		// parent's trust level: a child cannot attest its way above it.
 		promoted := identity
-		if promotedTrust := trustLevelForAttestation(locked.Level); domain.TrustLevelRank(string(promotedTrust)) > domain.TrustLevelRank(string(identity.TrustLevel)) {
+		promotedTrust, err := s.identitySvc.capTrustAtParent(ctx, identity, trustLevelForAttestation(locked.Level))
+		if err != nil {
+			return err
+		}
+		if domain.TrustLevelRank(string(promotedTrust)) > domain.TrustLevelRank(string(identity.TrustLevel)) {
 			updated, err := s.identitySvc.UpdateIdentity(ctx, locked.IdentityID, accountID, projectID, UpdateIdentityRequest{
 				TrustLevel: promotedTrust,
-				// Earned by the verified proof, not chosen by the caller, so a
-				// registered child is not capped at its parent's level here.
-				trustFromAttestation: true,
+				// Earned by the verified proof, not chosen by the caller, so
+				// a request authenticated as an identity is not held to that
+				// identity's level; the parent's cap is applied above.
+				trustEarnedByProof: true,
 			})
 			if err != nil {
 				return fmt.Errorf("failed to promote identity trust level: %w", err)

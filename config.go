@@ -64,6 +64,10 @@ type Config struct {
 
 	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
 
+	// IdentityTree bounds the trees identities build by registering other
+	// identities. See IdentityTreeConfig and docs/identity-tree.md.
+	IdentityTree IdentityTreeConfig `koanf:"identity_tree"`
+
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
 
@@ -86,6 +90,28 @@ type Config struct {
 	// Federation chooses where trusted issuers come from and how they are
 	// fetched (ADR 0042 D4). See docs/external-issuers.md.
 	Federation FederationConfig `koanf:"federation"`
+}
+
+// IdentityTreeConfig bounds registration trees: the identities an identity
+// registers while acting as itself, theirs, and so on. A registration that
+// would exceed a limit is refused with 409. Zero takes the default.
+type IdentityTreeConfig struct {
+	// MaxDepth is the most identities that may sit above any identity (an
+	// identity registered by an admin is at depth 0). Default 8, at most 64.
+	MaxDepth int `koanf:"max_depth"`
+	// MaxChildren is the most children, not deactivated, one identity may
+	// have. Default 1000.
+	MaxChildren int `koanf:"max_children"`
+}
+
+func (c IdentityTreeConfig) validate() error {
+	if c.MaxDepth < 0 || c.MaxDepth > postgres.MaxTreeDepth {
+		return fmt.Errorf("identity_tree.max_depth must be between 1 and %d (0 for the default), got %d", postgres.MaxTreeDepth, c.MaxDepth)
+	}
+	if c.MaxChildren < 0 {
+		return fmt.Errorf("identity_tree.max_children must be positive (0 for the default), got %d", c.MaxChildren)
+	}
+	return nil
 }
 
 // FederationConfig governs per-account trusted issuers.
@@ -848,6 +874,9 @@ func (c *Config) Validate() error {
 		if service.ReservedClientIDKey(p) == "" {
 			return fmt.Errorf("reserved_client_ids.prefixes: an empty prefix would reserve every client id")
 		}
+	}
+	if err := c.IdentityTree.validate(); err != nil {
+		return err
 	}
 	if err := c.ServiceTokens.validate(); err != nil {
 		return err

@@ -44,6 +44,11 @@ type IdentityService struct {
 	credentialSvc *CredentialService
 	signalSvc     *SignalService
 	wimseDomain   string
+	// treeLimits bound registration trees (SetTreeLimits).
+	treeLimits postgres.TreeLimits
+	// reserved are the deployer's reserved scopes, which never pass to a
+	// child identity (SetReservedScopes). Nil-safe.
+	reserved *ReservedScopes
 }
 
 // NewIdentityService creates a new IdentityService. policySvc must be non-nil —
@@ -71,6 +76,7 @@ func NewIdentityService(
 		credentialSvc: credentialSvc,
 		signalSvc:     signalSvc,
 		wimseDomain:   wimseDomain,
+		treeLimits:    TreeLimits{}.resolved(),
 	}
 }
 
@@ -177,9 +183,9 @@ type RegisterIdentityRequest struct {
 	// internal paths (discovery ingest, service-identity provisioning). When
 	// set, the new identity becomes its child (docs/identity-tree.md): it
 	// records the caller as its parent, takes the caller's owner and, for any
-	// of allowed_scopes and credential_policy_id the request leaves empty, the
-	// caller's own, and may hold no scope the caller cannot nor a trust level
-	// above the caller's.
+	// of allowed_scopes and credential_policy_id the request leaves empty, what
+	// the caller holds, and may hold no scope, policy, trust level or lifetime
+	// beyond the caller's and its token's.
 	RegisteredBy *CallerIdentity
 }
 
@@ -202,13 +208,16 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	// its parent. Resolved first, so what is inherited passes the same checks
 	// below as a value the request named: an inherited ciba:approve still
 	// needs a trusted approval-channel write.
-	var parent *registeringParent
+	var parent *treeBound
 	rowNamed := len(req.AllowedScopes) > 0
 	policyNamed := req.CredentialPolicyID != ""
 	if req.RegisteredBy != nil {
-		p, err := s.resolveRegisteringParent(ctx, *req.RegisteredBy, req.AccountID, req.ProjectID)
+		p, err := s.resolveCaller(ctx, *req.RegisteredBy, req.AccountID, req.ProjectID)
 		if err != nil {
 			return nil, err
+		}
+		if p.identity.OwnerUserID == "" {
+			return nil, fmt.Errorf("%w: the calling identity has no owner_user_id for its children to inherit", ErrParentIdentityRefused)
 		}
 		parent = p
 		req.OwnerUserID = p.identity.OwnerUserID
@@ -219,13 +228,31 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 			return nil, err
 		}
 		req.TrustLevel = level
-		if !rowNamed {
-			req.AllowedScopes = slices.Clone(p.identity.AllowedScopes)
+		if rowNamed {
+			if err := s.refuseReserved("allowed_scopes", req.AllowedScopes); err != nil {
+				return nil, err
+			}
+		} else {
+			// What both the parent's ceiling and its token allow.
+			req.AllowedScopes = s.inheritedScopes(p)
+			if len(req.AllowedScopes) == 0 {
+				return nil, ceilingError("the calling token holds no scope within the parent's ceiling for the identity to inherit; name allowed_scopes the token holds")
+			}
 		}
-		// Naming the parent's own policy is the same as inheriting it.
-		if !policyNamed || req.CredentialPolicyID == p.policy.ID {
+		// Naming the parent's effective policy is the same as inheriting it.
+		if !policyNamed || sameUUID(req.CredentialPolicyID, p.policy.ID) {
 			policyNamed = false
 			req.CredentialPolicyID = p.policy.ID
+		}
+		// A child outlives neither its parent, nor any identity above it,
+		// nor the API key its parent presented. Naming no expiry takes the
+		// earliest of those.
+		if req.ExpiresAt == nil && p.expiryCap != nil {
+			capped := *p.expiryCap
+			req.ExpiresAt = &capped
+		}
+		if err := checkExpiry(p, req.ExpiresAt); err != nil {
+			return nil, err
 		}
 	}
 
@@ -328,15 +355,20 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		return nil, err
 	}
 
-	// A child may hold no scope its parent cannot (docs/identity-tree.md).
+	// A child may hold no scope, and no policy, its parent or the parent's
+	// token cannot (docs/identity-tree.md).
 	parentID := ""
 	if parent != nil {
 		childPolicy, err := s.policySvc.GetPolicy(ctx, policyID, req.AccountID, req.ProjectID)
 		if err != nil {
 			return nil, fmt.Errorf("credential policy %s: %w", policyID, err)
 		}
-		child := ceilingLayers{rowScopes: req.AllowedScopes, policy: childPolicy}
-		if err := checkChildCeilings(parent.layers(), child, rowNamed, policyNamed); err != nil {
+		if policyNamed {
+			if err := s.refuseReserved(fmt.Sprintf("credential policy %q", childPolicy.Name), append(slices.Clone(childPolicy.AllowedScopes), childPolicy.UserGrantScopes...)); err != nil {
+				return nil, err
+			}
+		}
+		if err := s.checkBoundCeilings(parent, childLayers(req.AllowedScopes, childPolicy), rowNamed, policyNamed); err != nil {
 			return nil, err
 		}
 		parentID = parent.identity.ID
@@ -387,14 +419,17 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 
 	create := s.repo.Create
 	if parentID != "" {
-		// Inserted under a lock on the parent row, so a concurrent
-		// deactivation of the parent either refuses this insert or reaches the
-		// new child when it walks the parent's descendants.
-		create = s.repo.CreateUnderParent
+		// Inserted under locks on the parent and every identity above it, so
+		// a concurrent deactivation of any of them either refuses this insert
+		// or reaches the new child when it walks its descendants. The tree
+		// limits are checked under the same locks.
+		create = func(ctx context.Context, identity *domain.Identity) error {
+			return s.repo.CreateUnderParent(ctx, identity, s.treeLimits)
+		}
 	}
 	if err := create(ctx, identity); err != nil {
-		if errors.Is(err, postgres.ErrParentNotActive) {
-			return nil, fmt.Errorf("%w: the calling identity is no longer active", ErrParentIdentityRefused)
+		if errors.Is(err, postgres.ErrParentNotActive) || errors.Is(err, postgres.ErrTreeTooDeep) || errors.Is(err, postgres.ErrTooManyChildren) {
+			return nil, treeStoreError(err)
 		}
 		if isDuplicateKeyError(err) {
 			// Distinguish a collision with a DEACTIVATED (soft-deleted) identity
@@ -668,8 +703,8 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 		identity.WIMSEURI = newURI
 	}
 	identity.UpdatedAt = time.Now()
-	if err := s.repo.Update(ctx, identity); err != nil {
-		return nil, false, err
+	if err := s.repo.Update(ctx, identity, postgres.IdentityUpdate{PriorStatus: identity.Status}); err != nil {
+		return nil, false, treeStoreError(err)
 	}
 	return identity, false, nil
 }
@@ -891,8 +926,8 @@ func (s *IdentityService) SetPublicKey(ctx context.Context, id, accountID, proje
 	}
 	identity.PublicKeyPEM = publicKeyPEM
 	identity.PublicKeyChannelTrusted = TrustedApprovalChannelWrite(ctx)
-	if err := s.repo.Update(ctx, identity); err != nil {
-		return nil, err
+	if err := s.repo.Update(ctx, identity, postgres.IdentityUpdate{PriorStatus: identity.Status}); err != nil {
+		return nil, treeStoreError(err)
 	}
 	return identity, nil
 }
@@ -986,11 +1021,12 @@ type UpdateIdentityRequest struct {
 	//   pointer to ""          → clear to NULL (remove expiry, extend forever)
 	//   pointer to RFC3339 str → set new expiry
 	ExpiresAt *string
-	// trustFromAttestation marks TrustLevel as earned by a verified
-	// attestation rather than chosen by the caller. Only then may a child's
-	// trust level rise above its parent's. Unexported, so only this package
-	// (AttestationService) can set it.
-	trustFromAttestation bool
+	// trustEarnedByProof marks TrustLevel as earned by a verified
+	// attestation rather than chosen by the caller, so a request
+	// authenticated as an identity is not held to that identity's level. A
+	// child is still held to its parent's: AttestationService caps the level
+	// first (capTrustAtParent). Unexported, so only this package can set it.
+	trustEarnedByProof bool
 }
 
 // UpdateIdentity updates mutable fields of an existing identity.
@@ -1013,6 +1049,9 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if err != nil {
 		return nil, err
 	}
+	// stored keeps the row as read, for the checks that compare a write with
+	// what it replaces.
+	stored := *identity
 	if req.Name != "" {
 		identity.Name = req.Name
 	}
@@ -1038,7 +1077,17 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		!identity.SubType.ValidForIdentityType(identity.IdentityType) {
 		return nil, fmt.Errorf("%w: invalid sub_type %q for identity_type %q", ErrInvalidIdentityField, identity.SubType, identity.IdentityType)
 	}
-	if req.OwnerUserID != "" {
+	if req.OwnerUserID != "" && req.OwnerUserID != identity.OwnerUserID {
+		// The owner is who rotations are attributed to and whom four-eyes
+		// approvals exclude. An identity never changes it (it could hand
+		// itself, or its children, to a person of its choosing), and a
+		// child's changes only through the deployer's trusted path.
+		if _, byIdentity := CallerIdentityFromContext(ctx); byIdentity {
+			return nil, ErrOwnerWriteNotTrusted
+		}
+		if identity.ParentIdentityID != "" && !TrustedOwnerWrite(ctx) {
+			return nil, ErrOwnerWriteNotTrusted
+		}
 		identity.OwnerUserID = req.OwnerUserID
 	}
 	if req.AllowedScopes != nil {
@@ -1102,35 +1151,43 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		}
 		identity.Status = *req.Status
 	}
-	// A child's scope ceilings and trust level stay within its parent's
-	// (docs/identity-tree.md), so a write to any of them loads the parent to
-	// check against. A trust level a verified attestation earned is not capped.
-	capTrust := req.TrustLevel != "" && !req.trustFromAttestation
-	var parent *registeringParent
-	if identity.ParentIdentityID != "" && (req.AllowedScopes != nil || req.CredentialPolicyID != nil || capTrust) {
+	// A child's scope ceilings, credential policy, trust level and expiry
+	// stay within its parent's, and a request authenticated as an identity
+	// cannot give any identity more than that identity holds
+	// (docs/identity-tree.md). A write to any of them loads the bounds.
+	callerRef, byIdentity := CallerIdentityFromContext(ctx)
+	capTrust := req.TrustLevel != ""
+	boundedWrite := req.AllowedScopes != nil || req.CredentialPolicyID != nil || capTrust || req.ExpiresAt != nil
+	var parent, caller *treeBound
+	if identity.ParentIdentityID != "" && boundedWrite {
 		if parent, err = s.loadParent(ctx, identity); err != nil {
 			return nil, err
 		}
 	}
-	if parent != nil && capTrust {
+	if byIdentity && boundedWrite {
+		if caller, err = s.resolveCaller(ctx, callerRef, accountID, projectID); err != nil {
+			return nil, err
+		}
+	}
+	if capTrust && parent != nil {
 		if err := checkChildTrustRaise(priorTrust, req.TrustLevel, parent.identity.TrustLevel); err != nil {
 			return nil, err
 		}
 	}
-	policyNamed := false
+	if capTrust && caller != nil && !req.trustEarnedByProof {
+		if err := checkChildTrustRaise(priorTrust, req.TrustLevel, caller.identity.TrustLevel); err != nil {
+			return nil, err
+		}
+	}
 	if req.CredentialPolicyID != nil {
 		supplied := *req.CredentialPolicyID
-		if parent != nil {
-			if supplied == "" {
-				// A child's default is its parent's policy, not the tenant
-				// default, which may place no ceiling at all.
-				if err := requireTrustedPolicyAttachment(ctx, s.policySvc, parent.policy.ID, identity.AccountID, identity.ProjectID); err != nil {
-					return nil, err
-				}
-				supplied = parent.policy.ID
+		if parent != nil && supplied == "" {
+			// A child's default is its parent's policy, not the tenant
+			// default, which may place no ceiling at all.
+			if err := requireTrustedPolicyAttachment(ctx, s.policySvc, parent.policy.ID, identity.AccountID, identity.ProjectID); err != nil {
+				return nil, err
 			}
-			// Naming the parent's own policy is the same as inheriting it.
-			policyNamed = supplied != parent.policy.ID
+			supplied = parent.policy.ID
 		}
 		policyID, err := s.resolveIdentityPolicyID(ctx, identity.AccountID, identity.ProjectID, supplied)
 		if err != nil {
@@ -1138,13 +1195,13 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		}
 		identity.CredentialPolicyID = policyID
 	}
-	if parent != nil {
-		childPolicy, err := s.ResolveCredentialPolicy(ctx, identity)
-		if err != nil {
+	if req.AllowedScopes != nil && (parent != nil || caller != nil) {
+		if err := s.refuseReserved("allowed_scopes", req.AllowedScopes); err != nil {
 			return nil, err
 		}
-		child := ceilingLayers{rowScopes: identity.AllowedScopes, policy: childPolicy}
-		if err := checkChildCeilings(parent.layers(), child, req.AllowedScopes != nil, policyNamed); err != nil {
+	}
+	if (req.AllowedScopes != nil || req.CredentialPolicyID != nil) && (parent != nil || caller != nil) {
+		if err := s.checkCeilingWrite(ctx, &stored, identity, req.AllowedScopes != nil, req.CredentialPolicyID != nil, parent, caller); err != nil {
 			return nil, err
 		}
 	}
@@ -1176,10 +1233,39 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		} else {
 			identity.ExpiresAt = &t
 		}
+		// Bringing an expiry forward is always allowed; anything else must
+		// stay within the parent's and the caller's.
+		earlier := stored.ExpiresAt != nil && identity.ExpiresAt != nil && !identity.ExpiresAt.After(*stored.ExpiresAt)
+		if !earlier {
+			if err := checkExpiry(parent, identity.ExpiresAt); err != nil {
+				return nil, err
+			}
+			if err := checkExpiry(caller, identity.ExpiresAt); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	upd := postgres.IdentityUpdate{PriorStatus: priorStatus}
+	if identity.Status != priorStatus {
+		if identity.Status == domain.IdentityStatusActive {
+			// Not while the identities below it are still being retired, and,
+			// for a child, only while every identity above it is active: the
+			// ancestors are locked for the write, so a concurrent
+			// deactivation of one either waits for it and then reaches this
+			// identity, or commits first and refuses it.
+			if stored.CascadePendingAt != nil {
+				return nil, ErrCascadeStillPending
+			}
+			upd.RequireActiveAncestors = identity.ParentIdentityID != ""
+		}
+		// Retiring marks the identity in the same UPDATE, so a walk below it
+		// that does not finish is resumed from the mark.
+		upd.MarkCascadePending = retiredStatus(identity.Status) && !retiredStatus(priorStatus)
 	}
 	identity.UpdatedAt = time.Now()
-	if err := s.repo.Update(ctx, identity); err != nil {
-		return nil, err
+	if err := s.repo.Update(ctx, identity, upd); err != nil {
+		return nil, treeStoreError(err)
 	}
 
 	// Fresh transition into deactivated or expired: sweep linked API keys,
@@ -1187,17 +1273,14 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	// Centralized here so every update path (PUT /identities/{id},
 	// AgentService.DeactivateAgent, or any programmatic caller) runs the same
 	// cleanup.
+	var cleanupErr error
 	if priorStatus != domain.IdentityStatusDeactivated &&
 		identity.Status == domain.IdentityStatusDeactivated {
-		reason := "identity_deactivated"
-		if inDeactivationCascade(ctx) {
-			reason = reasonParentDeactivated
-		}
-		s.runDeactivationCleanup(ctx, identity, reason)
+		cleanupErr = s.deactivationCleanup(ctx, identity, "identity_deactivated")
 	}
 	if priorStatus != domain.IdentityStatusExpired &&
 		identity.Status == domain.IdentityStatusExpired {
-		s.runDeactivationCleanup(ctx, identity, "expired")
+		cleanupErr = s.deactivationCleanup(ctx, identity, "expired")
 	}
 	// Fresh transition into suspended: the identity can already mint nothing
 	// (IsUsable), so cut off what it still holds. See runSuspensionCleanup.
@@ -1205,17 +1288,70 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		identity.Status == domain.IdentityStatusSuspended {
 		s.runSuspensionCleanup(ctx, identity)
 	}
-	// Deactivating or expiring an identity deactivates every identity below it
-	// in the registration tree (docs/identity-tree.md). Run on every write of
-	// such a status, not only on a fresh transition, so that repeating the
-	// request finishes a cascade an earlier attempt left incomplete.
-	// Reactivation does not reach below the identity.
-	if req.Status != nil && retiredStatus(identity.Status) {
-		if err := s.deactivateDescendants(ctx, identity); err != nil {
+	// Retiring an identity deactivates every identity below it in the
+	// registration tree (docs/identity-tree.md); re-sending the retired status
+	// finishes a walk an earlier attempt left marked. The walk is detached
+	// from the request's cancellation: a client that goes away does not stop
+	// it. Reactivation does not reach below the identity.
+	switch {
+	case upd.MarkCascadePending:
+		now := time.Now()
+		identity.CascadePendingAt = &now
+		if err := s.finishCascade(context.WithoutCancel(ctx), identity, cleanupErr != nil); err != nil {
+			return nil, err
+		}
+	case req.Status != nil && retiredStatus(identity.Status) && stored.CascadePendingAt != nil:
+		identity.CascadePendingAt = stored.CascadePendingAt
+		if err := s.resumeCascade(context.WithoutCancel(ctx), identity); err != nil {
 			return nil, err
 		}
 	}
 	return identity, nil
+}
+
+// checkCeilingWrite holds a write to an identity's allowed_scopes or
+// credential policy within the bounds that apply: its parent's (parent, nil
+// for an identity with none) and the calling identity's (caller, nil when
+// the request is not authenticated as one). A write that leaves the identity
+// no wider than it was (scopes within the stored ones, and a policy that is
+// the stored one or a subset of it) is always allowed: re-sending an
+// unchanged value after a parent was narrowed is not an escalation.
+func (s *IdentityService) checkCeilingWrite(ctx context.Context, stored, next *domain.Identity, rowNamed, policyWritten bool, parent, caller *treeBound) error {
+	storedPolicy, err := s.ResolveCredentialPolicy(ctx, stored)
+	if err != nil {
+		return err
+	}
+	nextPolicy, err := s.ResolveCredentialPolicy(ctx, next)
+	if err != nil {
+		return err
+	}
+	priorLayers, nextLayers := childLayers(stored.AllowedScopes, storedPolicy), childLayers(next.AllowedScopes, nextPolicy)
+	samePolicy := sameUUID(storedPolicy.ID, nextPolicy.ID)
+	if priorLayers.within(nextLayers) {
+		if samePolicy {
+			return nil
+		}
+		if s.policySvc.EnforceSubset(nextPolicy, storedPolicy) == nil &&
+			(storedPolicy.ExpiresAt == nil || (nextPolicy.ExpiresAt != nil && !nextPolicy.ExpiresAt.After(*storedPolicy.ExpiresAt))) {
+			return nil
+		}
+	}
+	for _, b := range []*treeBound{parent, caller} {
+		if b == nil {
+			continue
+		}
+		// Naming the bound's own policy is the same as inheriting it.
+		policyNamed := policyWritten && !sameUUID(nextPolicy.ID, b.policy.ID)
+		if policyNamed {
+			if err := s.refuseReserved(fmt.Sprintf("credential policy %q", nextPolicy.Name), append(slices.Clone(nextPolicy.AllowedScopes), nextPolicy.UserGrantScopes...)); err != nil {
+				return err
+			}
+		}
+		if err := s.checkBoundCeilings(b, nextLayers, rowNamed, policyNamed); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // EnsureServiceIdentity returns the service identity for a given external ID within a tenant,
@@ -1306,11 +1442,12 @@ func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, erro
 		if !claimed {
 			continue
 		}
-		s.runDeactivationCleanup(ctx, identity, "expired")
-		// The identities below an expired one go with it. A failure is
-		// reported here and finished by deactivating the identity again
-		// (DELETE /identities/{id} is idempotent).
-		if err := s.deactivateDescendants(ctx, identity); err != nil {
+		cleanupErr := s.deactivationCleanup(ctx, identity, "expired")
+		// The identities below an expired one go with it. DeactivateIfActive
+		// marked the identity in the same UPDATE, so a walk this pass does not
+		// finish (a canceled pass, a failed step) is resumed below, on the
+		// next pass, or by deactivating the identity again.
+		if err := s.finishCascade(ctx, identity, cleanupErr != nil); err != nil {
 			log.Error().Err(err).
 				Str("identity_id", identity.ID).
 				Str("account_id", identity.AccountID).
@@ -1321,6 +1458,11 @@ func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, erro
 	}
 	if count > 0 {
 		log.Info().Int("count", count).Msg("sweep: deactivated expired identities")
+	}
+	// Finish deactivation cascades that an earlier request or pass left
+	// marked (docs/identity-tree.md).
+	if _, err := s.ResumePendingCascades(ctx); err != nil {
+		log.Error().Err(err).Msg("sweep: failed to list pending deactivation cascades")
 	}
 	return count, nil
 }
@@ -1354,7 +1496,7 @@ func (s *IdentityService) PurgeIdentity(ctx context.Context, id, accountID, proj
 		return s.repo.Delete(ctx, id, accountID, projectID)
 	}
 	s.runDeactivationCleanup(ctx, identity, "identity_deleted")
-	if err := s.deactivateDescendants(ctx, identity); err != nil {
+	if err := s.walkBelow(context.WithoutCancel(ctx), identity); err != nil {
 		return err
 	}
 	return s.repo.Delete(ctx, id, accountID, projectID)
@@ -1388,7 +1530,7 @@ func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID,
 	}
 
 	if identity.Status == domain.IdentityStatusDeactivated {
-		if err := s.deactivateDescendants(ctx, identity); err != nil {
+		if err := s.resumeCascade(context.WithoutCancel(ctx), identity); err != nil {
 			return nil, err
 		}
 		return identity, nil
@@ -1478,6 +1620,10 @@ func (s *IdentityService) OffboardOwner(ctx context.Context, ownerUserID, accoun
 	if err != nil {
 		return nil, err
 	}
+	// One run for the whole loop: an owner's identities often registered
+	// each other (a child inherits its parent's owner), and each subtree is
+	// walked once, not once per listed identity.
+	ctx = withCascadeRun(ctx)
 
 	result := &OffboardResult{}
 	for _, identity := range identities {
@@ -1539,7 +1685,7 @@ func (s *IdentityService) ExpireIdentity(ctx context.Context, id, accountID, pro
 	}
 
 	if identity.Status == domain.IdentityStatusExpired {
-		if err := s.deactivateDescendants(ctx, identity); err != nil {
+		if err := s.resumeCascade(context.WithoutCancel(ctx), identity); err != nil {
 			return nil, err
 		}
 		return identity, nil
@@ -1612,13 +1758,14 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 		if err != nil {
 			return nil, fmt.Errorf("resolve default policy on dismiss: %w", err)
 		}
+		prior := identity.Status
 		identity.Status = domain.IdentityStatusDiscovered
 		identity.OwnerUserID = ""
 		identity.CredentialPolicyID = defaultPolicyID
 		identity.AdoptedAt = nil
 		identity.UpdatedAt = time.Now()
-		if err := s.repo.Update(ctx, identity); err != nil {
-			return nil, err
+		if err := s.repo.Update(ctx, identity, postgres.IdentityUpdate{PriorStatus: prior}); err != nil {
+			return nil, treeStoreError(err)
 		}
 		return identity, nil
 	}
@@ -1635,12 +1782,23 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 // CAE signal payload so subscribers can distinguish "deactivated" from
 // "deleted" cleanups.
 func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *domain.Identity, reason string) {
+	_ = s.deactivationCleanup(ctx, identity, reason)
+}
+
+// deactivationCleanup is runDeactivationCleanup returning what failed, for
+// the callers that keep an identity marked cascade_pending until its cleanup
+// succeeds. Every step still runs, and is logged, when an earlier one fails.
+func (s *IdentityService) deactivationCleanup(ctx context.Context, identity *domain.Identity, reason string) error {
+	var errs []error
 	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identity.ID, revocationActor(ctx, "identity_revocation"), reason); err != nil {
 		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
 			Msg("identity cleanup: failed to revoke linked API keys")
+		errs = append(errs, fmt.Errorf("revoke API keys: %w", err))
 	}
 
-	s.revokeActiveCredentials(ctx, identity, reason)
+	if err := s.revokeActiveCredentials(ctx, identity, reason); err != nil {
+		errs = append(errs, err)
+	}
 
 	// Auto-expiry gets its own signal type so CAE subscribers can filter
 	// the indexed signal_type column directly (e.g. for offboarding-driven
@@ -1651,7 +1809,10 @@ func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *
 	if reason == "expired" {
 		signalType = domain.SignalTypeIdentityExpired
 	}
-	s.emitLifecycleSignal(ctx, identity, signalType, reason)
+	if err := s.emitLifecycleSignal(ctx, identity, signalType, reason); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // runSuspensionCleanup cuts off the credentials a suspended identity already
@@ -1667,26 +1828,30 @@ func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *
 // reactivated identity mints fresh credentials with the same keys.
 func (s *IdentityService) runSuspensionCleanup(ctx context.Context, identity *domain.Identity) {
 	const reason = "identity_suspended"
-	s.revokeActiveCredentials(ctx, identity, reason)
-	s.emitLifecycleSignal(ctx, identity, domain.SignalTypeIdentitySuspended, reason)
+	_ = s.revokeActiveCredentials(ctx, identity, reason)
+	_ = s.emitLifecycleSignal(ctx, identity, domain.SignalTypeIdentitySuspended, reason)
 }
 
 // revokeActiveCredentials cascade-revokes an identity's active credentials.
 // Best-effort, like the rest of the lifecycle cleanup: the status change has
 // already been written.
-func (s *IdentityService) revokeActiveCredentials(ctx context.Context, identity *domain.Identity, reason string) {
-	if n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identity.ID, reason); err != nil {
+func (s *IdentityService) revokeActiveCredentials(ctx context.Context, identity *domain.Identity, reason string) error {
+	n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identity.ID, reason)
+	if err != nil {
 		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
 			Msg("identity cleanup: failed to revoke active credentials")
-	} else if n > 0 {
+		return fmt.Errorf("revoke active credentials: %w", err)
+	}
+	if n > 0 {
 		log.Info().Str("identity_id", identity.ID).Str("reason", reason).Int64("count", n).
 			Msg("identity cleanup: revoked active credentials (cascade)")
 	}
+	return nil
 }
 
 // emitLifecycleSignal emits the high-severity CAE signal for a lifecycle
-// change. Best-effort: a failure is logged, not returned.
-func (s *IdentityService) emitLifecycleSignal(ctx context.Context, identity *domain.Identity, signalType domain.SignalType, reason string) {
+// change. A failure is logged, and returned for the callers that track it.
+func (s *IdentityService) emitLifecycleSignal(ctx context.Context, identity *domain.Identity, signalType domain.SignalType, reason string) error {
 	if _, err := s.signalSvc.IngestSignal(
 		ctx,
 		identity.AccountID,
@@ -1700,7 +1865,9 @@ func (s *IdentityService) emitLifecycleSignal(ctx context.Context, identity *dom
 		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
 			Str("signal_type", string(signalType)).
 			Msg("identity cleanup: failed to emit lifecycle CAE signal")
+		return fmt.Errorf("emit lifecycle signal: %w", err)
 	}
+	return nil
 }
 
 // resolveIdentityPolicyID picks the policy to attach to an identity. When the

@@ -50,6 +50,41 @@ type CredentialService struct {
 	// personGrant is the deployer's person-grant ceiling (ADR 0041 D15),
 	// consulted for every person root. Nil-safe: unset, nothing changes.
 	personGrant personGrantState
+	// ancestors reads an identity's registration-tree ancestors for the
+	// issuance guard (SetAncestorChain). Unset, an identity with a parent
+	// receives no token: the guard fails closed.
+	ancestors func(ctx context.Context, fromID, accountID, projectID string) ([]postgres.Ancestor, error)
+}
+
+// SetAncestorChain wires the read the issuance guard uses to refuse a token
+// to an identity below one that is not active. Wired once at server
+// construction (IdentityRepository.AncestorChain).
+func (s *CredentialService) SetAncestorChain(fn func(ctx context.Context, fromID, accountID, projectID string) ([]postgres.Ancestor, error)) {
+	s.ancestors = fn
+}
+
+// checkAncestorsUsable refuses issuance to an identity any of whose ancestors
+// in the registration tree is not active, is suspended, or has expired, so a
+// stopped tree stops minting at once, before (and whether or not) the
+// deactivation walk reaches the identities below. One statement of at most
+// postgres.MaxTreeDepth primary-key lookups, run only for an identity that
+// has a parent; any failure to read the chain refuses.
+func (s *CredentialService) checkAncestorsUsable(ctx context.Context, identity *domain.Identity) error {
+	if identity.ParentIdentityID == "" {
+		return nil
+	}
+	if s.ancestors == nil {
+		return fmt.Errorf("%w: the registration tree above it cannot be checked", domain.ErrIdentityNotUsable)
+	}
+	chain, err := s.ancestors(ctx, identity.ParentIdentityID, identity.AccountID, identity.ProjectID)
+	if err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Msg("issuance: could not read the registration tree above the identity; refusing")
+		return fmt.Errorf("%w: the registration tree above it could not be read", domain.ErrIdentityNotUsable)
+	}
+	if err := usableChain(chain); err != nil {
+		return fmt.Errorf("%w: %w, above it in the registration tree", domain.ErrIdentityNotUsable, err)
+	}
+	return nil
 }
 
 // SetTenantSettingsService wires the per-tenant settings the issuance
@@ -656,6 +691,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		// is what guarantees no grant path can mint a token past the
 		// authority's expiry window, regardless of worker timing.
 		return nil, nil, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
+	}
+	// Nor does an identity below one that is no longer active
+	// (docs/identity-tree.md).
+	if err := s.checkAncestorsUsable(ctx, req.Identity); err != nil {
+		return nil, nil, err
 	}
 
 	ttl, ttlRequested, err := s.issueTTL(req)
