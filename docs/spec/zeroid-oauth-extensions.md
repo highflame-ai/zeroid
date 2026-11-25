@@ -308,7 +308,11 @@ claims — are specified in Sections 4.3, 4.4, and 4.8.
   Only workloads appear; the person is never an actor. The current actor's own
   attributes (`identity_type`, `trust_level`, `external_id`) are carried inside
   the outermost `act` rather than at the top level, because the top level
-  describes the principal. Prior actors carry only `sub`. On an exchange from a
+  describes the principal. `act.client_id` is reserved for the OAuth client
+  the current actor authenticated as in the grant that minted the token; only
+  the internal service grants write it (§5.8). It is never copied from a parent token, so it always
+  describes the minting grant, and a resource server pairs it with `act.sub`
+  rather than trusting either alone. Prior actors carry only `sub`. On an exchange from a
   root grant, the root token's `client_id` becomes the first prior actor. The
   chain is capped at 16 actors for token size; past it the deepest prior actors
   are dropped, which §4.1 allows because they are informational.
@@ -593,6 +597,33 @@ mode:
 - Does **not** require an `actor_token`.
 - Emits `token_exchange=external_principal` and `trusted_by=<service>`.
 - Is RS256-signed with a short (900 s) TTL.
+- Refuses a `user_id` that is a SPIFFE/WIMSE URI (`invalid_request`): the token
+  names a person, never a workload.
+- Verifies a presented `subject_token`: it MUST be an active token this server
+  issued, for the request's `account_id` and `project_id`, whose person is
+  `user_id` (`sub` when `principal_type` is `user`; under the legacy profile
+  `user_id`, else a delegated token's `act.sub`, else `sub`; never a workload
+  URI); otherwise `invalid_grant`. A deployer's own grant that calls the
+  exchange in-process presents none and rests on the trusted caller alone.
+  `token.allow_unverified_external_principal_subject` restores accepting an
+  unverified subject while a deployment migrates. A subject that is itself an
+  internal service token (§5.8) is refused.
+- A **session broker** (a client listed in `service_tokens.session_broker_clients`,
+  §5.8) MAY call the exchange by authenticating as that client with
+  `private_key_jwt` instead of passing the `TrustedServiceValidator`. Its
+  client authentication MUST succeed; the validator is not consulted. The
+  token then carries `client_id` and `trusted_by` naming the client, set from
+  the client authentication. A token from the validator path carries no
+  `client_id`, so a resource server can tell the two apart, and the validator
+  path is refused (`invalid_grant`) when the name the validator returns is a
+  session broker or a reserved client id: those names are reached only by
+  authenticating as the client.
+- Refuses the service tenant (§5.8) as `account_id` (`invalid_request`): it
+  holds services, never a person.
+- A token bound to a `resource` lives at most 300 s. A deployer's grant
+  registered with `Server.RegisterGrantAcceptingResource` passes `resource`
+  through to `Server.ExternalPrincipalExchange`; a grant registered with
+  `RegisterGrant` refuses it with `invalid_target`.
 
 ### 5.6 Direct OIDC ID-token federation (external issuer)
 
@@ -694,6 +725,116 @@ whose `parent_jti` chain reaches the revoked `jti`). Revoking an identity
 delegated descendants. Cascade is bounded (see migration `007`/`029`).
 Revocation events are observable through the `RevocationNotifier` hook, one event
 per revoked `jti`; ZeroID ships no built-in deny-set transport.
+
+### 5.8 Internal service tokens
+
+A deployment's own services call each other, and a deployment's resource
+servers need to know which service called and for which tenant, without
+trusting a scope string (a tenant can register a client with any scope) or
+`aud` (any principal can request any `resource`). The grants in this section
+issue tokens a resource server identifies by claims only ZeroID writes. They
+are off unless `service_tokens.account_id` and `service_tokens.project_id`
+name the **service tenant**, which holds the deployment's service identities
+and nothing else.
+
+A **service client** is a client that:
+
+- authenticates with `private_key_jwt`;
+- has a reserved client id (`reserved_client_ids`), so no tenant could have
+  registered it;
+- was registered by `Server.EnsureClient` and is linked to a usable
+  `identity_type=service` identity in the service tenant.
+
+ZeroID checks each condition on every request. Every token below is bound to
+exactly one RFC 8707 `resource` (required; `aud` and `resource` carry it),
+carries no scopes, and lives at most 300 s.
+
+**`client_credentials` into the service tenant.** Only a service client may
+mint one, it requires exactly one `resource`, and an unlinked client may not
+name the service tenant. A resource
+server identifies the caller by `client_id` together with the service
+tenant's `account_id`.
+
+**On-behalf exchange.** RFC 8693 token exchange with no `actor_token`, a
+`subject_token_type` of `urn:ietf:params:oauth:token-type:access_token` and a
+service client authentication. The request takes this route only once its
+`private_key_jwt` assertion verifies; a request that merely names a
+`client_id`, or whose assertion fails for a client id that is not reserved,
+keeps the external-principal route (§5.5). A reserved client whose assertion
+fails is refused with `invalid_client`. The client MUST list
+`urn:ietf:params:oauth:grant-type:token-exchange` in its `grant_types`. ZeroID:
+
+1. verifies the `subject_token`: signature, `iss`, expiry and revocation;
+2. refuses a subject that is itself an internal service token or in the
+   service tenant: one carrying `tenant_source`, `act.client_id` at any level,
+   `token_exchange=on_behalf`, `grant_type=asserted_tenant`, or an actor in the
+   service tenant;
+3. refuses an external-principal subject (§5.5) not issued to a session
+   broker, and a subject whose `client_id` is a reserved id other than a
+   session broker's;
+4. refuses a subject bound to a `resource` unless the authenticated client
+   serves every resource it is bound to (`service_tokens.served_resources`;
+   an entry ending in `/` covers everything under it). Absent an entry, a
+   resource-bound subject is refused;
+5. refuses a subject whose identity is no longer usable;
+6. takes `account_id`/`project_id` from the subject's credential record;
+7. issues a token with `sub` and the principal of the subject,
+   `client_id` of the authenticated client, `token_exchange=on_behalf`,
+   `parent_jti` of the subject (so revoking the subject revokes it), and
+   `exp` no later than the subject's;
+8. sets `act` to `{"sub": <service WIMSE URI>, "client_id": <client>,
+   "identity_type", "trust_level", "external_id", "act": <subject's act>}`
+   under either token profile, with the subject's own `act` nested unchanged;
+9. sets `subject_kind` to `person` when the subject is a person's own session
+   (an external-principal token from a session broker, or an ID-token
+   exchange token, with a person `sub`, no `external_id`, no `act`, no
+   `resource`, and `aud` only the issuer), else `workload`;
+10. sets `resolved_user_id` and `resolved_user_source`, from the subject's
+    verified claims and identity record only, never the request, and never
+    to a SPIFFE/WIMSE value:
+    1. a person subject, or under the rfc8693 profile a subject whose
+       `principal_type` is `user`: its `sub` (`subject`);
+    2. under the legacy profile, the `user_id` claim, else at
+       `delegation_depth` 1 or more a non-workload `act.sub` (`on_behalf`);
+    3. the `owner_user_id` of the subject's identity record (`owner`).
+       An API key's creator is never consulted, so neither is the owner of
+       a service identity reached through an API key: ZeroID provisions a
+       shared placeholder service identity per product for keys that name
+       no identity, and its recorded owner is whoever created the first key;
+    4. nothing: neither claim is set.
+
+An internal service token, or any token in the service tenant, is also
+refused as the subject of an NHI delegation, as the `subject_token` of the
+external-principal exchange, and as a CIBA `requesting_token`.
+
+The request MUST NOT carry `scope`, `account_id`, `project_id`, `user_id`,
+`application_id`, `additional_claims`, `role`, `privilege_scope`, `audience`
+or `issue_refresh_token`.
+
+**Asserted-tenant grant.** `grant_type=urn:highflame:params:oauth:grant-type:asserted-tenant`.
+A service client listed in `service_tokens.asserted_tenant_clients`, which
+also lists the grant in its `grant_types`, names `account_id` and
+`project_id` (not the service tenant's). The token carries
+`tenant_source=asserted`, `grant_type=asserted_tenant`, the service identity
+as `sub` and as `act` (with `act.client_id`), and `client_id`. ZeroID writes
+an `ASSERT_TENANT` row to `identity_audit_logs` in the named tenant for every
+issuance, and revokes the token if the row cannot be written. A resource
+server that must know the tenant was proven refuses any token carrying
+`tenant_source`. The client list is server configuration only; no
+registration route sets it.
+
+### 5.8.1 What a resource server checks
+
+1. Verify the token (`pkg/authjwt`), issuer pinned, and require its own
+   resource id in the reserved `resource` claim (`Claims.RequireResource`).
+2. Identify the caller: for a `client_credentials` token, `client_id` in its
+   service map and `account_id` the service tenant's; for an on-behalf or
+   asserted-tenant token, the outermost `act.sub` is the WIMSE URI of a known
+   service identity in the service tenant and `act.client_id` is that
+   service's client. Never `client_id`, `act.client_id`, scope or `aud` alone.
+3. Take the tenant from `account_id`/`project_id`. Refuse `tenant_source`
+   wherever the tenant must be proven. Serve delegated credentials only for
+   `resolved_user_id`.
 
 ## 6. CIBA Extensions
 
@@ -870,6 +1011,8 @@ role privilege_scope roles
 authorization_details approval_id
 # Agent provenance
 origin agent_idp_iss agent_idp_parent
+# Internal service tokens
+tenant_source resolved_user_id resolved_user_source subject_kind
 ```
 
 Special cases:
@@ -896,6 +1039,13 @@ Special cases:
   registered (native, or an external IdP such as Entra or Okta). Policies use
   them to tell the two apart, so no caller may set them; ZeroID does not mint
   them yet.
+
+- `tenant_source`, `resolved_user_id`, `resolved_user_source` and
+  `subject_kind` describe how a grant chose a token's tenant, the user whose
+  delegated credentials it may use, and what its subject was. A resource
+  server identifying an internal service token relies on ZeroID being their
+  only writer, so issuance also strips them from internal callers' custom
+  claims. Only the internal service grants (§5.8) write them.
 
 This makes the `additional_claims` route fail closed regardless of which grant
 is in play.
@@ -1506,6 +1656,9 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `backchannel_client_id` | string | §4.7 |
 | `binding_message` | string | §4.7 |
 | `authorization_details` | array | §4.7, §6.2 (Std: RFC 9396) |
+| `tenant_source` | string | §5.8, §8 |
+| `subject_kind` | string | §5.8, §8 |
+| `resolved_user_id` `resolved_user_source` | string | §5.8, §8 |
 
 ### 14.2 Request parameters
 
@@ -1516,6 +1669,7 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `role`, `privilege_scope` | `/oauth2/token` (ext-principal exchange) | §5.5, §8 |
 | `additional_claims` | `/oauth2/token` (ext-principal exchange) | §4.8, §8 |
 | `subject_token_type` = `urn:ietf:params:oauth:token-type:id_token` | `/oauth2/token` (direct OIDC federation) | §5.6 (Std: RFC 8693) |
+| `grant_type` = `urn:highflame:params:oauth:grant-type:asserted-tenant` | `/oauth2/token` (asserted-tenant grant) | §5.8 |
 
 ### 14.3 DPoP proof claim
 

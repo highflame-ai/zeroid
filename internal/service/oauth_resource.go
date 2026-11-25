@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
 )
 
@@ -446,6 +447,9 @@ var resourceSupportedGrants = map[string]bool{
 	// path uses. See the note above on why the previous blanket rejection was
 	// removed rather than kept as defence in depth.
 	"refresh_token": true,
+	// The asserted-tenant grant REQUIRES exactly one resource: an internal
+	// service token is bound to the one receiver it is minted for.
+	domain.GrantTypeAssertedTenantURN: true,
 }
 
 func grantSupportsResource(grantType string) bool {

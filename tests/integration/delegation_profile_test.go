@@ -110,12 +110,11 @@ func (tn hrdTenant) userRoot(t *testing.T, scopes []string) (string, string) {
 	t.Helper()
 	userID := uid("alice")
 	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token": "external-principal-assertion",
-		"account_id":    tn.account,
-		"project_id":    tn.project,
-		"user_id":       userID,
-		"scope":         scopesToString(scopes),
+		"grant_type": testUserSessionGrant,
+		"account_id": tn.account,
+		"project_id": tn.project,
+		"user_id":    userID,
+		"scope":      scopesToString(scopes),
 	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
 	require.Equal(t, http.StatusOK, resp.StatusCode, "broker user root")
 	token := decode(t, resp)["access_token"].(string)
@@ -401,12 +400,13 @@ func TestTokenExchange_IssuedTokenType(t *testing.T) {
 	})
 
 	t.Run("trusted-broker principal exchange carries it", func(t *testing.T) {
+		user := uid("d7-user")
 		resp := post(t, "/oauth2/token", map[string]any{
 			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token": "external-principal-assertion",
+			"subject_token": personToken(t, testAccountID, testProjectID, user),
 			"account_id":    testAccountID,
 			"project_id":    testProjectID,
-			"user_id":       uid("d7-user"),
+			"user_id":       user,
 		}, map[string]string{testTrustedServiceHeader: "trusted-service"})
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		body := decode(t, resp)
@@ -589,8 +589,7 @@ func TestChainSubject_SurvivesRefresh(t *testing.T) {
 	tn := newTenant(t, "rfc8693")
 	user := uid("hrd-rt-user")
 	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":          "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token":       "external-principal-assertion",
+		"grant_type":          testUserSessionGrant,
 		"account_id":          tn.account,
 		"project_id":          tn.project,
 		"user_id":             user,

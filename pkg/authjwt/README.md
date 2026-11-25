@@ -64,6 +64,33 @@ if err := claims.RequireScope("repo:write"); err != nil {
 }
 ```
 
+## Identifying a Calling Service
+
+A scope string or an audience does not tell you who called: any principal can
+ask for any resource, and scopes are chosen at client registration. To accept
+a token only from a known service, check the resource binding and the calling
+principal, from claims ZeroID reserves:
+
+```go
+// The reserved RFC 8707 `resource` claim names this server. Audience alone
+// is not a binding.
+if err := claims.RequireResource("urn:example:svc:billing"); err != nil {
+    // returns authjwt.ErrResourceMismatch
+}
+
+claims.ClientID()           // client_id: the client the token was issued to
+claims.ActorClientID()      // act.client_id: the client the current actor authenticated as (on-behalf and asserted-tenant tokens)
+claims.CurrentActor()       // act.sub (rfc8693 profile), else sub
+claims.TenantSource()       // "asserted" when the caller named the tenant; empty otherwise
+claims.ResolvedUserID()     // the user ZeroID resolved for delegated credentials, if any
+claims.ResolvedUserSource() // how ResolvedUserID was resolved: subject, on_behalf or owner
+claims.SubjectKind()        // on an on-behalf token: "person" when its subject was a person's own session
+claims.TokenExchange()      // "on_behalf" on an on-behalf token
+```
+
+Never trust `ClientID()` or `ActorClientID()` alone. Pair a client id with the
+account the token was issued in, and an actor's client id with its `act.sub`.
+
 ## HTTP Middleware
 
 Drop-in middleware for any `net/http` compatible router:

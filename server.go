@@ -129,6 +129,7 @@ type Server struct {
 	// Services
 	identitySvc         *service.IdentityService
 	credentialSvc       *service.CredentialService
+	reservedScopes      *service.ReservedScopes
 	credentialPolicySvc *service.CredentialPolicyService
 	attestationSvc      *service.AttestationService
 	apiHandler          *handler.API
@@ -367,6 +368,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, db, cfg.Attestation.AllowUnsafeDevStub)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
+	reservedScopes := &service.ReservedScopes{}
+	apiKeySvc.SetReservedScopes(reservedScopes)
+	credentialSvc.SetReservedScopes(reservedScopes)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
 
 	// RevocationNotifier plumbing. One shared
@@ -400,6 +404,11 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// forces allow_unauthenticated_token_inspection=false in production, so
 	// production is strict by default.
 	oauthSvc.SetRequireTokenInspectionAuth(!cfg.Token.AllowUnauthenticatedTokenInspection)
+	oauthSvc.SetAllowUnverifiedExternalPrincipalSubject(cfg.Token.AllowUnverifiedExternalPrincipalSubject)
+	if cfg.Token.AllowUnverifiedExternalPrincipalSubject {
+		log.Warn().Msg("token.allow_unverified_external_principal_subject=true: the external-principal exchange accepts " +
+			"a subject_token without verifying it. Move the trusted services that rely on it to the ID-token exchange and turn it off.")
+	}
 
 	// CIMD (Client ID Metadata Documents) — resolve https:// client_id URLs on
 	// the authorization_code flow by fetching + validating their published
@@ -546,6 +555,17 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// useless if the dialer refused loopback, so the two move together.
 	oauthClientSvc.SetAllowPrivateJWKSEndpoints(cfg.ClientAuth.AllowPrivateJWKSEndpoints)
 	oauthClientSvc.SetBcryptClientSecrets(cfg.ClientAuth.BcryptClientSecrets)
+	// Client ids only the operator may register (EnsureClient). Validate()
+	// already refused an empty name or prefix.
+	oauthClientSvc.SetReservedClientIDs(cfg.ReservedClientIDs.Names, cfg.ReservedClientIDs.Prefixes)
+	// Internal service tokens: off unless service_tokens names the service
+	// tenant. Validate() already refused a half-configured block.
+	oauthSvc.SetAuditLogRepository(auditRepo)
+	oauthSvc.SetServiceTokens(serviceTokenSettings(cfg.ServiceTokens))
+	if cfg.ServiceTokens.AccountID != "" && len(cfg.ReservedClientIDs.Names)+len(cfg.ReservedClientIDs.Prefixes) == 0 {
+		log.Warn().Msg("service_tokens is set but reserved_client_ids is empty: no client can use the internal service " +
+			"grants until the services' client ids are reserved")
+	}
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
@@ -732,6 +752,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		router:                 r,
 		identitySvc:            identitySvc,
 		credentialSvc:          credentialSvc,
+		reservedScopes:         reservedScopes,
 		credentialPolicySvc:    credentialPolicySvc,
 		attestationSvc:         attestationSvc,
 		apiHandler:             apiHandler,
@@ -899,23 +920,43 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // RegisterGrant registers a custom OAuth2 grant type handler.
 // The handler is called when the token endpoint receives a grant_type matching name.
 func (s *Server) RegisterGrant(name string, handler GrantHandler) {
-	s.oauthSvc.RegisterGrant(name, func(ctx context.Context, req service.TokenRequest) (*domain.AccessToken, error) {
+	s.oauthSvc.RegisterGrant(name, grantAdapter(handler))
+}
+
+// RegisterGrantAcceptingResource registers a custom grant that accepts the RFC
+// 8707 resource parameter, which RegisterGrant's grants refuse with
+// invalid_target. The handler receives the validated list in
+// GrantRequest.Resource and must bind the token it issues to it:
+// ExternalPrincipalExchange does, so a handler that passes its GrantRequest
+// through needs nothing more. A handler that drops it issues an unbound token
+// to a caller that asked for a bound one.
+func (s *Server) RegisterGrantAcceptingResource(name string, handler GrantHandler) {
+	s.oauthSvc.RegisterGrantAcceptingResource(name, grantAdapter(handler))
+}
+
+// grantAdapter presents a token request to a deployer's grant handler.
+func grantAdapter(handler GrantHandler) service.CustomGrantHandler {
+	return func(ctx context.Context, req service.TokenRequest) (*domain.AccessToken, error) {
 		return handler(ctx, GrantRequest{
-			GrantType:         req.GrantType,
-			AccountID:         req.AccountID,
-			ProjectID:         req.ProjectID,
-			UserID:            req.UserID,
-			UserEmail:         req.UserEmail,
-			UserName:          req.UserName,
-			ApplicationID:     req.ApplicationID,
-			Scope:             req.Scope,
-			AdditionalClaims:  req.AdditionalClaims,
-			Role:              req.Role,
-			PrivilegeScope:    req.PrivilegeScope,
-			Audience:          req.Audience,
-			IssueRefreshToken: req.IssueRefreshToken,
+			GrantType:           req.GrantType,
+			AccountID:           req.AccountID,
+			ProjectID:           req.ProjectID,
+			ClientID:            req.ClientID,
+			ClientAssertion:     req.ClientAssertion,
+			ClientAssertionType: req.ClientAssertionType,
+			UserID:              req.UserID,
+			UserEmail:           req.UserEmail,
+			UserName:            req.UserName,
+			ApplicationID:       req.ApplicationID,
+			Scope:               req.Scope,
+			AdditionalClaims:    req.AdditionalClaims,
+			Role:                req.Role,
+			PrivilegeScope:      req.PrivilegeScope,
+			Audience:            req.Audience,
+			IssueRefreshToken:   req.IssueRefreshToken,
+			Resource:            slices.Clone(req.Resource),
 		})
-	})
+	}
 }
 
 // ResolveAPIKey looks up a zid_sk_* API key and returns the resolved
@@ -969,21 +1010,44 @@ func (s *Server) ResolveAPIKey(ctx context.Context, apiKey string) (*APIKeyResol
 // This is the building block for custom grant types like "user_session".
 func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest) (*domain.AccessToken, error) {
 	return s.oauthSvc.ExternalPrincipalExchange(ctx, service.TokenRequest{
-		GrantType:         req.GrantType,
-		AccountID:         req.AccountID,
-		ProjectID:         req.ProjectID,
-		UserID:            req.UserID,
-		UserEmail:         req.UserEmail,
-		UserName:          req.UserName,
-		ApplicationID:     req.ApplicationID,
-		Scope:             req.Scope,
-		AdditionalClaims:  req.AdditionalClaims,
-		Role:              req.Role,
-		PrivilegeScope:    req.PrivilegeScope,
-		Audience:          req.Audience,
-		IssueRefreshToken: req.IssueRefreshToken,
-		TrustedService:    true,
+		GrantType:           req.GrantType,
+		AccountID:           req.AccountID,
+		ProjectID:           req.ProjectID,
+		ClientID:            req.ClientID,
+		ClientAssertion:     req.ClientAssertion,
+		ClientAssertionType: req.ClientAssertionType,
+		UserID:              req.UserID,
+		UserEmail:           req.UserEmail,
+		UserName:            req.UserName,
+		ApplicationID:       req.ApplicationID,
+		Scope:               req.Scope,
+		AdditionalClaims:    req.AdditionalClaims,
+		Role:                req.Role,
+		PrivilegeScope:      req.PrivilegeScope,
+		Audience:            req.Audience,
+		IssueRefreshToken:   req.IssueRefreshToken,
+		Resource:            slices.Clone(req.Resource),
+		TrustedService:      true,
 	})
+}
+
+// SetServiceTokens replaces the internal service token settings
+// (Config.ServiceTokens) on a running server, for embedders that build them
+// in code and for tests. It does not validate; build the value with
+// Config.Validate's rules (account_id and project_id together, or neither).
+func (s *Server) SetServiceTokens(cfg ServiceTokensConfig) {
+	s.oauthSvc.SetServiceTokens(serviceTokenSettings(cfg))
+}
+
+// serviceTokenSettings converts the config block to the service's settings.
+func serviceTokenSettings(cfg ServiceTokensConfig) service.ServiceTokenSettings {
+	return service.ServiceTokenSettings{
+		AccountID:             cfg.AccountID,
+		ProjectID:             cfg.ProjectID,
+		AssertedTenantClients: cfg.AssertedTenantClients,
+		SessionBrokerClients:  cfg.SessionBrokerClients,
+		ServedResources:       cfg.ServedResources,
+	}
 }
 
 // OnClaimsIssue registers a claims enricher.
@@ -1524,6 +1588,20 @@ func (s *Server) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrant
 	return s.credentialSvc.SetPersonGrantResolver(fn, mode)
 }
 
+// SetReservedScopes reserves scope prefixes for the deployer's own APIs
+// (Highflame: "highflame."). A reserved scope is written onto an API key only
+// in a WithReservedScopeWrite context, and issued only on the api_key grant
+// from a key whose row lists it, linked to a service identity with a recorded
+// creator (named in owner_user_id), after authorize allows it. Every other
+// path refuses it. Tokens carrying one last at most maxTTL
+// (0 = no extra cap; a negative or sub-second maxTTL is refused). Prefixes
+// with a nil authorize are refused; no prefixes turns it off.
+//
+// Can be called any time after NewServer; safe to call concurrently.
+func (s *Server) SetReservedScopes(prefixes []string, authorize ReservedScopeAuthorizer, maxTTL time.Duration) error {
+	return s.reservedScopes.Set(prefixes, authorize, maxTTL)
+}
+
 // SetApproverAuthorizer installs the hook consulted on CIBA approve/deny for
 // requests carrying a group_hint, when backchannel.enforce_hints is shadow or
 // on. zeroid treats group_hint as opaque; the authorizer decides whether the
@@ -1627,6 +1705,16 @@ func (s *Server) SetRequireTokenInspectionAuth(require bool) {
 	s.oauthSvc.SetRequireTokenInspectionAuth(require)
 }
 
+// SetAllowUnverifiedExternalPrincipalSubject mirrors the
+// token.allow_unverified_external_principal_subject config key: when true, the
+// external-principal exchange accepts a presented subject_token without
+// verifying it, as it did before subject verification. Exposed for embedders
+// that build Config in code, and so integration tests can exercise both
+// postures on one server.
+func (s *Server) SetAllowUnverifiedExternalPrincipalSubject(allow bool) {
+	s.oauthSvc.SetAllowUnverifiedExternalPrincipalSubject(allow)
+}
+
 // SetRefreshReuseGrace sets the refresh-token reuse grace window: how long
 // after a rotation a second presentation of the rotated-out refresh token is
 // refused as a concurrent retry instead of revoking its family. Mirrors the
@@ -1714,13 +1802,33 @@ func (s *Server) GetIdentity(ctx context.Context, id, accountID, projectID strin
 	return s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
 }
 
+// ErrClientNotOwned is returned by EnsureClient when a client with the
+// seed's client_id already exists and the seed cannot show it is the seed's
+// own (see ownsExistingClient): for a linked seed, the row is linked to
+// another identity or none, or was not registered by seeding; for an unlinked
+// seed, the row is linked, was registered dynamically, or differs from the
+// seed in whether it authenticates. EnsureClient refuses rather than
+// rewriting that row, because whoever registered it first may hold its
+// credential. Remove the row (or rename the seed) to proceed.
+var ErrClientNotOwned = errors.New("oauth client exists and is not owned by this seed")
+
 // EnsureClient registers an OAuth client if it doesn't exist, or updates it if the
 // config has changed. Idempotent — safe to call on every startup.
 // Does not regenerate client_secret on update (secrets are rotated explicitly).
+//
+// It is the operator's seeding path, so it may register a client id the
+// deployment reserved (ReservedClientIDsConfig), which every tenant-facing
+// registration path refuses. A deployer that calls it on behalf of anyone
+// else must choose the client id itself, never take it from the caller.
+//
+// An existing row is updated only when it is the seed's own, and is otherwise
+// refused with ErrClientNotOwned (see ownsExistingClient). Link a service's
+// client to its identity with cfg.IdentityID: that link is what proves a row
+// is the seed's, since a client_id is only a name anyone could have
+// registered first.
 func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error {
 	existing, err := s.oauthClientSvc.GetClientByClientID(ctx, cfg.ClientID)
-	if err != nil {
-		// Client doesn't exist — create it.
+	if errors.Is(err, service.ErrOAuthClientNotFound) {
 		_, _, regErr := s.oauthClientSvc.RegisterClient(ctx, service.RegisterClientRequest{
 			ClientID:                     cfg.ClientID,
 			Name:                         cfg.Name,
@@ -1738,16 +1846,43 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 			SoftwareVersion:              cfg.SoftwareVersion,
 			Contacts:                     cfg.Contacts,
 			Metadata:                     cfg.Metadata,
+			IdentityID:                   cfg.IdentityID,
 			ClientNotificationEndpoint:   cfg.ClientNotificationEndpoint,
 			BackchannelTokenDeliveryMode: cfg.BackchannelTokenDeliveryMode,
+			AllowReservedClientID:        true,
 		})
+		if !errors.Is(regErr, service.ErrOAuthClientAlreadyExists) {
+			return regErr
+		}
+		// Another replica seeding at the same moment registered it first.
+		// Read that row and treat it like any existing one: adopted only if
+		// it is this seed's.
+		existing, err = s.oauthClientSvc.GetClientByClientID(ctx, cfg.ClientID)
+	}
+	if err != nil {
+		// A lookup that failed for any other reason (the store is down) is not
+		// "no such client": registering on top of it would only fail later
+		// with a less useful error.
+		return fmt.Errorf("look up oauth client %q: %w", cfg.ClientID, err)
+	}
 
-		return regErr
+	if err := ownsExistingClient(existing, cfg); err != nil {
+		return err
 	}
 
 	// Client exists — update mutable fields from config.
 	// Secret is NOT touched (rotated explicitly via RotateSecret).
 	updated := false
+
+	// An unlinked seed adopting a row it did not register (one registered
+	// before seeding recorded itself, or through the admin route): say so
+	// once, and record the row as seeded from now on.
+	if existing.RegistrationSource != domain.RegistrationSourceSeed {
+		log.Warn().Str("client_id", cfg.ClientID).Str("registration_source", existing.RegistrationSource).
+			Msg("EnsureClient adopted an existing client it did not register; check it is the operator's own")
+		existing.RegistrationSource = domain.RegistrationSourceSeed
+		updated = true
+	}
 
 	if cfg.Name != "" && cfg.Name != existing.Name {
 		existing.Name = cfg.Name
@@ -1818,6 +1953,167 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 	existing.UpdatedAt = time.Now()
 
 	return s.oauthClientSvc.UpdateClient(ctx, existing)
+}
+
+// ServiceIdentityConfig describes an identity a deployment's own service
+// authenticates as, seeded by Server.EnsureServiceIdentity.
+type ServiceIdentityConfig struct {
+	// AccountID and ProjectID are the tenant the identity lives in. For a
+	// platform service that is the deployment's own tenant, never a
+	// customer's.
+	AccountID string
+	ProjectID string
+	// ExternalID names the service within the tenant; it is also the last
+	// segment of the identity's WIMSE URI.
+	ExternalID string
+	// Name is the display name. Empty uses ExternalID.
+	Name string
+	// OwnerUserID is the person accountable for the identity. Required, as
+	// for every native identity.
+	OwnerUserID string
+	// TrustLevel defaults to first_party.
+	TrustLevel domain.TrustLevel
+}
+
+// ErrServiceIdentityConflict is returned by EnsureServiceIdentity when an
+// identity with the requested external id exists in the tenant and is not a
+// service identity. It is not adopted: it belongs to whoever registered it.
+var ErrServiceIdentityConflict = errors.New("identity exists and is not a service identity")
+
+// EnsureServiceIdentity returns the service identity named by cfg.ExternalID
+// in cfg's tenant, registering it (identity_type service) when it does not
+// exist. Idempotent, so safe to call on every start, and safe across replicas
+// starting at once.
+//
+// An existing service identity is returned as it is: its status, trust level,
+// keys and policy are not rewritten, so an operator who suspends a service
+// identity keeps it suspended across restarts. It is adopted whoever created
+// it, so the tenant that holds service identities must not be writable by
+// anyone else. An existing identity of any other type is refused with
+// ErrServiceIdentityConflict.
+//
+// Pair it with EnsureClient and OAuthClientConfig.IdentityID to give the
+// service a client linked to this identity.
+func (s *Server) EnsureServiceIdentity(ctx context.Context, cfg ServiceIdentityConfig) (*domain.Identity, error) {
+	if cfg.AccountID == "" || cfg.ProjectID == "" || cfg.ExternalID == "" {
+		return nil, errors.New("ensure service identity: account_id, project_id and external_id are required")
+	}
+	get := func() (*domain.Identity, error) {
+		id, err := s.identitySvc.GetIdentityByExternalID(ctx, cfg.ExternalID, cfg.AccountID, cfg.ProjectID)
+		if err != nil {
+			return nil, err
+		}
+		if id.IdentityType != domain.IdentityTypeService {
+			return nil, fmt.Errorf("%w: external_id %q is a %s identity", ErrServiceIdentityConflict, cfg.ExternalID, id.IdentityType)
+		}
+		return id, nil
+	}
+	existing, err := get()
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	name := cfg.Name
+	if name == "" {
+		name = cfg.ExternalID
+	}
+	trust := cfg.TrustLevel
+	if trust == "" {
+		trust = domain.TrustLevelFirstParty
+	}
+	created, err := s.identitySvc.RegisterIdentity(ctx, service.RegisterIdentityRequest{
+		AccountID:    cfg.AccountID,
+		ProjectID:    cfg.ProjectID,
+		ExternalID:   cfg.ExternalID,
+		Name:         name,
+		IdentityType: domain.IdentityTypeService,
+		TrustLevel:   trust,
+		OwnerUserID:  cfg.OwnerUserID,
+		CreatedBy:    cfg.OwnerUserID,
+	})
+	if errors.Is(err, service.ErrIdentityAlreadyExists) {
+		// Another replica registered it first.
+		return get()
+	}
+	return created, err
+}
+
+// ownsExistingClient decides whether an existing client row is the seed's
+// own, so EnsureClient may update it in place.
+//
+//   - A seed linked to an identity owns only a row that EnsureClient itself
+//     registered (registration_source "seed") linked to that same identity.
+//     A row linked elsewhere, to nothing, or registered through another path
+//     was registered by someone else (or before the link existed) and is not
+//     adopted.
+//   - An unlinked seed never owns a linked row: the link makes the row a
+//     credential of that identity's tenant, and rewriting its redirect URIs,
+//     scopes or keys from the seed would hand the seed's configuration to it.
+//   - An unlinked seed owns an unlinked, non-dynamic row only when both are
+//     public, or both authenticate: a public seed must not adopt a row whose
+//     secret or key someone else holds, and a confidential seed must not
+//     adopt a public row someone else registered. Moving between the
+//     confidential methods (client_secret_* to private_key_jwt) stays
+//     allowed, as before.
+//
+// For an unlinked seed, nothing here can tell a squatter's row from one an
+// earlier release of EnsureClient registered (both read "internal"), so such
+// a row is adopted, logged, and marked as seeded. Seed service clients with
+// IdentityID, which is held to the stricter rule.
+func ownsExistingClient(existing *domain.OAuthClient, cfg OAuthClientConfig) error {
+	// The message names the way out: an operator meets it at startup, often
+	// right after an upgrade that introduced this check.
+	notOwned := func(why string) error {
+		return fmt.Errorf("%w: client_id %q %s; delete that client or give the seed another client_id",
+			ErrClientNotOwned, cfg.ClientID, why)
+	}
+	if cfg.IdentityID != "" {
+		if existing.IdentityID == nil || *existing.IdentityID != cfg.IdentityID {
+			return notOwned("is not linked to the seed's identity")
+		}
+		// Linked to the right identity is not enough: anyone who can register
+		// a client in that identity's tenant can link one to it before the
+		// first seed runs, and would keep its credential. Only a row this
+		// seeding path created is adopted.
+		if existing.RegistrationSource != domain.RegistrationSourceSeed {
+			return notOwned("was not registered by seeding")
+		}
+		return nil
+	}
+	if existing.IdentityID != nil {
+		return notOwned("is linked to an identity and the seed is not")
+	}
+	// A dynamically registered client's registrant holds a registration
+	// access token and could rewrite the seed's configuration through RFC 7592.
+	if existing.RegistrationSource == "dynamic" {
+		return notOwned("was registered dynamically")
+	}
+	if seedIsPublicClient(cfg) != (existing.TokenEndpointAuthMethod == "none" || existing.TokenEndpointAuthMethod == "") {
+		return notOwned("differs from the seed in whether it authenticates " +
+			"(a seed for a confidential client sets Confidential, or a client_secret_* or private_key_jwt TokenEndpointAuthMethod)")
+	}
+	return nil
+}
+
+// seedIsPublicClient reports whether a seed registers a public client: one
+// that does not authenticate (token_endpoint_auth_method "none"). It applies
+// the defaults RegisterClient does when the method is not given.
+func seedIsPublicClient(cfg OAuthClientConfig) bool {
+	if cfg.TokenEndpointAuthMethod != "" {
+		return cfg.TokenEndpointAuthMethod == "none"
+	}
+	return !cfg.Confidential
+}
+
+// IsReservedClientID reports whether clientID is reserved for the operator
+// (ReservedClientIDsConfig). A deployer that registers clients on someone
+// else's behalf through EnsureClient, which accepts reserved ids, can use it
+// to refuse a caller-chosen reserved id itself.
+func (s *Server) IsReservedClientID(clientID string) bool {
+	return s.oauthClientSvc.IsReservedClientID(clientID)
 }
 
 // slicesEqual returns true if two string slices have the same elements in order.

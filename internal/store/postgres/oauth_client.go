@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"github.com/uptrace/bun"
@@ -110,9 +111,15 @@ func (r *OAuthClientRepository) DeleteForIdentity(ctx context.Context, id, ident
 
 // Update persists changes to an OAuth2 client.
 func (r *OAuthClientRepository) Update(ctx context.Context, client *domain.OAuthClient) error {
-	_, err := r.db.NewUpdate().Model(client).Where("id = ?", client.ID).Exec(ctx)
+	res, err := r.db.NewUpdate().Model(client).Where("id = ?", client.ID).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to update oauth client: %w", err)
+	}
+	// A row deleted since the caller read it (and perhaps re-registered under
+	// the same client_id with a new id) is not updated; say so rather than
+	// report success for a write that did not happen.
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("failed to update oauth client: %w", sql.ErrNoRows)
 	}
 	return nil
 }

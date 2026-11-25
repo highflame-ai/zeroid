@@ -68,8 +68,10 @@ func TestApprovalChannelCredentialRemovalRequiresTrustedContext(t *testing.T) {
 		id, _ := body["client"].(map[string]any)["id"].(string)
 		require.NotEmpty(t, id)
 
-		requireForbidden(t, doRequest(t, http.MethodDelete, adminPath("/oauth/clients/"+id), nil, adminHeaders()), "untrusted delete")
-		del := doRequest(t, http.MethodDelete, adminPath("/oauth/clients/"+id), nil, channelWriteHeaders())
+		// The client is unlinked, so it is the operator's to manage: delete it
+		// with no tenant in context.
+		requireForbidden(t, doRequest(t, http.MethodDelete, adminPath("/oauth/clients/"+id), nil, nil), "untrusted delete")
+		del := doRequest(t, http.MethodDelete, adminPath("/oauth/clients/"+id), nil, operatorChannelWriteHeaders())
 		_ = del.Body.Close()
 		require.Less(t, del.StatusCode, 300)
 	})
