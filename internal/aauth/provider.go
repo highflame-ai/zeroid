@@ -36,6 +36,11 @@ const maxBootstrapBody = 64 << 10
 // the skew the shared single-use store allows.
 const assertionClockSkew = 60 * time.Second
 
+// pendingStale is how long an unminted claim by the same key is taken to be
+// in flight. Far beyond any request (server write timeout, a 10 s issuance and
+// 5 s bookkeeping); past it, the first request's bookkeeping failed.
+const pendingStale = 2 * time.Minute
+
 // minAgentTokenTTL is the refresh margin: an agent refreshes its agent token
 // when fewer than five minutes remain (bootstrap draft, Refresh Patterns).
 const minAgentTokenTTL = 300
@@ -313,7 +318,13 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		return "", 0, notAccepted(err)
 	}
 
-	claim, _, err := p.redemptions.claim(ctx, wa.ReplayKey, jkt, wa.ExpiresAt.Add(assertionClockSkew))
+	// Bookkeeping after the claim must outlive the request: a client that
+	// disconnects mid-issuance must not leave its attestation half-redeemed.
+	bookkeeping := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	}
+
+	claim, age, err := p.redemptions.claim(ctx, wa.ReplayKey, jkt, wa.ExpiresAt.Add(assertionClockSkew))
 	if err != nil {
 		return "", 0, fmt.Errorf("claiming the attestation: %w", err)
 	}
@@ -321,12 +332,16 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 	case claimRefused:
 		return "", 0, &bootstrapRefusal{code: "invalid_grant", description: "the attestation was already redeemed by another key"}
 	case claimPending:
-		// Still in flight, however long it takes: the first request either
-		// mints (and a retry then repeats) or is refused or cleaned up (and a
-		// retry is told so). Only a crashed process leaves it pending, until
-		// the attestation expires.
-		return "", 0, &bootstrapRefusal{code: "temporarily_unavailable", status: http.StatusServiceUnavailable, retryAfter: 1,
-			description: "a redemption of this attestation by this key is still in progress; retry"}
+		if age < pendingStale {
+			// The first request is still running: it will mint (a retry then
+			// repeats) or be refused or cleaned up (a retry is told so).
+			return "", 0, &bootstrapRefusal{code: "temporarily_unavailable", status: http.StatusServiceUnavailable, retryAfter: 1,
+				description: "a redemption of this attestation by this key is still in progress; retry"}
+		}
+		// Far longer than any request runs: its bookkeeping failed or its
+		// process died. Final, so no client loops on it.
+		return "", 0, &bootstrapRefusal{code: "invalid_grant",
+			description: "an earlier redemption of this attestation by this key did not complete; retry with a fresh platform token"}
 	case claimRefusedEarlier:
 		return "", 0, &bootstrapRefusal{code: "invalid_grant",
 			description: "an earlier redemption of this attestation by this key was refused; retry with a fresh platform token"}
@@ -337,21 +352,21 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 			if errors.Is(err, dpop.ErrReplay) {
 				// Spent at the token endpoint. The claim is marked refused,
 				// so every later redemption is refused too.
-				if mErr := p.redemptions.refuse(context.WithoutCancel(ctx), wa.ReplayKey); mErr != nil {
+				bctx, cancel := bookkeeping()
+				mErr := p.redemptions.refuse(bctx, wa.ReplayKey)
+				cancel()
+				if mErr != nil {
 					log.Warn().Err(mErr).Msg("aauth: could not record a refused redemption")
 				}
 				return "", 0, &bootstrapRefusal{code: "invalid_grant", description: "the attestation has already been used"}
 			}
-			p.forget(ctx, wa)
+			bctx, cancel := bookkeeping()
+			p.forget(bctx, wa)
+			cancel()
 			return "", 0, fmt.Errorf("spending the attestation: %w", err)
 		}
 	}
 	fresh := claim == claimFresh
-	// Bookkeeping after the claim must outlive the request: a client that
-	// disconnects mid-issuance must not leave its attestation half-redeemed.
-	bookkeeping := func() (context.Context, context.CancelFunc) {
-		return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	}
 	// A refusal after a fresh claim is recorded, so the same key is refused
 	// at once next time instead of being told to retry.
 	refused := func(err error) error {
@@ -401,7 +416,11 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 			description: fmt.Sprintf("the identity's credential policy allows tokens of at most %ds; an agent token needs over %ds", ttl, minAgentTokenTTL)})
 	}
 	sub := "aauth:" + identity.ID + "@" + p.authority
-	issued, _, err := p.creds.IssueCredential(ctx, service.IssueRequest{
+	// Issued on a detached context: a disconnect after the row commits must
+	// not run cleanup() and release a spend that already minted.
+	ictx, icancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer icancel()
+	issued, _, err := p.creds.IssueCredential(ictx, service.IssueRequest{
 		Identity:         identity,
 		IdentityPolicyID: policyID(policy),
 		TTL:              ttl,
@@ -431,7 +450,7 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		defer cancel()
 		if err := p.redemptions.confirm(bctx, wa.ReplayKey); err != nil {
 			// The token is issued; only a repeat redemption by this key is lost.
-			log.Warn().Err(err).Msg("aauth: could not confirm a redemption; a repeat by the same key will be refused")
+			log.Warn().Err(err).Msg("aauth: could not confirm a redemption; repeats by the same key get 503 until it goes stale, then a final refusal")
 		}
 	}
 	return issued.AccessToken, issued.ExpiresIn, nil

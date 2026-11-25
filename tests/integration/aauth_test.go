@@ -23,6 +23,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,6 +116,8 @@ func newAAuthServer(t *testing.T) (*zeroid.Server, *httptest.Server) {
 		Token: zeroid.TokenConfig{
 			Issuer: federationIssuer, DefaultTTL: 3600, MaxTTL: 90 * 24 * 3600,
 			HMACSecret: testHMACSecret, AuthCodeIssuer: federationIssuer,
+			// The confusion tests introspect without client credentials.
+			AllowUnauthenticatedTokenInspection: true,
 		},
 		Telemetry:   zeroid.TelemetryConfig{Enabled: false},
 		Logging:     zeroid.LoggingConfig{Level: "warn"},
@@ -562,5 +565,73 @@ func TestAAuthBridge(t *testing.T) {
 		res := off.bridge(t, boot.body["agent_token"].(string), &k, nil)
 		assert.Equal(t, http.StatusBadRequest, res.status, "body=%v", res.body)
 		assert.Equal(t, "invalid_grant", res.body["error"])
+	})
+}
+
+// TestAAuthTokenConfusion pins that neither AAuth token can pass for
+// something it isn't anywhere else in ZeroID.
+func TestAAuthTokenConfusion(t *testing.T) {
+	a := newAAuthFed(t)
+	k := newAgentKey(t)
+	boot := a.bootstrap(t, k, a.assertion(t, nil))
+	require.Equal(t, http.StatusOK, boot.status, "body=%v", boot.body)
+	agentToken := boot.body["agent_token"].(string)
+	bridged := a.bridge(t, agentToken, &k, nil)
+	require.Equal(t, http.StatusOK, bridged.status, "body=%v", bridged.body)
+	bridgedToken := bridged.body["access_token"].(string)
+
+	form := func(path string, values map[string]string) apResponse {
+		v := url.Values{}
+		for key, val := range values {
+			v.Set(key, val)
+		}
+		req, err := http.NewRequest(http.MethodPost, a.f.http.URL+path, strings.NewReader(v.Encode()))
+		require.NoError(t, err)
+		req.Host = aauthHost
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return a.do(t, req)
+	}
+
+	t.Run("an agent token is never active at introspection", func(t *testing.T) {
+		res := form("/oauth2/token/introspect", map[string]string{"token": agentToken})
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		assert.Equal(t, false, res.body["active"], "its row carries a key thumbprint, but it is not an OAuth access token")
+	})
+
+	t.Run("an agent token is not a subject or actor token for RFC 8693 exchange", func(t *testing.T) {
+		asSubject := form("/oauth2/token", map[string]string{
+			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":      agentToken,
+			"subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+		})
+		assert.NotEqual(t, http.StatusOK, asSubject.status, "body=%v", asSubject.body)
+		asActor := form("/oauth2/token", map[string]string{
+			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":      bridgedToken,
+			"subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+			"actor_token":        agentToken,
+			"actor_token_type":   "urn:ietf:params:oauth:token-type:jwt",
+		})
+		assert.NotEqual(t, http.StatusOK, asActor.status, "body=%v", asActor.body)
+	})
+
+	t.Run("neither token can enroll a durable key at agent self-service", func(t *testing.T) {
+		for name, tok := range map[string]string{"agent token": agentToken, "bridged token": bridgedToken} {
+			req, err := http.NewRequest(http.MethodPost, a.f.http.URL+"/agents/self/public-key",
+				strings.NewReader(`{"new_public_key_pem":"x","new_key_proof":"x"}`))
+			require.NoError(t, err)
+			req.Host = aauthHost
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+tok)
+			res := a.do(t, req)
+			if name == "bridged token" {
+				// It verifies as a ZeroID access token; enrollment's own
+				// grant-type rule refuses it.
+				assert.Equal(t, http.StatusForbidden, res.status, "%s: %v", name, res.body)
+				assert.Contains(t, fmt.Sprint(res.body["detail"]), "agent's own token")
+				continue
+			}
+			assert.Equal(t, http.StatusUnauthorized, res.status, "an agent token is not a ZeroID access token: %v", res.body)
+		}
 	})
 }

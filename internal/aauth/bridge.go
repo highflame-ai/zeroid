@@ -86,6 +86,13 @@ func (p *Provider) bridgeGrant(ctx context.Context, req service.TokenRequest) (*
 	if err != nil {
 		return nil, err
 	}
+	// A request that names a tenant must name the agent's, as on the
+	// federated grant (ADR 0042 D5): a tenant-routed embedder must not mint
+	// for another tenant through its endpoint. Checked before the identity
+	// is read, so it says nothing about that identity.
+	if (req.AccountID != "" && req.AccountID != row.AccountID) || (req.ProjectID != "" && req.ProjectID != row.ProjectID) {
+		return nil, bridgeRefusal(oautherror.InvalidGrant, "account_id or project_id does not match the agent token's tenant")
+	}
 	identity, err := p.identities.GetIdentity(ctx, *row.IdentityID, row.AccountID, row.ProjectID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, bridgeRefusal(oautherror.InvalidGrant, "the agent token's identity no longer exists")
@@ -93,13 +100,6 @@ func (p *Provider) bridgeGrant(ctx context.Context, req service.TokenRequest) (*
 	if err != nil {
 		return nil, service.NewOAuthError(oautherror.ServerError, "the agent token's identity could not be loaded", http.StatusInternalServerError)
 	}
-	// A request that names a tenant must name the agent's, as on the
-	// federated grant (ADR 0042 D5): a tenant-routed embedder must not mint
-	// for another tenant through its endpoint.
-	if (req.AccountID != "" && req.AccountID != identity.AccountID) || (req.ProjectID != "" && req.ProjectID != identity.ProjectID) {
-		return nil, bridgeRefusal(oautherror.InvalidGrant, "account_id or project_id does not match the agent token's tenant")
-	}
-
 	grant, err := p.oauth.ResolveWorkloadGrant(ctx, identity, req.Scope)
 	if err != nil {
 		return nil, err
@@ -142,17 +142,18 @@ func (p *Provider) bridgeGrant(ctx context.Context, req service.TokenRequest) (*
 
 	// The agent token may have been revoked after the check above and before
 	// the child row was written, which the revoke's cascade then missed.
-	// Re-check, and revoke the child if so. A failure to read is not a
-	// revocation: the child stands, and the error is the caller's to retry.
-	if _, err := p.liveAgentRow(ctx, agent.JTI, p.now()); err != nil {
+	// Re-check, and revoke the child unless the parent is confirmed live:
+	// fail closed, on a detached context, so neither a database error nor a
+	// client disconnect leaves a revoked parent with a live child.
+	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if _, err := p.liveAgentRow(bctx, agent.JTI, p.now()); err != nil {
+		if rErr := p.creds.RevokeCredential(bctx, child.ID, child.AccountID, child.ProjectID, "parent agent token not confirmed live after exchange"); rErr != nil {
+			log.Error().Err(rErr).Str("jti", child.JTI).Msg("aauth: could not revoke a bridged token whose agent token was not confirmed live")
+		}
 		var oe *service.OAuthError
 		if errors.As(err, &oe) && oe.HTTPStatus >= http.StatusInternalServerError {
-			log.Warn().Err(err).Str("jti", child.JTI).Msg("aauth: could not re-check the agent token after an exchange")
-			return token, nil
-		}
-		if rErr := p.creds.RevokeCredential(ctx, child.ID, child.AccountID, child.ProjectID, "parent agent token revoked during exchange"); rErr != nil {
-			log.Error().Err(rErr).Str("jti", child.JTI).Msg("aauth: could not revoke a bridged token whose agent token was revoked")
-			return nil, service.NewOAuthError(oautherror.ServerError, "the exchange could not be completed", http.StatusInternalServerError)
+			return nil, service.NewOAuthError(oautherror.ServerError, "the exchange could not be completed; retry", http.StatusInternalServerError)
 		}
 		return nil, bridgeRefusal(oautherror.InvalidGrant, "the agent token was revoked during the exchange")
 	}
