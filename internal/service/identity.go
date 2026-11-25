@@ -453,6 +453,9 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 		return s.reconcileDiscovered(ctx, existing, req)
 	}
 
+	// An ingest never claims a standing adoption that did not happen.
+	ingested := &domain.Identity{Labels: req.Labels, Metadata: req.Metadata}
+	keepStandingAdoptionMarkers(ingested, nil, nil)
 	identity, err := s.RegisterIdentity(ctx, RegisterIdentityRequest{
 		AccountID:    req.AccountID,
 		ProjectID:    req.ProjectID,
@@ -469,8 +472,8 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 		Publisher:    req.Publisher,
 		Description:  req.Description,
 		Capabilities: req.Capabilities,
-		Labels:       req.Labels,
-		Metadata:     req.Metadata,
+		Labels:       ingested.Labels,
+		Metadata:     ingested.Metadata,
 		CreatedBy:    req.CreatedBy,
 	})
 	if err != nil {
@@ -612,8 +615,10 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 		identity.Metadata = req.Metadata
 	}
 	// A first-contact identity keeps its marker and the claims it arrived
-	// with, whatever the inventory sends.
+	// with, whatever the inventory sends, and an identity a standing
+	// adoption activated keeps that record.
 	keepFirstContactProvenance(identity, prevLabels, prevMetadata)
+	keepStandingAdoptionMarkers(identity, prevLabels, prevMetadata)
 	// Re-type a still-discovered row from the connector's current classification
 	// (e.g. application → mcp_server once it's recognised as an MCP server,
 	// CAP-DSC-003). domain.CanRetypeDiscovered leaves adopted rows untouched and

@@ -395,6 +395,19 @@ const (
 // through its issuer_binding metadata.
 const FirstContactExternalIDPrefix = "first_contact."
 
+// Standing-adoption markers on an identity an issuer row's standing adoption
+// mapping activated, whether first contact registered it or it existed
+// already (docs/external-issuers.md, "Standing adoption"): the label a list
+// can filter on (label=adopted_via:first_contact, its value
+// FirstContactLabelValue), and the metadata key naming the row and who last
+// set its mapping. A discovered ingest can neither add nor remove them; the
+// identity API writes labels and metadata as given, so the audit row of the
+// activation is the authoritative record.
+const (
+	StandingAdoptionLabelKey    = "adopted_via"
+	StandingAdoptionMetadataKey = "first_contact_adoption"
+)
+
 // IsExternal reports whether the identity was discovered in an external IdP
 // (origin is set and not `native`). External-origin identities enter the
 // lifecycle in `discovered` and may be owner-less until adopted.

@@ -113,12 +113,12 @@ type FederationConfig struct {
 	FirstContact FirstContactConfig `koanf:"first_contact"`
 }
 
-// FirstContactConfig bounds first-contact registration. Past either bound a
-// credential that would register an agent gets the plain no-binding refusal
+// FirstContactConfig bounds first contact. Past either bound a credential
+// that would register or adopt an agent is refused as without first contact
 // instead, and the reason is logged.
 type FirstContactConfig struct {
-	// RatePerMinute caps the agents first contact registers under one issuer
-	// row in any minute. 0 means the default, 10.
+	// RatePerMinute caps the agents first contact registers or adopts under
+	// one issuer row in any minute. 0 means the default, 10.
 	RatePerMinute int `koanf:"rate_per_minute"`
 	// MaxDiscoveredPerAccount caps an account's first-contact identities that
 	// are still discovered (unadopted), so a discover row cannot fill an

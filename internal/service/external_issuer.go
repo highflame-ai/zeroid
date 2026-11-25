@@ -217,6 +217,7 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		return nil, nil, validationToAPIError(err)
 	}
 	row.Normalize()
+	stampFirstContact(row, nil, actor)
 	// Trusting ZeroID's own issuer would let its tokens (or ID-JAGs it might
 	// be tricked into signing) federate back in as an external person.
 	if s.cfg.SelfIssuer != "" && domain.CanonicalIssuer(row.Issuer) == domain.CanonicalIssuer(s.cfg.SelfIssuer) {
@@ -429,9 +430,11 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 		if p.IfUpdatedAt != nil && !r.UpdatedAt.Equal(*p.IfUpdatedAt) {
 			return errIssuerChanged
 		}
+		before := *r
 		applyIssuerPatch(r, p)
 		r.UpdatedBy = actor
 		r.Normalize()
+		stampFirstContact(r, &before, actor)
 		// A rename, a disable or a first-contact change touches nothing
 		// uniqueness or the token checks decide on. Skipping both keeps such
 		// rows manageable when the deployment's rules moved under them (an
@@ -481,6 +484,23 @@ func (p IssuerPatch) onlyNameFirstContactOrDisable() bool {
 	return p.Audiences == nil && p.Algorithms == nil && p.ClaimMapping == nil && p.PropagateClaims == nil &&
 		p.ClaimConstraints == nil && p.MaxTokenAge == nil && p.JWKSCacheTTL == nil && p.TrustEmail == nil &&
 		(p.Enabled == nil || !*p.Enabled)
+}
+
+// stampFirstContact names actor as the last to change r's first-contact mode
+// or mapping, when the write changes any of them from before (a new row is
+// compared with the defaults, before == nil). A standing adoption records
+// who that was on every identity it activates.
+func stampFirstContact(r, before *domain.ExternalIssuer, actor string) {
+	mode, project, owner := domain.FirstContactOff, "", ""
+	if before != nil {
+		mode, project, owner = before.FirstContact, before.FirstContactProjectID, before.FirstContactOwnerUserID
+	}
+	if r.FirstContact == mode && r.FirstContactProjectID == project && r.FirstContactOwnerUserID == owner {
+		return
+	}
+	now := time.Now().UTC()
+	r.FirstContactUpdatedBy = actor
+	r.FirstContactUpdatedAt = &now
 }
 
 func applyIssuerPatch(r *domain.ExternalIssuer, p IssuerPatch) {

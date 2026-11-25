@@ -72,13 +72,15 @@ func (r *ExternalIssuerRepository) LockFirstContact(ctx context.Context, account
 	return nil
 }
 
-// CountBindingsCreatedBySince counts the bindings actor created under an
-// issuer row since t, deleted ones included: the per-row first-contact rate.
-func (r *ExternalIssuerRepository) CountBindingsCreatedBySince(ctx context.Context, issuerID, actor string, since time.Time) (int, error) {
+// CountBindingsWrittenBySince counts the bindings under an issuer row that
+// actor last wrote since t, deleted ones included: the per-row first-contact
+// rate, over the bindings first contact created and those a standing
+// adoption enabled.
+func (r *ExternalIssuerRepository) CountBindingsWrittenBySince(ctx context.Context, issuerID, actor string, since time.Time) (int, error) {
 	n, err := dbOrTx(ctx, r.db).NewSelect().Model((*domain.IssuerBinding)(nil)).
 		Where("issuer_id = ?", issuerID).
-		Where("created_by = ?", actor).
-		Where("created_at > ?", since).
+		Where("updated_by = ?", actor).
+		Where("updated_at > ?", since).
 		Count(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count bindings: %w", err)
@@ -200,7 +202,7 @@ func (r *ExternalIssuerRepository) Update(ctx context.Context, row *domain.Exter
 		Column("display_name", "audiences", "algorithms", "claim_mapping", "propagate_claims",
 			"claim_constraints", "constraints_key", "max_token_age_seconds", "jwks_cache_ttl_seconds",
 			"trust_email", "enabled", "first_contact", "first_contact_project_id", "first_contact_owner_user_id",
-			"updated_by").
+			"first_contact_updated_by", "first_contact_updated_at", "updated_by").
 		Set("updated_at = clock_timestamp()").
 		Where("id = ?", row.ID).
 		Where("account_id = ?", row.AccountID).
@@ -283,6 +285,25 @@ func (r *ExternalIssuerRepository) GetBinding(ctx context.Context, id, issuerID,
 		Where("issuer_id = ?", issuerID).
 		Where("account_id = ?", accountID).
 		Where("deleted_at IS NULL").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get binding: %w", err)
+	}
+	return b, nil
+}
+
+// GetBindingForUpdate is one live binding of an account, holding its row
+// lock until the transaction ends. sql.ErrNoRows (wrapped) when it is gone.
+func (r *ExternalIssuerRepository) GetBindingForUpdate(ctx context.Context, id, accountID string) (*domain.IssuerBinding, error) {
+	if !hasTx(ctx) {
+		return nil, errors.New("GetBindingForUpdate requires a transaction")
+	}
+	b := &domain.IssuerBinding{}
+	err := dbOrTx(ctx, r.db).NewSelect().Model(b).
+		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("deleted_at IS NULL").
+		For("UPDATE").
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get binding: %w", err)

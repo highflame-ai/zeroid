@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -27,18 +28,25 @@ import (
 
 // First contact (docs/external-issuers.md, "First contact"): a credential
 // that verified in full under an enabled issuer row, and names an agent no
-// binding maps yet, registers that agent when the row's first_contact says
-// so. discover registers it unadopted and refuses the request; adopt
-// registers it adopted under the row's mapping and serves the request.
+// enabled binding maps, is handled as the row's first_contact says.
+//
+// With no binding at all, discover registers the agent unadopted and refuses
+// the request; adopt registers it adopted under the row's mapping and serves
+// the request. With only a disabled binding, adopt applies the same mapping
+// to the agent's existing identity (standing adoption) when that identity is
+// still discovered, sits in the mapped project, is no approval channel, and
+// no person disabled the binding; discover leaves it as it is, already in
+// the adoption queue.
 //
 // It never creates a person or a membership, never trusts an issuer that is
-// not already a row, never acts on a disabled row, and never touches an
-// identity that already exists: a subject with any binding, enabled or not,
-// keeps today's behaviour.
+// not already a row, never acts on a disabled row, and never overrides a
+// person's decision: an explicitly disabled binding, an identity a person has
+// taken on (pending), activated, suspended or dismissed, or an identity in
+// another project keeps today's behaviour.
 
-// FirstContactActor is the audit actor and created_by of every row first
-// contact writes. The system: prefix is reserved, so no admin caller can
-// claim it.
+// FirstContactActor is the audit actor of every row first contact writes,
+// and the created_by or updated_by it leaves on them. The system: prefix is
+// reserved, so no admin caller can claim it.
 const FirstContactActor = middleware.SystemCallerPrefix + "first_contact"
 
 // Defaults for the first-contact bounds.
@@ -47,11 +55,12 @@ const (
 	DefaultFirstContactMaxDiscoveredPerAccount = 500
 )
 
-// FirstContactConfig bounds first-contact registration. Past either bound a
-// credential gets the plain no-binding refusal, and the reason is logged.
+// FirstContactConfig bounds first contact. Past either bound nothing is
+// written, the credential is refused as without first contact, and the
+// reason is logged.
 type FirstContactConfig struct {
-	// RatePerMinute caps the registrations under one issuer row in any
-	// minute. Zero means DefaultFirstContactRatePerMinute.
+	// RatePerMinute caps the registrations and standing adoptions under one
+	// issuer row in any minute. Zero means DefaultFirstContactRatePerMinute.
 	RatePerMinute int
 	// MaxDiscoveredPerAccount caps an account's first-contact identities that
 	// are still discovered (unadopted). Zero means
@@ -76,7 +85,8 @@ func reservedFirstContactExternalID(externalID string) bool {
 	return strings.HasPrefix(externalID, domain.FirstContactExternalIDPrefix)
 }
 
-// FirstContactRegistrar registers agents on first contact.
+// FirstContactRegistrar registers agents on first contact, and applies an
+// adopt row's standing adoption to agents that are bound already.
 type FirstContactRegistrar struct {
 	issuers    *postgres.ExternalIssuerRepository
 	identities *IdentityService
@@ -109,8 +119,13 @@ type firstContactOutcome string
 const (
 	// firstContactRegistered: an identity and its binding were created.
 	firstContactRegistered firstContactOutcome = "registered"
-	// firstContactAlreadyBound: a binding for the subject exists now (a
-	// concurrent first contact made it); the grant reads it as usual.
+	// firstContactAdopted: an adopt row's standing mapping activated the
+	// agent's existing discovered identity and enabled its binding.
+	firstContactAdopted firstContactOutcome = "adopted"
+	// firstContactAlreadyBound: the subject's bindings changed after the
+	// request read them (a concurrent first contact or a person bound,
+	// enabled or deleted one), or the agent is bound but unadopted under a
+	// discover row; the grant reads them again and decides as usual.
 	firstContactAlreadyBound firstContactOutcome = "already_bound"
 	// firstContactRowChanged: the row was disabled, deleted, switched off or
 	// re-mapped after the request read it.
@@ -131,10 +146,45 @@ const (
 	// client. Such a client must be linked to the agent it acts for, and first
 	// contact neither creates nor links clients.
 	firstContactRegisteredClient firstContactOutcome = "registered_client"
+
+	// Why an adopt row's standing mapping left an agent that has only a
+	// disabled binding as it is. The grant refuses as without first contact.
+
+	// firstContactExplicitlyDisabled: a person disabled one of the subject's
+	// bindings under the row, and that decision wins.
+	firstContactExplicitlyDisabled firstContactOutcome = "explicitly_disabled"
+	// firstContactAmbiguousBinding: more than one binding maps the subject
+	// key, so which identity is the agent is for a person to decide.
+	firstContactAmbiguousBinding firstContactOutcome = "ambiguous_binding"
+	// firstContactNotDiscovered: the bound identity is not discovered: a
+	// person has taken it on (pending), activated, suspended or dismissed it.
+	firstContactNotDiscovered firstContactOutcome = "not_discovered"
+	// firstContactOtherProject: the bound identity is not in the row's
+	// account and first_contact_project_id.
+	firstContactOtherProject firstContactOutcome = "other_project"
+	// firstContactApprovalChannel: the bound identity is an approval channel,
+	// which only a person activates.
+	firstContactApprovalChannel firstContactOutcome = "approval_channel"
 )
 
+// rereads reports whether the grant reads the subject's bindings again after
+// an attempt with this outcome.
+func (o firstContactOutcome) rereads() bool {
+	return o == firstContactRegistered || o == firstContactAdopted || o == firstContactAlreadyBound
+}
+
+// firstContactResult is what a first-contact attempt did.
+type firstContactResult struct {
+	outcome firstContactOutcome
+	// identity is the identity registered or adopted, when there is one.
+	identity *domain.Identity
+	// candidate is the bound identity a standing adoption declined, when it
+	// got as far as reading one.
+	candidate string
+}
+
 // firstContactArrival is a credential that verified in full and named an
-// agent no binding maps.
+// agent no enabled binding maps.
 type firstContactArrival struct {
 	row        *domain.ExternalIssuer
 	subjectKey string
@@ -144,24 +194,31 @@ type firstContactArrival struct {
 	claims map[string]any
 }
 
-// firstContactFunc is the first-contact step bindAgent runs when no binding
-// maps the subject key. It reports whether a binding now exists, so the
-// caller reads the bindings again.
-type firstContactFunc func(ctx context.Context) (bool, error)
+// firstContactFunc is the first-contact step bindAgent runs when no enabled
+// binding maps the subject key. existing are the bindings bindAgent read:
+// none, or only disabled ones. It reports whether a binding was created or
+// enabled, here or concurrently, so the caller reads the bindings again.
+type firstContactFunc func(ctx context.Context, existing []*domain.IssuerBinding) (bool, error)
 
 // firstContactFor returns the first-contact step for a credential that
-// verified under row, or nil when nothing would register: no registrar, a
+// verified under row, or nil when nothing would happen: no registrar, a
 // static issuer, a disabled row, or first_contact off. prepare, when set,
-// runs before anything is registered and may decline with an outcome
-// (nothing is registered, the attempt is logged, and the grant refuses as
-// without first contact) or refuse the request with an error.
+// runs before anything is written and may decline with an outcome (nothing
+// is written, the attempt is logged, and the grant refuses as without first
+// contact) or refuse the request with an error.
 func (s *OAuthService) firstContactFor(row *domain.ExternalIssuer, subjectKey, grant string, claims map[string]any,
 	prepare func(ctx context.Context) (firstContactOutcome, error),
 ) firstContactFunc {
 	if s.firstContact == nil || row == nil || !row.Enabled || !row.FirstContact.On() {
 		return nil
 	}
-	return func(ctx context.Context) (bool, error) {
+	return func(ctx context.Context, existing []*domain.IssuerBinding) (bool, error) {
+		// An agent bound but not enabled is first contact's only under an
+		// adopt row. Under discover it is in the adoption queue already, and
+		// is refused as it always was, with nothing logged here.
+		if len(existing) > 0 && row.FirstContact != domain.FirstContactAdopt {
+			return false, nil
+		}
 		a := firstContactArrival{row: row, subjectKey: subjectKey, grant: grant, claims: claims}
 		if prepare != nil {
 			declined, err := prepare(ctx)
@@ -169,48 +226,49 @@ func (s *OAuthService) firstContactFor(row *domain.ExternalIssuer, subjectKey, g
 				return false, err
 			}
 			if declined != "" {
-				recordFirstContact(ctx, a, row.FirstContact, declined, nil)
+				recordFirstContact(ctx, a, row.FirstContact, firstContactResult{outcome: declined})
 				return false, nil
 			}
 		}
-		identity, outcome, err := s.firstContact.register(ctx, a)
+		res, err := s.firstContact.arrive(ctx, a)
 		if err != nil {
-			return false, oauthServerError("failed to register the agent on first contact", err)
+			return false, oauthServerError("failed to apply first contact to the agent", err)
 		}
-		recordFirstContact(ctx, a, row.FirstContact, outcome, identity)
-		return outcome == firstContactRegistered || outcome == firstContactAlreadyBound, nil
+		recordFirstContact(ctx, a, row.FirstContact, res)
+		return res.outcome.rereads(), nil
 	}
 }
 
-// Sentinels that end the registration transaction after a failed write.
+// Sentinels that end the first-contact transaction after a failed write.
 var (
 	errFirstContactTaken = errors.New("first contact: external_id taken")
-	errFirstContactRace  = errors.New("first contact: binding created concurrently")
+	errFirstContactRace  = errors.New("first contact: binding created or enabled concurrently")
 )
 
-// register creates the identity and binding for a, in one transaction under
-// the account's first-contact lock. It returns the identity only when it
-// registered one. Every outcome but an error leaves the grant to read the
-// bindings and decide as usual.
-func (r *FirstContactRegistrar) register(ctx context.Context, a firstContactArrival) (*domain.Identity, firstContactOutcome, error) {
+// arrive applies first contact to a in one transaction under the account's
+// first-contact lock. Under the lock it re-reads the row and the subject's
+// bindings and decides on what it reads: with no binding it registers the
+// agent, and with only a disabled one under an adopt row it applies the
+// row's standing adoption. Every result but an error leaves the grant to
+// read the bindings and decide as usual.
+func (r *FirstContactRegistrar) arrive(ctx context.Context, a firstContactArrival) (firstContactResult, error) {
 	row := a.row
 	if len(a.subjectKey) > domain.MaxSubjectKeyBytes {
-		return nil, firstContactSubjectTooLong, nil
+		return firstContactResult{outcome: firstContactSubjectTooLong}, nil
 	}
 	project := row.FirstContactProjectID
 	// The project's default credential policy is ensured before the
 	// transaction: created inside it, a concurrent creation would abort the
 	// transaction instead of being read back.
 	if _, err := r.identities.policySvc.EnsureDefaultPolicy(ctx, row.AccountID, project); err != nil {
-		return nil, "", err
+		return firstContactResult{}, err
 	}
 
-	var (
-		identity *domain.Identity
-		outcome  firstContactOutcome
-	)
+	var res firstContactResult
 	err := r.issuers.DB().RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		ctx = postgres.WithTx(ctx, tx)
+		// The audit actor of every write, and the identity's modified_by.
+		ctx = middleware.SetCallerName(ctx, FirstContactActor)
 		if err := r.issuers.SetAuditActor(ctx, FirstContactActor); err != nil {
 			return err
 		}
@@ -218,122 +276,287 @@ func (r *FirstContactRegistrar) register(ctx context.Context, a firstContactArri
 			return err
 		}
 		// The row as it is now, held against a concurrent delete: disabled,
-		// switched off or re-mapped since the request read it, it registers
+		// switched off or re-mapped since the request read it, it writes
 		// nothing.
 		fresh, err := r.issuers.GetForShare(ctx, row.ID, row.AccountID)
 		if errors.Is(err, sql.ErrNoRows) {
-			outcome = firstContactRowChanged
+			res.outcome = firstContactRowChanged
 			return nil
 		}
 		if err != nil {
 			return err
 		}
 		if !fresh.Enabled || fresh.Kind != row.Kind || !fresh.FirstContact.On() || fresh.FirstContactProjectID != project {
-			outcome = firstContactRowChanged
+			res.outcome = firstContactRowChanged
 			return nil
 		}
-		mode := fresh.FirstContact
-
 		// Under the lock, so two first contacts for one subject make one
-		// identity: the second finds the first one's binding.
+		// identity or one activation: the second finds the first's binding.
 		existing, err := r.issuers.BindingsFor(ctx, row.ID, a.subjectKey)
 		if err != nil {
 			return err
 		}
-		if len(existing) > 0 {
-			outcome = firstContactAlreadyBound
-			return nil
+		switch {
+		case len(existing) == 0:
+			res, err = r.registerLocked(ctx, a, fresh)
+		case existing[0].Enabled || fresh.FirstContact != domain.FirstContactAdopt:
+			res.outcome = firstContactAlreadyBound
+		default:
+			res, err = r.adoptLocked(ctx, a, fresh, existing)
 		}
-		recent, err := r.issuers.CountBindingsCreatedBySince(ctx, row.ID, FirstContactActor, time.Now().Add(-time.Minute))
-		if err != nil {
-			return err
-		}
-		if recent >= r.cfg.RatePerMinute {
-			outcome = firstContactRateLimited
-			return nil
-		}
-		if mode == domain.FirstContactDiscover {
-			n, err := r.identities.repo.CountByOriginAndStatus(ctx, row.AccountID, domain.OriginFirstContact, domain.IdentityStatusDiscovered)
-			if err != nil {
-				return err
-			}
-			if n >= r.cfg.MaxDiscoveredPerAccount {
-				outcome = firstContactAccountCap
-				return nil
-			}
-		}
-
-		externalID := firstContactExternalID(row.ID, a.subjectKey)
-		if _, err := r.identities.repo.GetByExternalID(ctx, externalID, row.AccountID, project); err == nil {
-			outcome = firstContactExternalIDTaken
-			return nil
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-
-		labels, metadata, err := firstContactMarkers(a, mode)
-		if err != nil {
-			return err
-		}
-		req := RegisterIdentityRequest{
-			AccountID:    row.AccountID,
-			ProjectID:    project,
-			ExternalID:   externalID,
-			Name:         firstContactName(a.subjectKey),
-			IdentityType: domain.IdentityTypeAgent,
-			TrustLevel:   domain.TrustLevelUnverified,
-			Origin:       domain.OriginFirstContact,
-			OwnerUserID:  fresh.FirstContactOwnerUserID,
-			Labels:       labels,
-			Metadata:     metadata,
-			CreatedBy:    FirstContactActor,
-			firstContact: true,
-		}
-		if mode == domain.FirstContactAdopt {
-			// The row's standing mapping is the adoption: the agent is adopted
-			// into the mapped project, owned by the mapped user, and vouched
-			// for by an issuer the account trusts.
-			req.adopted = true
-			req.TrustLevel = domain.TrustLevelVerifiedThirdParty
-		}
-		created, err := r.identities.RegisterIdentity(ctx, req)
-		if err != nil {
-			var deactivated *IdentityDeactivatedConflictError
-			if errors.Is(err, ErrIdentityAlreadyExists) || errors.As(err, &deactivated) {
-				return errFirstContactTaken
-			}
-			return err
-		}
-		binding := &domain.IssuerBinding{
-			AccountID:  row.AccountID,
-			IssuerID:   row.ID,
-			SubjectKey: a.subjectKey,
-			IdentityID: created.ID,
-			// discover: disabled until the agent is adopted, as a binding for
-			// any unadopted identity is. Not explicitly disabled, so adoption
-			// enables it.
-			Enabled:   mode == domain.FirstContactAdopt,
-			CreatedBy: FirstContactActor,
-			UpdatedBy: FirstContactActor,
-		}
-		if err := r.issuers.InsertBinding(ctx, binding); err != nil {
-			if isDuplicateKeyError(err) {
-				return errFirstContactRace
-			}
-			return err
-		}
-		identity, outcome = created, firstContactRegistered
-		return nil
+		return err
 	})
 	switch {
 	case errors.Is(err, errFirstContactTaken):
-		return nil, firstContactExternalIDTaken, nil
+		return firstContactResult{outcome: firstContactExternalIDTaken}, nil
 	case errors.Is(err, errFirstContactRace):
-		return nil, firstContactAlreadyBound, nil
+		return firstContactResult{outcome: firstContactAlreadyBound}, nil
 	case err != nil:
-		return nil, "", err
+		return firstContactResult{}, err
 	}
-	return identity, outcome, nil
+	return res, nil
+}
+
+// registerLocked creates the identity and binding for an agent no binding
+// maps, in arrive's transaction. fresh is the row as read under the lock.
+func (r *FirstContactRegistrar) registerLocked(ctx context.Context, a firstContactArrival, fresh *domain.ExternalIssuer) (firstContactResult, error) {
+	row, project, mode := a.row, fresh.FirstContactProjectID, fresh.FirstContact
+	recent, err := r.issuers.CountBindingsWrittenBySince(ctx, row.ID, FirstContactActor, time.Now().Add(-time.Minute))
+	if err != nil {
+		return firstContactResult{}, err
+	}
+	if recent >= r.cfg.RatePerMinute {
+		return firstContactResult{outcome: firstContactRateLimited}, nil
+	}
+	if mode == domain.FirstContactDiscover {
+		n, err := r.identities.repo.CountByOriginAndStatus(ctx, row.AccountID, domain.OriginFirstContact, domain.IdentityStatusDiscovered)
+		if err != nil {
+			return firstContactResult{}, err
+		}
+		if n >= r.cfg.MaxDiscoveredPerAccount {
+			return firstContactResult{outcome: firstContactAccountCap}, nil
+		}
+	}
+
+	externalID := firstContactExternalID(row.ID, a.subjectKey)
+	if _, err := r.identities.repo.GetByExternalID(ctx, externalID, row.AccountID, project); err == nil {
+		return firstContactResult{outcome: firstContactExternalIDTaken}, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return firstContactResult{}, err
+	}
+
+	labels, metadata, err := firstContactMarkers(a, fresh)
+	if err != nil {
+		return firstContactResult{}, err
+	}
+	req := RegisterIdentityRequest{
+		AccountID:    row.AccountID,
+		ProjectID:    project,
+		ExternalID:   externalID,
+		Name:         firstContactName(a.subjectKey),
+		IdentityType: domain.IdentityTypeAgent,
+		TrustLevel:   domain.TrustLevelUnverified,
+		Origin:       domain.OriginFirstContact,
+		OwnerUserID:  fresh.FirstContactOwnerUserID,
+		Labels:       labels,
+		Metadata:     metadata,
+		CreatedBy:    FirstContactActor,
+		firstContact: true,
+	}
+	if mode == domain.FirstContactAdopt {
+		// The row's standing mapping is the adoption: the agent is adopted
+		// into the mapped project, owned by the mapped user, and vouched for
+		// by an issuer the account trusts.
+		req.adopted = true
+		req.TrustLevel = domain.TrustLevelVerifiedThirdParty
+	}
+	created, err := r.identities.RegisterIdentity(ctx, req)
+	if err != nil {
+		var deactivated *IdentityDeactivatedConflictError
+		if errors.Is(err, ErrIdentityAlreadyExists) || errors.As(err, &deactivated) {
+			return firstContactResult{}, errFirstContactTaken
+		}
+		return firstContactResult{}, err
+	}
+	binding := &domain.IssuerBinding{
+		AccountID:  row.AccountID,
+		IssuerID:   row.ID,
+		SubjectKey: a.subjectKey,
+		IdentityID: created.ID,
+		// discover: disabled until the agent is adopted, as a binding for
+		// any unadopted identity is. Not explicitly disabled, so adoption
+		// enables it.
+		Enabled:   mode == domain.FirstContactAdopt,
+		CreatedBy: FirstContactActor,
+		UpdatedBy: FirstContactActor,
+	}
+	if err := r.issuers.InsertBinding(ctx, binding); err != nil {
+		if isDuplicateKeyError(err) {
+			return firstContactResult{}, errFirstContactRace
+		}
+		return firstContactResult{}, err
+	}
+	return firstContactResult{outcome: firstContactRegistered, identity: created}, nil
+}
+
+// adoptLocked applies an adopt row's standing mapping to the agent the
+// subject key already names through a disabled binding, in arrive's
+// transaction: the identity goes discovered → active, owned by the mapped
+// user, verified_third_party, with the project's default credential policy
+// if it has none, and its binding is enabled. Through the identity service's
+// lifecycle transition, so its owner rule and audit row apply.
+//
+// The identity's row is locked before the binding's, the order in which a
+// purge's cascade takes them, and every guard is checked on the locked rows:
+// a person's concurrent disable, adoption or dismissal either commits first
+// and is seen here, or waits for this transaction.
+func (r *FirstContactRegistrar) adoptLocked(ctx context.Context, a firstContactArrival, fresh *domain.ExternalIssuer,
+	existing []*domain.IssuerBinding,
+) (firstContactResult, error) {
+	if fresh.FirstContactOwnerUserID == "" {
+		return firstContactResult{outcome: firstContactRowChanged}, nil
+	}
+	candidate, outcome := standingAdoptionBinding(existing)
+	if outcome != "" {
+		return firstContactResult{outcome: outcome}, nil
+	}
+	res := firstContactResult{candidate: candidate.IdentityID}
+	identity, err := r.identities.repo.GetByIDInAccountForUpdate(ctx, candidate.IdentityID, fresh.AccountID)
+	if errors.Is(err, sql.ErrNoRows) {
+		res.outcome = firstContactOtherProject
+		return res, nil
+	}
+	if err != nil {
+		return firstContactResult{}, err
+	}
+	binding, err := r.issuers.GetBindingForUpdate(ctx, candidate.ID, fresh.AccountID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Deleted since it was read: the grant reads the bindings again.
+		res.outcome = firstContactAlreadyBound
+		return res, nil
+	}
+	if err != nil {
+		return firstContactResult{}, err
+	}
+	if res.outcome = standingAdoptionRefusal(fresh, binding, identity); res.outcome != "" {
+		return res, nil
+	}
+	if channel, err := r.identities.IsApprovalChannel(ctx, identity); err != nil {
+		return firstContactResult{}, err
+	} else if channel {
+		res.outcome = firstContactApprovalChannel
+		return res, nil
+	}
+	recent, err := r.issuers.CountBindingsWrittenBySince(ctx, fresh.ID, FirstContactActor, time.Now().Add(-time.Minute))
+	if err != nil {
+		return firstContactResult{}, err
+	}
+	if recent >= r.cfg.RatePerMinute {
+		res.outcome = firstContactRateLimited
+		return res, nil
+	}
+
+	labels, metadata, err := standingAdoptionMarkers(identity, a, fresh)
+	if err != nil {
+		return firstContactResult{}, err
+	}
+	active := domain.IdentityStatusActive
+	update := UpdateIdentityRequest{
+		Status:      &active,
+		OwnerUserID: fresh.FirstContactOwnerUserID,
+		TrustLevel:  domain.TrustLevelVerifiedThirdParty,
+		Labels:      labels,
+		Metadata:    metadata,
+	}
+	if identity.CredentialPolicyID == "" {
+		// No policy of its own: the project's default, as a registered agent
+		// gets.
+		projectDefault := ""
+		update.CredentialPolicyID = &projectDefault
+	}
+	adopted, err := r.identities.UpdateIdentity(ctx, identity.ID, identity.AccountID, identity.ProjectID, update)
+	if err != nil {
+		return firstContactResult{}, err
+	}
+	binding.Enabled = true
+	binding.ExplicitlyDisabled = false
+	binding.UpdatedBy = FirstContactActor
+	if err := r.issuers.UpdateBinding(ctx, binding, false); err != nil {
+		if isDuplicateKeyError(err) {
+			// Another of the subject's bindings was enabled meanwhile.
+			return firstContactResult{}, errFirstContactRace
+		}
+		return firstContactResult{}, err
+	}
+	res.outcome, res.identity = firstContactAdopted, adopted
+	return res, nil
+}
+
+// standingAdoptionBinding returns the one binding a standing adoption may act
+// on among the subject's bindings under the row (all disabled), or why there
+// is none. A person's explicit disable on any of them wins, and two or more
+// leave the choice of identity to a person.
+func standingAdoptionBinding(existing []*domain.IssuerBinding) (*domain.IssuerBinding, firstContactOutcome) {
+	for _, b := range existing {
+		if b.ExplicitlyDisabled {
+			return nil, firstContactExplicitlyDisabled
+		}
+	}
+	if len(existing) != 1 {
+		return nil, firstContactAmbiguousBinding
+	}
+	return existing[0], ""
+}
+
+// standingAdoptionRefusal says why row's standing mapping does not adopt
+// identity through binding, or "" when it does: the binding must still be
+// disabled and not explicitly, and the identity discovered, in the row's
+// account and first_contact_project_id. The approval-channel check, which
+// reads the identity's policy, is left to the caller.
+func standingAdoptionRefusal(row *domain.ExternalIssuer, binding *domain.IssuerBinding, identity *domain.Identity) firstContactOutcome {
+	switch {
+	case binding.Enabled:
+		return firstContactAlreadyBound
+	case binding.ExplicitlyDisabled:
+		return firstContactExplicitlyDisabled
+	case identity.Status != domain.IdentityStatusDiscovered:
+		return firstContactNotDiscovered
+	case identity.AccountID != row.AccountID || identity.ProjectID != row.FirstContactProjectID:
+		return firstContactOtherProject
+	}
+	return ""
+}
+
+// standingAdoptionCandidate is what a standing adoption would do for the
+// subject's bindings under an adopt row, read without locks: the identity it
+// would activate, or why it would not. The ID-JAG grant reads it before it
+// resolves the person and spends the jti; arrive decides again under the
+// lock.
+func (r *FirstContactRegistrar) standingAdoptionCandidate(ctx context.Context, row *domain.ExternalIssuer,
+	existing []*domain.IssuerBinding,
+) (string, firstContactOutcome, error) {
+	binding, outcome := standingAdoptionBinding(existing)
+	if outcome != "" {
+		return "", outcome, nil
+	}
+	identity, err := r.identities.repo.GetByIDInAccounts(ctx, binding.IdentityID, []string{row.AccountID})
+	if errors.Is(err, sql.ErrNoRows) {
+		return binding.IdentityID, firstContactOtherProject, nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	if outcome := standingAdoptionRefusal(row, binding, identity); outcome != "" {
+		return identity.ID, outcome, nil
+	}
+	channel, err := r.identities.IsApprovalChannel(ctx, identity)
+	if err != nil {
+		return "", "", err
+	}
+	if channel {
+		return identity.ID, firstContactApprovalChannel, nil
+	}
+	return identity.ID, "", nil
 }
 
 // firstContactExternalID is the external_id of the identity first contact
@@ -398,26 +621,86 @@ type firstContactRecord struct {
 	AWS map[string]any `json:"aws,omitempty"`
 }
 
-// firstContactMarkers returns the labels and metadata of a first-contact
-// identity.
-func firstContactMarkers(a firstContactArrival, mode domain.FirstContactMode) (json.RawMessage, json.RawMessage, error) {
-	labels, err := json.Marshal(map[string]string{domain.FirstContactLabelKey: domain.FirstContactLabelValue})
-	if err != nil {
-		return nil, nil, err
+// standingAdoptionRecord is the metadata, under first_contact_adoption, of an
+// identity an issuer row's standing mapping activated: the row, the subject
+// and grant it was adopted on, and who last set the row's mapping, the person
+// accountable for the adoption.
+type standingAdoptionRecord struct {
+	Issuer           string     `json:"issuer"`
+	IssuerID         string     `json:"issuer_id"`
+	SubjectKey       string     `json:"subject_key"`
+	GrantType        string     `json:"grant_type"`
+	MappingUpdatedBy string     `json:"mapping_updated_by"`
+	MappingUpdatedAt *time.Time `json:"mapping_updated_at,omitempty"`
+}
+
+func newStandingAdoptionRecord(a firstContactArrival, fresh *domain.ExternalIssuer) standingAdoptionRecord {
+	return standingAdoptionRecord{
+		Issuer:           fresh.Issuer,
+		IssuerID:         fresh.ID,
+		SubjectKey:       a.subjectKey,
+		GrantType:        a.grant,
+		MappingUpdatedBy: fresh.FirstContactUpdatedBy,
+		MappingUpdatedAt: fresh.FirstContactUpdatedAt,
 	}
-	metadata, err := json.Marshal(map[string]any{domain.FirstContactMetadataKey: firstContactRecord{
+}
+
+// firstContactMarkers returns the labels and metadata of an identity first
+// contact registers under fresh, the row as read under the lock. An adopt
+// row's identity also carries the standing-adoption markers.
+func firstContactMarkers(a firstContactArrival, fresh *domain.ExternalIssuer) (json.RawMessage, json.RawMessage, error) {
+	labelMap := map[string]string{domain.FirstContactLabelKey: domain.FirstContactLabelValue}
+	metadataMap := map[string]any{domain.FirstContactMetadataKey: firstContactRecord{
 		Issuer:      a.row.Issuer,
 		IssuerID:    a.row.ID,
 		SubjectKey:  a.subjectKey,
 		FirstSeenAt: time.Now().UTC().Truncate(time.Second),
 		GrantType:   a.grant,
-		Mode:        string(mode),
+		Mode:        string(fresh.FirstContact),
 		AWS:         awsSTSClaims(a.claims),
-	}})
+	}}
+	if fresh.FirstContact == domain.FirstContactAdopt {
+		labelMap[domain.StandingAdoptionLabelKey] = domain.FirstContactLabelValue
+		metadataMap[domain.StandingAdoptionMetadataKey] = newStandingAdoptionRecord(a, fresh)
+	}
+	labels, err := json.Marshal(labelMap)
+	if err != nil {
+		return nil, nil, err
+	}
+	metadata, err := json.Marshal(metadataMap)
 	if err != nil {
 		return nil, nil, err
 	}
 	return labels, metadata, nil
+}
+
+// standingAdoptionMarkers returns identity's labels and metadata with the
+// standing-adoption markers added: the adopted_via label and the
+// first_contact_adoption record. Labels or metadata that are not a JSON
+// object are replaced by an object holding only the marker; the audit row of
+// the adoption keeps what they were.
+func standingAdoptionMarkers(identity *domain.Identity, a firstContactArrival, fresh *domain.ExternalIssuer) (json.RawMessage, json.RawMessage, error) {
+	labelValue, err := json.Marshal(domain.FirstContactLabelValue)
+	if err != nil {
+		return nil, nil, err
+	}
+	record, err := json.Marshal(newStandingAdoptionRecord(a, fresh))
+	if err != nil {
+		return nil, nil, err
+	}
+	labels, _ := jsonObject(identity.Labels)
+	labels[domain.StandingAdoptionLabelKey] = labelValue
+	metadata, _ := jsonObject(identity.Metadata)
+	metadata[domain.StandingAdoptionMetadataKey] = record
+	rawLabels, err := json.Marshal(labels)
+	if err != nil {
+		return nil, nil, err
+	}
+	rawMetadata, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, nil, err
+	}
+	return rawLabels, rawMetadata, nil
 }
 
 // awsSTSClaimNamespace holds the AWS claims of an STS web identity token
@@ -495,18 +778,17 @@ func awsSTSClaims(claims map[string]any) map[string]any {
 // recordFirstContact logs and counts a first-contact attempt. A discover
 // registration also emits the unmatched-agent event, pointing at the
 // identity it registered: the credential still maps to no adopted agent.
-func recordFirstContact(ctx context.Context, a firstContactArrival, mode domain.FirstContactMode,
-	outcome firstContactOutcome, identity *domain.Identity,
-) {
+func recordFirstContact(ctx context.Context, a firstContactArrival, mode domain.FirstContactMode, res firstContactResult) {
 	telemetry.FederationFirstContact.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("account_id", a.row.AccountID),
 		attribute.String("grant_type", a.grant),
 		attribute.String("mode", string(mode)),
-		attribute.String("outcome", string(outcome)),
+		attribute.String("outcome", string(res.outcome)),
 	))
 	var ev *zerolog.Event
-	switch outcome {
-	case firstContactRateLimited, firstContactAccountCap, firstContactExternalIDTaken, firstContactSubjectTooLong:
+	switch res.outcome {
+	case firstContactRateLimited, firstContactAccountCap, firstContactExternalIDTaken, firstContactSubjectTooLong,
+		firstContactAmbiguousBinding, firstContactOtherProject, firstContactApprovalChannel:
 		ev = log.Warn()
 	default:
 		ev = log.Info()
@@ -517,16 +799,19 @@ func recordFirstContact(ctx context.Context, a firstContactArrival, mode domain.
 		Str("subject_key", a.subjectKey).
 		Str("grant_type", a.grant).
 		Str("mode", string(mode)).
-		Str("outcome", string(outcome))
-	if identity != nil {
-		ev = ev.Str("identity_id", identity.ID).
-			Str("project_id", identity.ProjectID).
-			Str("status", string(identity.Status))
+		Str("outcome", string(res.outcome))
+	switch {
+	case res.identity != nil:
+		ev = ev.Str("identity_id", res.identity.ID).
+			Str("project_id", res.identity.ProjectID).
+			Str("status", string(res.identity.Status))
+	case res.candidate != "":
+		ev = ev.Str("identity_id", res.candidate)
 	}
 	ev.Msg("federation_first_contact")
 
-	if identity != nil && identity.Status != domain.IdentityStatusActive {
-		recordUnmatchedAgentIdentity(ctx, a.row, a.subjectKey, a.grant, "first_contact_registered", identity.ID)
+	if res.identity != nil && res.identity.Status != domain.IdentityStatusActive {
+		recordUnmatchedAgentIdentity(ctx, a.row, a.subjectKey, a.grant, "first_contact_registered", res.identity.ID)
 	}
 }
 
@@ -564,6 +849,59 @@ func keepFirstContactProvenance(identity *domain.Identity, prevLabels, prevMetad
 	if raw, err := json.Marshal(metadata); err == nil {
 		identity.Metadata = raw
 	}
+}
+
+// keepStandingAdoptionMarkers makes the adopted_via label and the
+// first_contact_adoption record, which only a standing adoption writes,
+// follow the stored identity through a discovered ingest: kept, with their
+// stored values, on an identity that has them, and dropped from an update or
+// a new identity that would add them. prevLabels and prevMetadata are the
+// stored values, nil for a new identity.
+func keepStandingAdoptionMarkers(identity *domain.Identity, prevLabels, prevMetadata json.RawMessage) {
+	identity.Labels = followMarker(identity.Labels, prevLabels, domain.StandingAdoptionLabelKey, isFirstContactLabelValue)
+	identity.Metadata = followMarker(identity.Metadata, prevMetadata, domain.StandingAdoptionMetadataKey, nil)
+}
+
+func isFirstContactLabelValue(v json.RawMessage) bool {
+	var s string
+	return json.Unmarshal(v, &s) == nil && s == domain.FirstContactLabelValue
+}
+
+// followMarker returns next with the marker key as prev has it: set to
+// prev's value when prev has it, absent when prev has not. A value counts as
+// the marker only when match accepts it (nil accepts any). A next that is
+// not a JSON object is replaced by prev when prev has the marker, and left
+// alone otherwise.
+func followMarker(next, prev json.RawMessage, key string, match func(json.RawMessage) bool) json.RawMessage {
+	marker := func(obj map[string]json.RawMessage) (json.RawMessage, bool) {
+		v, ok := obj[key]
+		return v, ok && (match == nil || match(v))
+	}
+	prevObj, _ := jsonObject(prev)
+	kept, had := marker(prevObj)
+	nextObj, ok := jsonObject(next)
+	if !ok {
+		if had {
+			return prev
+		}
+		return next
+	}
+	got, has := marker(nextObj)
+	switch {
+	case had && has && bytes.Equal(got, kept):
+		return next
+	case had:
+		nextObj[key] = kept
+	case has:
+		delete(nextObj, key)
+	default:
+		return next
+	}
+	raw, err := json.Marshal(nextObj)
+	if err != nil {
+		return next
+	}
+	return raw
 }
 
 // jsonObject decodes raw as a JSON object, keeping each value's encoding.
