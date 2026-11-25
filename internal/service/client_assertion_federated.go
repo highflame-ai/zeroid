@@ -3,15 +3,11 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
-	"time"
 
-	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
-	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
@@ -41,39 +37,12 @@ const (
 const federatedAuthUnavailable = "client authentication is temporarily unavailable"
 
 // workloadIssuerFor reports whether req's client_assertion was issued by an
-// enabled workload issuer row, and returns its entry. An assertion whose iss
-// names no workload row (a registered client's own private_key_jwt) returns
-// ok=false and keeps today's registered-client path. An iss that does name
-// workload rows but matches none usably is refused here rather than handed to
-// that path: explicit issuer configuration wins, it is never guessed around.
+// enabled workload issuer row, and returns its entry (see
+// LookupWorkloadIssuer). An assertion whose iss names no workload row (a
+// registered client's own private_key_jwt) returns ok=false and keeps today's
+// registered-client path.
 func (s *OAuthService) workloadIssuerFor(ctx context.Context, req TokenRequest) (*ExternalIssuerEntry, bool, error) {
-	if req.ClientAssertion == "" || s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.DBMode() {
-		return nil, false, nil
-	}
-	peeked, err := jwt.ParseInsecure([]byte(req.ClientAssertion))
-	if err != nil {
-		return nil, false, nil
-	}
-	iss, ok := peeked.Issuer()
-	if !ok || iss == "" {
-		return nil, false, nil
-	}
-	entry, err := s.externalIssuerRegistry.ResolveWorkload(ctx, iss, tokenClaimsAsMap(peeked))
-	switch {
-	case err == nil:
-		return entry, true, nil
-	case errors.Is(err, ErrUnknownExternalIssuer), errors.Is(err, errIssuerNotWorkload):
-		return nil, false, nil
-	case errors.Is(err, errIssuerLookupFailed):
-		return nil, false, oauthServerError("failed to resolve the client assertion's issuer", err)
-	default:
-		// Disabled, constraints unmet, or ambiguous. The assertion is not
-		// verified yet, so the refusal is the registered path's generic one:
-		// a distinct answer would tell an unsigned probe which issuers, and
-		// which claim values, an account trusts. The reason goes to the log.
-		log.Info().Str("issuer", iss).Err(err).Msg("federated client assertion refused before verification")
-		return nil, false, oauthUnauthorized("invalid client credentials", err)
-	}
+	return s.LookupWorkloadIssuer(ctx, req.ClientAssertion)
 }
 
 // federatedClientCredentials mints a client_credentials token for the agent a
@@ -84,103 +53,51 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 	// one an unknown client gets, and the reason goes to the log: a distinct
 	// answer would tell an unsigned probe that its iss and claims matched an
 	// enabled row.
-	refuseUnverified := func(reason string, cause error) error {
-		log.Info().Str("issuer", row.Issuer).Str("reason", reason).Err(cause).
-			Msg("federated client assertion refused before verification")
-		return oauthUnauthorized("invalid client credentials", cause)
-	}
 	if req.ClientAssertionType != clientAssertionTypeJWTBearer {
-		return nil, refuseUnverified("client_assertion_type is not jwt-bearer", nil)
+		return nil, refuseUnverifiedWorkload(row, "client_assertion_type is not jwt-bearer", nil)
 	}
 	// One client authentication method per request (RFC 6749 §2.3).
 	if req.ClientSecret != "" {
-		return nil, refuseUnverified("client_secret sent with a client_assertion", nil)
+		return nil, refuseUnverifiedWorkload(row, "client_secret sent with a client_assertion", nil)
 	}
 
-	// Signature against the row's JWKS, iss, the row's audiences, its claim
-	// constraints, sub, exp and iat present, and the row's token-age cap.
-	verified, err := validateExternalAssertion(ctx, req.ClientAssertion, entry, "client_assertion", requirePlainSub)
-	if err != nil {
-		var oe *OAuthError
-		if errors.As(err, &oe) && oe.HTTPStatus >= http.StatusInternalServerError {
-			// A server-side failure keeps its status, so the client retries
-			// rather than giving up, but not its description: that can name
-			// the issuer ("failed to load JWKS for issuer ..."), which an
-			// unsigned probe must not learn is trusted.
-			log.Warn().Str("issuer", row.Issuer).Err(err).
-				Msg("federated client assertion could not be verified")
-			return nil, &OAuthError{Code: oe.Code, Description: federatedAuthUnavailable, HTTPStatus: oe.HTTPStatus, err: err}
+	var clientID string
+	wa, err := s.VerifyWorkloadAssertion(ctx, req.ClientAssertion, entry, "client_assertion", func(sub string) error {
+		clientID = federatedClientID(row.Issuer, sub)
+		// RFC 7523 §3 makes sub the client_id; the issued token names the
+		// client as <iss>#<sub>. The handler fills an omitted client_id from
+		// the assertion's iss, so that value means "not sent".
+		if req.ClientID != "" && req.ClientID != row.Issuer && req.ClientID != sub && req.ClientID != clientID {
+			return oauthUnauthorized("client_id must equal the client_assertion's sub", nil)
 		}
-		return nil, refuseUnverified(errorDescription(err), err)
-	}
-
-	// D8: aud is single-valued and names this server: its issuer or its
-	// token endpoint (RFC 7523 §3). STS lets one token carry up to ten
-	// audiences, and a token minted for several servers, or for a broad
-	// audience such as a cluster's API server, can be replayed at each.
-	aud, _ := verified.Audience()
-	if len(aud) != 1 {
-		return nil, oauthUnauthorized("client_assertion aud must name exactly one audience", nil)
-	}
-	if !s.acceptedClientAssertionAudiences()[aud[0]] {
-		return nil, oauthUnauthorized("client_assertion aud must be this server's issuer or token endpoint", nil)
-	}
-
-	sub, _ := verified.Subject()
-	clientID := federatedClientID(row.Issuer, sub)
-	// RFC 7523 §3 makes sub the client_id; the issued token names the client
-	// as <iss>#<sub>. The handler fills an omitted client_id from the
-	// assertion's iss, so that value means "not sent".
-	if req.ClientID != "" && req.ClientID != row.Issuer && req.ClientID != sub && req.ClientID != clientID {
-		return nil, oauthUnauthorized("client_id must equal the client_assertion's sub", nil)
-	}
-
-	// The assertion's whole lifetime, iat to exp, is capped by the row's
-	// max_token_age_seconds (600 s by default). That fits STS's 300 s default
-	// and Kubernetes' 600 s minimum, and refuses a long-lived token at any
-	// point in its life, not only while it is fresh.
-	// validateExternalAssertion has required exp and iat, and the row's age
-	// cap (validated to 1..3600 s) is always set.
-	exp, _ := verified.Expiration()
-	iat, _ := verified.IssuedAt()
-	maxLifetime := time.Duration(row.MaxTokenAgeSeconds) * time.Second
-	if exp.Sub(iat) > maxLifetime {
-		return nil, oauthUnauthorized(fmt.Sprintf(
-			"client_assertion lifetime exceeds the issuer's %s", maxLifetime), nil)
-	}
-	jti, ok := verified.JwtID()
-	if !ok || jti == "" {
-		return nil, oauthUnauthorized("client_assertion missing required jti claim", nil)
-	}
-	if len(jti) > maxClientAssertionJTILength {
-		return nil, oauthUnauthorized(fmt.Sprintf(
-			"client_assertion jti exceeds %d characters", maxClientAssertionJTILength), nil)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	// Single use, spent once the assertion itself has passed every check and
 	// before the binding is read, so a captured assertion cannot replay the
-	// binding and adoption refusals (and their events) over and over. Keyed on
-	// (iss, sub, jti): a Kubernetes subject repeats across clusters, so the
-	// subject alone does not name one client.
-	if s.clientAssertionReplay == nil {
-		return nil, oauthServerError("client assertion replay store is not configured", nil)
-	}
-	replayKey := clientAssertionReplayKey("federated\x00"+row.Issuer+"\x00"+sub, jti)
-	if err := s.clientAssertionReplay.Insert(ctx, replayKey, exp.Add(clientAssertionClockSkew)); err != nil {
+	// binding and adoption refusals (and their events) over and over.
+	if err := s.SpendWorkloadAssertion(ctx, wa); err != nil {
 		if errors.Is(err, dpop.ErrReplay) {
 			return nil, oauthUnauthorized("client_assertion has already been used (replay)", nil)
+		}
+		var oe *OAuthError
+		if errors.As(err, &oe) {
+			return nil, err
 		}
 		return nil, oauthServerError("client assertion replay check failed", err)
 	}
 
-	accessToken, err := s.mintFederatedClientCredentials(ctx, req, row, sub, clientID, tokenClaimsAsMap(verified))
+	accessToken, err := s.mintFederatedClientCredentials(ctx, req, row, wa.Subject, clientID, wa.Claims)
 	if err != nil && federatedServerFailure(err) {
 		// Nothing was minted, and the caller was told to retry. The assertion
 		// is single use, and a Kubernetes or STS token can't be re-signed on
 		// demand, so a spent jti would turn that retry into "replay" until the
 		// platform token rotates. Releasing it still mints at most one token
 		// per assertion. Refusals (4xx) keep it spent, as above.
-		s.releaseClientAssertion(ctx, replayKey)
+		s.ReleaseWorkloadAssertion(ctx, wa)
 	}
 
 	return accessToken, err
@@ -206,29 +123,14 @@ func (s *OAuthService) mintFederatedClientCredentials(
 	trace.setClientID(clientID)
 	trace.setIdentity(identity)
 
-	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
-	if err != nil {
-		return nil, oauthServerError("failed to resolve identity credential policy", err)
-	}
-	// No registered client sets a scope list here, so the agent's policy and
-	// row ceilings are the only bound. With neither set, refuse: the
-	// registered client_credentials path refuses a client with no scopes for
-	// the same reason, and grantScopes would otherwise grant whatever the
-	// request names, nhi:manage included (highflame-authn#317).
-	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
-	if len(policyScopes) == 0 && !identity.ScopeCeilingRestricts() {
-		return nil, oauthBadRequest(oautherror.InvalidScope,
-			"the agent has no scope limit: set allowed_scopes on its identity or credential policy")
-	}
-	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
-	trace.identityCeiling(ceilingIdentityScopes, identity)
-	scopes, err := grantIdentityScopes(req.Scope, identity, policyScopes, rowScopes)
+	grant, err := s.ResolveWorkloadGrant(ctx, identity, req.Scope)
 	if err != nil {
 		return nil, err
 	}
+	policy, scopes := grant.Policy, grant.Scopes
 
 	issue := IssueRequest{
-		TTL:                 federatedAccessTokenTTL(policy),
+		TTL:                 grant.TTL,
 		Identity:            identity,
 		IdentityPolicyID:    policy.ID,
 		Scopes:              scopes,
