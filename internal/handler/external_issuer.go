@@ -118,6 +118,8 @@ type ExternalIssuerView struct {
 	FirstContact            string              `json:"first_contact"`
 	FirstContactProjectID   string              `json:"first_contact_project_id"`
 	FirstContactOwnerUserID string              `json:"first_contact_owner_user_id"`
+	FirstContactUpdatedBy   string              `json:"first_contact_updated_by" doc:"Who last changed first_contact or its mapping. Read-only."`
+	FirstContactUpdatedAt   *time.Time          `json:"first_contact_updated_at,omitempty" doc:"When first_contact or its mapping last changed. Read-only."`
 	CreatedBy               string              `json:"created_by"`
 	UpdatedBy               string              `json:"updated_by"`
 	CreatedAt               time.Time           `json:"created_at"`
@@ -134,7 +136,8 @@ func issuerView(r *domain.ExternalIssuer, check *service.JWKSCheck) ExternalIssu
 		Source: string(r.Source), SourceRef: r.SourceRef, Enabled: r.Enabled,
 		FirstContact: string(r.FirstContact), FirstContactProjectID: r.FirstContactProjectID,
 		FirstContactOwnerUserID: r.FirstContactOwnerUserID,
-		CreatedBy:               r.CreatedBy, UpdatedBy: r.UpdatedBy, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		FirstContactUpdatedBy:   r.FirstContactUpdatedBy, FirstContactUpdatedAt: r.FirstContactUpdatedAt,
+		CreatedBy: r.CreatedBy, UpdatedBy: r.UpdatedBy, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		JWKSCheck: check,
 	}
 }

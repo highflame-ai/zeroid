@@ -56,6 +56,9 @@ type CredentialService struct {
 	// the issuance and introspection guards (SetIdentityTree). Unset, every
 	// check that needs it refuses: the guards fail closed.
 	tree identityTreeReader
+	// scopeRules is the stricter scope rules' mode. Off by default; shadow
+	// only counts what they would change.
+	scopeRules scopeRulesState
 }
 
 // identityTreeReader is what the tree guards read: an identity's ancestor
@@ -773,6 +776,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	if req.Identity == nil {
 		return nil, nil, fmt.Errorf("identity is required")
 	}
+	// The stricter scope rules' shadow count (nil when off) attributes the
+	// request to the identity and client the token is for.
+	trace := scopeTraceFrom(ctx)
+	trace.setIdentity(req.Identity)
+	trace.setClientID(req.ClientID)
 	if !req.Identity.Status.IsUsable() {
 		return nil, nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, req.Identity.Status)
 	}
@@ -836,6 +844,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// Reserved scopes are issued only through the api_key grant's checks; an
 	// unbounded ceiling, an exchange or any other grant never yields one.
 	if r := s.reserved.in(req.Scopes); len(r) > 0 && !req.ReservedScopesAuthorized {
+		trace.refusedByReservedScopes()
 		return nil, nil, fmt.Errorf("%w: %q is issued only on the api_key grant, from a key that lists it", ErrScopesNotAllowed, r[0])
 	}
 
@@ -897,7 +906,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	//
 	// The identity's governing policy, kept for choices beyond enforcement
 	// (the token's typ header). Nil when no identity policy governs the grant.
-	var identityPolicy *domain.CredentialPolicy
+	// keyPolicy is the API key's own policy, when distinct from it.
+	var identityPolicy, keyPolicy *domain.CredentialPolicy
 	if s.policySvc != nil {
 		var attestationLevel string
 		if s.attestationRepo != nil && req.Identity.ID != "" {
@@ -982,6 +992,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 					Msg("Credential policy enforcement denied issuance")
 				return nil, nil, err
 			}
+			keyPolicy = policy
 		}
 	}
 
@@ -1326,6 +1337,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		Msg("Credential issued")
 
 	s.recordUnboundedScope(ctx, req, principal, identityPolicy)
+	if trace != nil {
+		trace.minted(req.Scopes, scopeListings(req, principal, identityPolicy, keyPolicy)...)
+	}
 
 	tokenType := "Bearer"
 	if req.DPoPKeyThumbprint != "" {

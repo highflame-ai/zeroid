@@ -40,7 +40,7 @@ const (
 )
 
 // FirstContactMode says what a credential that verified under an enabled
-// issuer row does when no binding maps its subject key yet. See
+// issuer row does when no enabled binding maps its subject key. See
 // docs/external-issuers.md, "First contact".
 type FirstContactMode string
 
@@ -49,11 +49,14 @@ const (
 	FirstContactOff FirstContactMode = "off"
 	// FirstContactDiscover registers a discovered identity with a disabled
 	// binding, then refuses the credential as it refuses any unadopted agent.
+	// A subject that already has a binding is left as it is.
 	FirstContactDiscover FirstContactMode = "discover"
 	// FirstContactAdopt registers an active identity under the row's mapping
 	// (project and owner), with an enabled binding, and serves the request.
-	// Setting it on a row is the adoption decision for every agent that first
-	// arrives through the row.
+	// An agent that already has a discovered identity in the mapped project,
+	// bound under the row but not enabled, is adopted under the same mapping
+	// instead (standing adoption). Setting it on a row is the adoption
+	// decision for every agent the row's issuer vouches for.
 	FirstContactAdopt FirstContactMode = "adopt"
 )
 
@@ -101,10 +104,15 @@ type ExternalIssuer struct {
 	Enabled             bool         `bun:"enabled,notnull"                           json:"enabled"`
 	// FirstContact and its mapping: the project an agent first seen through
 	// this row is registered into, and, for adopt, its owner. A disabled row
-	// registers nothing, whatever the mode.
+	// registers nothing, whatever the mode. FirstContactUpdatedBy and
+	// FirstContactUpdatedAt say who last changed any of the three, and when:
+	// the person accountable for what the row's standing adoption does
+	// (empty and nil until then).
 	FirstContact            FirstContactMode `bun:"first_contact,notnull"               json:"first_contact"`
 	FirstContactProjectID   string           `bun:"first_contact_project_id,notnull"    json:"first_contact_project_id"`
 	FirstContactOwnerUserID string           `bun:"first_contact_owner_user_id,notnull" json:"first_contact_owner_user_id"`
+	FirstContactUpdatedBy   string           `bun:"first_contact_updated_by,notnull"    json:"first_contact_updated_by"`
+	FirstContactUpdatedAt   *time.Time       `bun:"first_contact_updated_at"            json:"first_contact_updated_at,omitempty"`
 	CreatedBy               string           `bun:"created_by,notnull"                        json:"created_by"`
 	UpdatedBy               string           `bun:"updated_by,notnull"                        json:"updated_by"`
 	CreatedAt               time.Time        `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`

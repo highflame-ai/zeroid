@@ -1016,7 +1016,15 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	}
 	ttl := 900 // seconds — short-lived, matching ExternalPrincipalExchange; clamped to the bound identity's policy ceiling below
 	var identityPolicyID string
+	// The scope the bc-authorize request named is what the approval asks for.
+	trace := scopeTraceFrom(ctx)
+	trace.setTenant(row.AccountID, row.ProjectID)
+	trace.setClientID(row.ClientID)
+	trace.ask(parseScopeString(row.Scope), true)
 	client, cerr := s.oauthClientSvc.GetClientByClientID(ctx, row.ClientID)
+	if cerr == nil {
+		trace.setClient(client)
+	}
 	if cerr != nil {
 		if !errors.Is(cerr, ErrOAuthClientNotFound) {
 			// Only a definitive not-found may fall back to the unbound shape.
@@ -1048,6 +1056,7 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		if bound.IsExpired() {
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 		}
+		trace.setIdentity(bound)
 		// Identity credential policy — the same governance ceiling the
 		// authorization_code path enforces for bound clients: resolve it here
 		// and hand its ID to the IssueCredential chokepoint. The axes
@@ -1424,7 +1433,13 @@ func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *doma
 	// so there is no DPoP proof — passes empty thumbprint to keep the token
 	// as Bearer. Resource-server-side DPoP for CIBA-push tokens is a future
 	// item if it's ever needed.
-	accessToken, err := s.issueTokenForApprovedRow(ctx, row, "")
+	//
+	// No token request carries this mint, so it is traced here for the
+	// stricter scope rules' shadow count (a no-op unless it is on).
+	traceCtx, trace := s.credentialSvc.traceScopes(ctx, string(domain.GrantTypeCIBA))
+	trace.deliveredByPush()
+	accessToken, err := s.issueTokenForApprovedRow(traceCtx, row, "")
+	trace.done(traceCtx, err)
 	if err != nil {
 		// Most likely an OAuthError("access_denied") from a lost race against
 		// a concurrent dispatch. Log and exit — the first dispatcher will

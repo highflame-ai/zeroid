@@ -140,7 +140,15 @@ func ReservedScopeWrite(ctx context.Context) bool {
 // issue and, when they pass, marks it authorized and caps its lifetime. A
 // grant with no reserved scopes is untouched and never calls the authorizer,
 // so ordinary key exchanges gain no dependency on the deployer.
-func (s *OAuthService) authorizeReservedScopes(ctx context.Context, issue *IssueRequest, sk *domain.APIKey, identity *domain.Identity) error {
+//
+// Its refusals are the reserved-scope rules' own decision, so the stricter
+// scope rules' shadow count (token.scope_rules) records none of them.
+func (s *OAuthService) authorizeReservedScopes(ctx context.Context, issue *IssueRequest, sk *domain.APIKey, identity *domain.Identity) (err error) {
+	defer func() {
+		if err != nil {
+			scopeTraceFrom(ctx).refusedByReservedScopes()
+		}
+	}()
 	reserved := s.credentialSvc.reserved
 	scopes := reserved.in(issue.Scopes)
 	if len(scopes) == 0 {
@@ -161,13 +169,13 @@ func (s *OAuthService) authorizeReservedScopes(ctx context.Context, issue *Issue
 	}
 	actx, cancel := context.WithTimeout(ctx, reservedScopeTimeout)
 	defer cancel()
-	if err := authorize(actx, ReservedScopeGrant{
+	if aerr := authorize(actx, ReservedScopeGrant{
 		AccountID: sk.AccountID, ProjectID: sk.ProjectID, APIKeyID: sk.ID, CreatedBy: creator, Scopes: scopes,
-	}); err != nil {
-		if errors.Is(err, ErrReservedScopeDenied) {
-			return oauthBadRequestCause(oautherror.InvalidGrant, err.Error(), err)
+	}); aerr != nil {
+		if errors.Is(aerr, ErrReservedScopeDenied) {
+			return oauthBadRequestCause(oautherror.InvalidGrant, aerr.Error(), aerr)
 		}
-		return oauthServerError("could not authorize the key's reserved scopes", err)
+		return oauthServerError("could not authorize the key's reserved scopes", aerr)
 	}
 	issue.ReservedScopesAuthorized = true
 	issue.MaxTTL = maxTTL

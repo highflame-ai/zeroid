@@ -200,6 +200,11 @@ func (s *OAuthService) mintFederatedClientCredentials(
 	if err := federatedTenant(identity, req.AccountID, req.ProjectID); err != nil {
 		return nil, err
 	}
+	// clientCredentials recorded the request; the client here is the
+	// federated issuer and subject, which registered no scope list.
+	trace := scopeTraceFrom(ctx)
+	trace.setClientID(clientID)
+	trace.setIdentity(identity)
 
 	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
 	if err != nil {

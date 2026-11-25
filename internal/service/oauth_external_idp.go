@@ -230,6 +230,8 @@ func (s *OAuthService) SetExternalIssuerRegistry(r *ExternalIssuerRegistry) {
 // check + issuer allowlist + audience binding are the proof of trust.
 // That bypass is intentional and the entire point of the new path.
 func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	trace := scopeTraceFrom(ctx)
+	trace.setGrant(PersonGrantExternalIDToken)
 	if req.SubjectToken == "" {
 		return nil, oauthBadRequest("invalid_request", "subject_token is required")
 	}
@@ -246,6 +248,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	if err != nil {
 		return nil, err
 	}
+	trace.setClient(authedClient)
 
 	if s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.HasAny() {
 		return nil, oauthBadRequest("invalid_request", "no external issuers are configured for direct OIDC federation")
@@ -388,6 +391,8 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	}
 
 	scopes := parseScopeString(req.Scope)
+	trace.setIdentity(identity)
+	trace.ask(scopes, true)
 	issue := IssueRequest{
 		// The IdP's scopes are not read on this path, so the token is bounded
 		// only by the caller's request and the governing policy (ceiling rule, P1).

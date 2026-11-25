@@ -139,12 +139,12 @@ type FederationConfig struct {
 	FirstContact FirstContactConfig `koanf:"first_contact"`
 }
 
-// FirstContactConfig bounds first-contact registration. Past either bound a
-// credential that would register an agent gets the plain no-binding refusal
+// FirstContactConfig bounds first contact. Past either bound a credential
+// that would register or adopt an agent is refused as without first contact
 // instead, and the reason is logged.
 type FirstContactConfig struct {
-	// RatePerMinute caps the agents first contact registers under one issuer
-	// row in any minute. 0 means the default, 10.
+	// RatePerMinute caps the agents first contact registers or adopts under
+	// one issuer row in any minute. 0 means the default, 10.
 	RatePerMinute int `koanf:"rate_per_minute"`
 	// MaxDiscoveredPerAccount caps an account's first-contact identities that
 	// are still discovered (unadopted), so a discover row cannot fill an
@@ -798,6 +798,22 @@ type TokenConfig struct {
 	// isolation should authenticate these endpoints at its own edge
 	// (Server.Use) rather than serving them unauthenticated from ZeroID.
 	AllowUnauthenticatedTokenInspection bool `koanf:"allow_unauthenticated_token_inspection"`
+
+	// ScopeRules is what the stricter scope issuance rules do (see
+	// docs/scope-ceilings.md, "Stricter scope rules"):
+	//
+	//   off    (default) no rule is evaluated, and nothing is logged or
+	//          counted.
+	//   shadow every grant is evaluated against the stricter rules, and each
+	//          request whose outcome they would change is logged as
+	//          scope_rule_would_change and counted in
+	//          zeroid_scope_rule_would_change_total. Nothing is enforced:
+	//          tokens and responses are exactly as with off.
+	//
+	// Empty means off. Any other value is refused at startup. Can also be
+	// changed at runtime with Server.SetScopeRulesMode. Env var:
+	// ZEROID_SCOPE_RULES.
+	ScopeRules string `koanf:"scope_rules"`
 }
 
 // TelemetryConfig holds OpenTelemetry settings.
@@ -933,6 +949,10 @@ func (c *Config) Validate() error {
 		if c.Token.AllowUnauthenticatedTokenInspection {
 			return fmt.Errorf("token.allow_unauthenticated_token_inspection must be false in production (server.env=%q): RFC 7662 §2.1 / RFC 7009 §2.1 require caller authentication on introspection/revocation — set ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION=false (authenticate these endpoints at your edge if you rely on network isolation)", c.Server.Env)
 		}
+	}
+
+	if _, err := service.ParseScopeRulesMode(c.Token.ScopeRules); err != nil {
+		return fmt.Errorf("token.scope_rules: %w", err)
 	}
 
 	if !service.ValidEnforceHints(c.Backchannel.EnforceHints) {
@@ -1312,6 +1332,9 @@ func loadDefaults(k *koanf.Koanf) error {
 		"token.allow_unauthenticated_token_inspection": true,
 		// Refresh-token reuse grace (seconds) after a rotation; 0 = strict.
 		"token.refresh_reuse_grace_seconds": domain.DefaultRefreshTokenReuseGraceSeconds,
+		// The stricter scope rules evaluate nothing until a deployment opts
+		// into counting what they would change.
+		"token.scope_rules": string(service.ScopeRulesModeOff),
 
 		// Telemetry
 		"telemetry.enabled":       false,
@@ -1435,6 +1458,9 @@ var envMapping = map[string]string{
 	// Seconds after a rotation in which re-presenting the rotated-out refresh
 	// token is a benign retry, not reuse. 0 = strict RFC 9700; max 300.
 	"ZEROID_REFRESH_REUSE_GRACE_SECONDS": "token.refresh_reuse_grace_seconds",
+	// The stricter scope rules: off (default) or shadow (count what they
+	// would change, enforce nothing).
+	"ZEROID_SCOPE_RULES": "token.scope_rules",
 	// Accept an external-principal subject_token without verifying it, as
 	// before subject verification. Default false.
 	"ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT": "token.allow_unverified_external_principal_subject",
