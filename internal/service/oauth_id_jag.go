@@ -243,39 +243,46 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// identity's; a registered client linked to another identity is refused.
 	// This also gives a CIMD client its tenant.
 	//
-	// An agent no binding maps may be registered on first contact, as the
-	// row's first_contact says (firstContactIDJAG). The tenant is then the
-	// row's account and its first-contact project, and the agent is registered
-	// only further down, once the person has been resolved.
+	// An agent no enabled binding maps may be registered, or adopted under
+	// an adopt row's standing mapping, on first contact, as the row's
+	// first_contact says (firstContactIDJAG). The tenant is then the row's
+	// account and its first-contact project, and the agent is registered or
+	// adopted only further down, once the person has been resolved.
 	var (
 		boundAgent *domain.Identity
 		agentKey   string
-		pending    bool
+		fc         idJAGFirstContact
 	)
 	if entry.Row != nil {
 		agentKey = federatedAgentKey(rawClaims, idJAGClientID)
-		pending, err = s.firstContactIDJAGPending(ctx, entry.Row, agentKey, authedClient)
+		fc, err = s.firstContactIDJAGPending(ctx, entry.Row, agentKey, authedClient)
 		if err != nil {
 			return nil, err
 		}
 	}
 	switch {
-	case pending:
+	case fc.pending:
 		row := entry.Row
 		if (req.AccountID != "" && req.AccountID != row.AccountID) || (req.ProjectID != "" && req.ProjectID != row.FirstContactProjectID) {
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "account_id or project_id does not match the tenant derived from the issuer")
 		}
-		if req.ApplicationID != "" {
+		// A registration has no identity yet; a standing adoption names the
+		// one it would activate.
+		if req.ApplicationID != "" && req.ApplicationID != fc.agentID {
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "application_id is not the agent the ID-JAG is bound to")
 		}
 		req.AccountID, req.ProjectID = row.AccountID, row.FirstContactProjectID
 	case entry.Row != nil:
 		// With first contact on, a registered client's ID-JAG still registers
-		// nothing; firstContactFor's step only logs why.
+		// and adopts nothing, nor does one a standing adoption declined;
+		// firstContactFor's step only logs why.
 		var declined firstContactFunc
-		if !authedClient.SelfAsserted() {
+		if outcome := fc.declined; outcome != "" || !authedClient.SelfAsserted() {
+			if outcome == "" {
+				outcome = firstContactRegisteredClient
+			}
 			declined = s.firstContactFor(entry.Row, agentKey, federatedGrantIDJAG, nil, func(context.Context) (firstContactOutcome, error) {
-				return firstContactRegisteredClient, nil
+				return outcome, nil
 			})
 		}
 		boundAgent, err = s.bindFederatedAgent(ctx, entry.Row, agentKey, authedClient, federatedGrantIDJAG, declined)
@@ -402,19 +409,20 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		return nil, err
 	}
 
-	// First contact: the person is resolved before anything is registered, so
-	// a person the resolver refuses leaves no identity and no binding behind.
-	// Then the jti is spent, so a captured ID-JAG cannot replay the
-	// registration, and the agent is registered and bound. discover refuses
-	// here, naming the new identity's state; adopt goes on to the mint with
-	// the person already resolved and the jti already spent.
+	// First contact: the person is resolved before anything is written, so a
+	// person the resolver refuses leaves no identity and no binding behind,
+	// and an agent awaiting a standing adoption stays discovered. Then the jti
+	// is spent, so a captured ID-JAG cannot replay the registration or the
+	// adoption, and the agent is registered or adopted, and bound. discover
+	// refuses here, naming the new identity's state; adopt goes on to the
+	// mint with the person already resolved and the jti already spent.
 	var (
 		resolvedPerson *federatedPerson
 		jtiSpent       bool
 	)
-	if pending {
+	if fc.pending {
 		var person federatedPerson
-		boundAgent, person, err = s.firstContactIDJAG(ctx, req, entry, verified, rawClaims, cfg, upstreamIss, userID, agentKey, authedClient)
+		boundAgent, person, err = s.firstContactIDJAG(ctx, req, entry, verified, rawClaims, cfg, upstreamIss, userID, agentKey, fc.agentID, authedClient)
 		if err != nil {
 			return nil, err
 		}
@@ -617,33 +625,64 @@ func idJAGPersonRequest(req TokenRequest, entry *ExternalIssuerEntry, rawClaims 
 	}
 }
 
-// firstContactIDJAGPending reports whether an ID-JAG under row takes the
+// idJAGFirstContact is what first contact makes of an ID-JAG's agent before
+// the grant resolves the person (firstContactIDJAGPending).
+type idJAGFirstContact struct {
+	// pending: the grant takes the first-contact path. agentID is the
+	// existing identity a standing adoption would activate, "" when the
+	// agent would be registered.
+	pending bool
+	agentID string
+	// declined says why an adopt row's standing mapping does not adopt an
+	// agent that has only a disabled binding. The grant goes on as without
+	// first contact, and logs it.
+	declined firstContactOutcome
+}
+
+// firstContactIDJAGPending reads whether an ID-JAG under row takes the
 // first-contact path: first contact is on for the row, the redeeming client
-// is a CIMD client, and no binding at all maps the agent key. Only a CIMD
-// client, whose registration is the IdP-signed ID-JAG itself: a registered
-// client must be linked to the agent it redeems for, and first contact
-// neither creates nor links clients.
-func (s *OAuthService) firstContactIDJAGPending(ctx context.Context, row *domain.ExternalIssuer, agentKey string, client *domain.OAuthClient) (bool, error) {
-	if s.firstContactFor(row, agentKey, federatedGrantIDJAG, nil, nil) == nil || !client.SelfAsserted() || agentKey == "" || s.issuerBindings == nil {
-		return false, nil
+// is a CIMD client, and either no binding at all maps the agent key, or only
+// a disabled one under an adopt row whose standing adoption applies to it
+// (read here without locks; decided again under them). Only a CIMD client,
+// whose registration is the IdP-signed ID-JAG itself: a registered client
+// must be linked to the agent it redeems for, and first contact neither
+// creates nor links clients.
+func (s *OAuthService) firstContactIDJAGPending(ctx context.Context, row *domain.ExternalIssuer, agentKey string, client *domain.OAuthClient) (idJAGFirstContact, error) {
+	if s.firstContactFor(row, agentKey, federatedGrantIDJAG, nil, nil) == nil || agentKey == "" || s.issuerBindings == nil {
+		return idJAGFirstContact{}, nil
 	}
 	existing, err := s.issuerBindings.BindingsFor(ctx, row.ID, agentKey)
 	if err != nil {
-		return false, oauthServerError("failed to read the agent's credential binding", err)
+		return idJAGFirstContact{}, oauthServerError("failed to read the agent's credential binding", err)
 	}
-	return len(existing) == 0, nil
+	switch {
+	case len(existing) == 0:
+		return idJAGFirstContact{pending: client.SelfAsserted()}, nil
+	case existing[0].Enabled || row.FirstContact != domain.FirstContactAdopt || !client.SelfAsserted():
+		return idJAGFirstContact{}, nil
+	}
+	agentID, declined, err := s.firstContact.standingAdoptionCandidate(ctx, row, existing)
+	if err != nil {
+		return idJAGFirstContact{}, oauthServerError("failed to read the agent's identity", err)
+	}
+	if declined != "" {
+		return idJAGFirstContact{declined: declined}, nil
+	}
+	return idJAGFirstContact{pending: true, agentID: agentID}, nil
 }
 
-// firstContactIDJAG registers the agent an ID-JAG names on first contact,
-// in this order: the replay check; the person, through the resolver, in the
-// row's account and first-contact project; the jti, spent; then the
-// registration, and the binding read as for any agent. A refusal at any step
-// before the registration leaves nothing behind. It returns the bound agent
-// (adopt) and the resolved person, or the refusal (discover refuses naming
-// the new identity's state; a bound past the row's limits refuses as with
-// no binding).
+// firstContactIDJAG registers, or adopts under an adopt row's standing
+// mapping, the agent an ID-JAG names on first contact, in this order: the
+// replay check; the person, through the resolver, in the row's account and
+// first-contact project (with agentID, the identity a standing adoption
+// would activate, or "" for a registration); the jti, spent; then the
+// registration or adoption, and the binding read as for any agent. A refusal
+// at any step before that leaves the agent as it was. It returns the bound
+// agent (adopt) and the resolved person, or the refusal (discover refuses
+// naming the new identity's state; a bound past the row's limits, or an
+// adoption declined under the lock, refuses as without first contact).
 func (s *OAuthService) firstContactIDJAG(ctx context.Context, req TokenRequest, entry *ExternalIssuerEntry, verified jwt.Token,
-	rawClaims map[string]any, cfg domain.ExternalIssuerConfig, upstreamIss, userID, agentKey string, client *domain.OAuthClient,
+	rawClaims map[string]any, cfg domain.ExternalIssuerConfig, upstreamIss, userID, agentKey, agentID string, client *domain.OAuthClient,
 ) (*domain.Identity, federatedPerson, error) {
 	if s.idJAGReplayStore == nil {
 		return nil, federatedPerson{}, oauthServerError("ID-JAG replay store is not configured", nil)
@@ -660,12 +699,13 @@ func (s *OAuthService) firstContactIDJAG(ctx context.Context, req TokenRequest, 
 	if redeemed {
 		return nil, federatedPerson{}, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
 	}
-	person, err := s.resolveFederatedPerson(ctx, true, idJAGPersonRequest(req, entry, rawClaims, cfg, upstreamIss, userID, client, ""))
+	person, err := s.resolveFederatedPerson(ctx, true, idJAGPersonRequest(req, entry, rawClaims, cfg, upstreamIss, userID, client, agentID))
 	if err != nil {
 		return nil, federatedPerson{}, err
 	}
 	// Spent whatever happens next, so the caller never spends it again: a
-	// registration, a binding someone else made meanwhile, or a refusal.
+	// registration, an adoption, a binding someone else made or enabled
+	// meanwhile, or a refusal.
 	if err := s.spendIDJAG(ctx, verified); err != nil {
 		return nil, federatedPerson{}, err
 	}
@@ -674,9 +714,13 @@ func (s *OAuthService) firstContactIDJAG(ctx context.Context, req TokenRequest, 
 	if err != nil {
 		return nil, federatedPerson{}, err
 	}
-	// A binding made concurrently by someone else may name another project.
+	// A binding made or enabled concurrently by someone else may name another
+	// project, or another agent than the one application_id names.
 	if err := federatedTenant(agent, req.AccountID, req.ProjectID); err != nil {
 		return nil, federatedPerson{}, err
+	}
+	if req.ApplicationID != "" && req.ApplicationID != agent.ID {
+		return nil, federatedPerson{}, oauthBadRequest(oautherror.InvalidGrant, "application_id is not the agent the ID-JAG is bound to")
 	}
 	return agent, person, nil
 }

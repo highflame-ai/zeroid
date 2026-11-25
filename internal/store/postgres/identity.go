@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -73,6 +74,25 @@ func (r *IdentityRepository) GetByIDInAccounts(ctx context.Context, id string, a
 	err := db.NewSelect().Model(identity).
 		Where("id = ?", id).
 		Where("account_id IN (?)", bun.List(accountIDs)).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity: %w", err)
+	}
+	return identity, nil
+}
+
+// GetByIDInAccountForUpdate is GetByIDInAccounts for one account, holding
+// the identity's row lock until the transaction ends. The same rules apply:
+// the id is a server-held reference, never caller input.
+func (r *IdentityRepository) GetByIDInAccountForUpdate(ctx context.Context, id, accountID string) (*domain.Identity, error) {
+	if !hasTx(ctx) {
+		return nil, errors.New("GetByIDInAccountForUpdate requires a transaction")
+	}
+	identity := &domain.Identity{}
+	err := dbOrTx(ctx, r.db).NewSelect().Model(identity).
+		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		For("UPDATE").
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get identity: %w", err)

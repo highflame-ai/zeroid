@@ -25,6 +25,12 @@ import (
 // ErrIdentityAlreadyExists is returned when (account_id, project_id, external_id) already exists.
 var ErrIdentityAlreadyExists = errors.New("identity already exists")
 
+// ErrExternalIDHeldByFirstContact refuses a discovered-identity ingest whose
+// external_id an identity first contact registered holds. It is an
+// ErrIdentityAlreadyExists.
+var ErrExternalIDHeldByFirstContact = fmt.Errorf("%w: external_id belongs to an agent registered on first contact; "+
+	"an inventory record names that agent only through metadata.issuer_binding", ErrIdentityAlreadyExists)
+
 // ErrInvalidIdentityField marks caller-fixable input errors on identity writes
 // (SPIFFE path segments, enums, public_key_pem). Maps to 400 at the HTTP boundary.
 var ErrInvalidIdentityField = errors.New("invalid identity field")
@@ -195,6 +201,9 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	}
 	if req.Origin == domain.OriginFirstContact && !req.firstContact {
 		return nil, errFirstContactOriginReserved
+	}
+	if reservedFirstContactExternalID(req.ExternalID) && !req.firstContact {
+		return nil, errFirstContactExternalIDReserved
 	}
 	discovered := req.Origin.IsExternal()
 
@@ -412,6 +421,11 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	if req.Origin == domain.OriginFirstContact {
 		return nil, false, errFirstContactOriginReserved
 	}
+	// Before the external_id lookup: an inventory record never names a
+	// first-contact identity by its external_id, only by issuer_binding.
+	if reservedFirstContactExternalID(req.ExternalID) {
+		return nil, false, errFirstContactExternalIDReserved
+	}
 	// The discovery path can only carry trust it can EARN: unverified or
 	// verified_third_party (directory verification, CAP-DSC-004). first_party
 	// is reserved for natively-registered identities, and anything else is a
@@ -426,7 +440,9 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 		return nil, false, fmt.Errorf("%w: invalid trust_level for a discovered identity: %q", ErrInvalidIdentityField, req.TrustLevel)
 	}
 
-	if existing, err := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); err == nil && existing != nil {
+	if existing, err := s.inventoryByExternalID(ctx, req); err != nil {
+		return nil, false, err
+	} else if existing != nil {
 		return s.reconcileDiscovered(ctx, existing, req)
 	}
 	// An agent first contact already registered, keyed on the same runtime
@@ -437,6 +453,9 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 		return s.reconcileDiscovered(ctx, existing, req)
 	}
 
+	// An ingest never claims a standing adoption that did not happen.
+	ingested := &domain.Identity{Labels: req.Labels, Metadata: req.Metadata}
+	keepStandingAdoptionMarkers(ingested, nil, nil)
 	identity, err := s.RegisterIdentity(ctx, RegisterIdentityRequest{
 		AccountID:    req.AccountID,
 		ProjectID:    req.ProjectID,
@@ -453,8 +472,8 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 		Publisher:    req.Publisher,
 		Description:  req.Description,
 		Capabilities: req.Capabilities,
-		Labels:       req.Labels,
-		Metadata:     req.Metadata,
+		Labels:       ingested.Labels,
+		Metadata:     ingested.Metadata,
 		CreatedBy:    req.CreatedBy,
 	})
 	if err != nil {
@@ -464,20 +483,44 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 		// upsert stays idempotent under races.
 		var deactErr *IdentityDeactivatedConflictError
 		if errors.Is(err, ErrIdentityAlreadyExists) || errors.As(err, &deactErr) {
-			existing, gerr := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID)
+			existing, gerr := s.inventoryByExternalID(ctx, req)
 			// Only a genuine "no row" result lets us fall through to the
 			// original conflict error. An operational DB failure (connection
 			// loss, timeout) must surface as-is, not be masked as a 409.
-			if gerr != nil && !errors.Is(gerr, sql.ErrNoRows) {
+			if gerr != nil {
 				return nil, false, gerr
 			}
-			if gerr == nil && existing != nil {
+			if existing != nil {
 				return s.reconcileDiscovered(ctx, existing, req)
 			}
 		}
 		return nil, false, err
 	}
 	return identity, true, nil
+}
+
+// inventoryByExternalID returns the identity a discovered-identity ingest
+// reconciles into by its external_id, or nil when none has it. An identity
+// first contact registered is never one, whatever its external_id: an
+// inventory record whose id equals an agent's subject key (an IdP app the
+// agent uses as its OAuth client, say) is another record, and reaches a
+// first-contact identity only through its issuer_binding metadata. First
+// contact keeps its external_ids in a reserved namespace for that, but an
+// identity registered before the namespace existed holds the bare subject
+// key; the ingest is then refused as a conflict, as for any external_id
+// another identity holds, instead of being merged into the agent.
+func (s *IdentityService) inventoryByExternalID(ctx context.Context, req DiscoveredIdentityRequest) (*domain.Identity, error) {
+	existing, err := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if existing.Origin == domain.OriginFirstContact {
+		return nil, ErrExternalIDHeldByFirstContact
+	}
+	return existing, nil
 }
 
 // applyDiscoveredOwnerAttribution applies a connector's verified owner
@@ -572,8 +615,10 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 		identity.Metadata = req.Metadata
 	}
 	// A first-contact identity keeps its marker and the claims it arrived
-	// with, whatever the inventory sends.
+	// with, whatever the inventory sends, and an identity a standing
+	// adoption activated keeps that record.
 	keepFirstContactProvenance(identity, prevLabels, prevMetadata)
+	keepStandingAdoptionMarkers(identity, prevLabels, prevMetadata)
 	// Re-type a still-discovered row from the connector's current classification
 	// (e.g. application → mcp_server once it's recognised as an MCP server,
 	// CAP-DSC-003). domain.CanRetypeDiscovered leaves adopted rows untouched and

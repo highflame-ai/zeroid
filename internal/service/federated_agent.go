@@ -43,11 +43,13 @@ const (
 // There is no synthetic identity: no binding, or a client registered to a
 // different identity, is invalid_grant and an unmatched-agent event.
 //
-// firstContact, when set, runs when no binding at all maps the subject key
-// (first contact, docs/external-issuers.md). If it registered the agent, or
-// found it registered concurrently, the bindings are read again and decide
-// as for any agent: a discovered one is refused naming its state, an adopted
-// one is served. A subject with a binding, enabled or not, never reaches it.
+// firstContact, when set, runs when no enabled binding maps the subject key
+// (first contact, docs/external-issuers.md), with the disabled bindings
+// there are. If it registered the agent, applied an adopt row's standing
+// adoption to it, or found either done concurrently, the bindings are read
+// again and decide as for any agent: a discovered one is refused naming its
+// state, an adopted one is served. A subject with an enabled binding never
+// reaches it.
 func (s *OAuthService) bindFederatedAgent(ctx context.Context, row *domain.ExternalIssuer, subjectKey string,
 	client *domain.OAuthClient, grant string, firstContact firstContactFunc,
 ) (*domain.Identity, error) {
@@ -68,8 +70,8 @@ func bindAgent(ctx context.Context, bindings issuerBindingSource, lookup linkedI
 	if err != nil {
 		return nil, oauthServerError("failed to read the agent's credential binding", err)
 	}
-	if len(all) == 0 && firstContact != nil {
-		reread, err := firstContact(ctx)
+	if firstContact != nil && (len(all) == 0 || !all[0].Enabled) {
+		reread, err := firstContact(ctx, all)
 		if err != nil {
 			return nil, err
 		}
