@@ -383,10 +383,13 @@ func TestScopeRulesShadow_OneCode(t *testing.T) {
 	policyID := tn.policy(t, []string{"sr:read"})
 	identityID := registerIdentityWithPolicy(t, uid("sr-d-app"), policyID, "", nil, tn.headers)
 	user := uid("sr-d-user")
+	// The exchange verifies its subject_token: a token this server issued for
+	// the tenant and person the request names.
+	subject := personToken(t, tn.account, tn.project, user)
 	request := func(t *testing.T) *http.Response {
 		return post(t, "/oauth2/token", map[string]any{
 			"grant_type":     "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token":  "external-principal-assertion",
+			"subject_token":  subject,
 			"account_id":     tn.account,
 			"project_id":     tn.project,
 			"user_id":        user,
@@ -454,4 +457,161 @@ func TestScopeRulesShadow_OffRecordsNothing(t *testing.T) {
 	_ = resp.Body.Close()
 	assert.Empty(t, records.lines(t))
 	assert.Empty(t, records.counts(t))
+}
+
+// TestScopeRulesShadow_ReservedScopes: a reserved scope is governed by the
+// reserved-scope rules and the deployer's authorizer, not by ceilings. Rule A
+// keeps it as the key's own scope, rules B and C never judge it, and a request
+// the reserved-scope rules refuse records nothing.
+func TestScopeRulesShadow_ReservedScopes(t *testing.T) {
+	status, _, key := createProductKey(t, "test-user", []string{"data:read", testReservedScope}, true)
+	require.Equal(t, http.StatusCreated, status)
+	keyGrant := func(scope string) func(t *testing.T) *http.Response {
+		return func(t *testing.T) *http.Response {
+			body := map[string]any{"grant_type": "api_key", "api_key": key}
+			if scope != "" {
+				body["scope"] = scope
+			}
+			return post(t, "/oauth2/token", body, nil)
+		}
+	}
+
+	t.Run("an omitted request keeps the key's reserved scope", func(t *testing.T) {
+		outcome, records := offThenShadow(t, keyGrant(""))
+		require.Equal(t, http.StatusOK, outcome["status"])
+		assert.Equal(t, "data:read "+testReservedScope, outcome["scope"], "precondition: the key's scopes, issued without asking")
+		assert.Empty(t, records.lines(t))
+		assert.Empty(t, records.counts(t))
+	})
+
+	t.Run("a request naming the reserved scope is issued it", func(t *testing.T) {
+		outcome, records := offThenShadow(t, keyGrant(testReservedScope))
+		require.Equal(t, http.StatusOK, outcome["status"])
+		assert.Equal(t, testReservedScope, outcome["scope"])
+		assert.Empty(t, records.lines(t))
+	})
+
+	t.Run("refusals by the reserved-scope rules record nothing", func(t *testing.T) {
+		status, _, unlisted := createProductKey(t, "test-user", nil, false)
+		require.Equal(t, http.StatusCreated, status)
+		status, _, demoted := createProductKey(t, testDemotedUser, []string{testReservedScope}, true)
+		require.Equal(t, http.StatusCreated, status)
+		for name, tc := range map[string]struct{ key, code string }{
+			"a key that does not list it": {unlisted, "invalid_scope"},
+			"the authorizer refuses":      {demoted, "invalid_grant"},
+		} {
+			t.Run(name, func(t *testing.T) {
+				outcome, records := offThenShadow(t, func(t *testing.T) *http.Response {
+					return post(t, "/oauth2/token", map[string]any{
+						"grant_type": "api_key", "api_key": tc.key, "scope": testReservedScope,
+					}, nil)
+				})
+				require.Equal(t, http.StatusBadRequest, outcome["status"])
+				assert.Equal(t, tc.code, outcome["error"])
+				assert.Empty(t, records.lines(t))
+			})
+		}
+	})
+
+	// A token carrying the reserved scope, delegated to an actor whose own
+	// ceilings allow data:read and, for the second actor, the reserved scope.
+	code, body := exchangeKey(t, key, "")
+	require.Equal(t, http.StatusOK, code, "%v", body)
+	root := body["access_token"].(string)
+	tn := hrdTenant{account: testAccountID, project: testProjectID, headers: adminHeaders()}
+	delegate := func(actorScopes []string, scope string) func(t *testing.T) *http.Response {
+		// The actor's tokens live less than the root's remaining lifetime, so
+		// both runs answer the same expires_in.
+		policyID := tn.policyWith(t, actorScopes, map[string]any{"max_ttl_seconds": 30})
+		k := generateKey(t)
+		wimse := tn.register(t, uid("sr-rs-actor"), policyID, ecPublicKeyPEM(t, k), actorScopes)
+		return func(t *testing.T) *http.Response {
+			return post(t, "/oauth2/token", map[string]any{
+				"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+				"subject_token": root,
+				"actor_token":   buildAssertion(t, k, wimse),
+				"scope":         scope,
+			}, nil)
+		}
+	}
+
+	t.Run("an exchange refused for naming the reserved scope records nothing", func(t *testing.T) {
+		outcome, records := offThenShadow(t, delegate([]string{"data:read", testReservedScope}, testReservedScope))
+		require.Equal(t, http.StatusBadRequest, outcome["status"])
+		assert.Equal(t, "insufficient_scope", outcome["error"], "precondition: today the chokepoint's own code")
+		assert.Empty(t, records.lines(t), "the reserved-scope rules refused it, not a ceiling")
+		assert.Empty(t, records.counts(t))
+	})
+
+	t.Run("an exchange whose ceiling drops the reserved scope is not narrowed", func(t *testing.T) {
+		outcome, records := offThenShadow(t, delegate([]string{"data:read"}, "data:read "+testReservedScope))
+		require.Equal(t, http.StatusOK, outcome["status"])
+		assert.Equal(t, "data:read", outcome["scope"], "precondition: today the reserved scope is dropped")
+		assert.Empty(t, records.lines(t))
+		assert.Empty(t, records.counts(t))
+	})
+}
+
+// TestScopeRulesShadow_InternalServiceGrants: the on-behalf exchange and the
+// asserted-tenant grant are open only to the deployment's own services, refuse
+// a scope parameter with invalid_scope and issue no scopes, so they record
+// nothing. A session broker's external-principal exchange is evaluated like
+// any other.
+func TestScopeRulesShadow_InternalServiceGrants(t *testing.T) {
+	gw := gateway(t)
+	jb := jobs(t)
+	tn := newTenant(t, "")
+	subject := brokerSession(t, testAccountID, testProjectID, uid("sr-obo"), nil)["access_token"].(string)
+
+	for name, tc := range map[string]struct {
+		body   func() map[string]any
+		client svcClient
+	}{
+		"on-behalf exchange": {client: gw, body: func() map[string]any { return onBehalf(subject, receiverResource) }},
+		"asserted-tenant grant": {client: jb, body: func() map[string]any {
+			return map[string]any{
+				"grant_type": assertedGrant, "account_id": tn.account, "project_id": tn.project, "resource": receiverResource,
+			}
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			outcome, records := offThenShadow(t, func(t *testing.T) *http.Response {
+				return post(t, "/oauth2/token", tc.client.auth(t, tc.body()), nil)
+			})
+			require.Equal(t, http.StatusOK, outcome["status"])
+			assert.NotContains(t, outcome["access_token.claims"], "scopes")
+			assert.Empty(t, records.lines(t))
+
+			outcome, records = offThenShadow(t, func(t *testing.T) *http.Response {
+				body := tc.body()
+				body["scope"] = "sr:read"
+				return post(t, "/oauth2/token", tc.client.auth(t, body), nil)
+			})
+			require.Equal(t, http.StatusBadRequest, outcome["status"])
+			assert.Equal(t, "invalid_scope", outcome["error"])
+			assert.Empty(t, records.lines(t))
+			assert.Empty(t, records.counts(t))
+		})
+	}
+
+	t.Run("a session broker's exchange is evaluated", func(t *testing.T) {
+		policyID := tn.policy(t, []string{"sr:read"})
+		identityID := registerIdentityWithPolicy(t, uid("sr-broker-app"), policyID, "", nil, tn.headers)
+		user := uid("sr-broker-user")
+		personSubject := personToken(t, tn.account, tn.project, user)
+		outcome, records := offThenShadow(t, func(t *testing.T) *http.Response {
+			body := brokerExchange(personSubject, tn.account, tn.project, user)
+			body["application_id"] = identityID
+			body["scope"] = "sr:read sr:write"
+			return post(t, "/oauth2/token", broker(t).auth(t, body), nil)
+		})
+		require.Equal(t, http.StatusBadRequest, outcome["status"])
+		assert.Equal(t, "policy_violation", outcome["error"])
+
+		line := scopeRuleLine(t, records)
+		assert.Equal(t, "one_code", line["rule"])
+		assert.Equal(t, "external_principal", line["grant_type"])
+		assert.Equal(t, testBrokerClient, line["client_id"])
+		assert.Equal(t, identityID, line["identity_id"])
+	})
 }

@@ -1604,7 +1604,9 @@ func (s *Server) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrant
 // request whose outcome they would change is logged as
 // scope_rule_would_change and counted in
 // zeroid_scope_rule_would_change_total. Nothing is enforced: every token and
-// every response is exactly what ScopeRulesModeOff produces. An empty or
+// every response is exactly what ScopeRulesModeOff produces. The internal
+// service grants, which issue no scopes, are not evaluated, and reserved
+// scopes (SetReservedScopes) are left to their own rules. An empty or
 // unknown mode is rejected and the setting left unchanged. See
 // docs/scope-ceilings.md, "Stricter scope rules".
 //

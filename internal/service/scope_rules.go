@@ -115,7 +115,15 @@ func clientListsScopes(c *domain.OAuthClient) bool {
 
 // scopeTraceGrant names a /oauth2/token grant in the stricter rules' records,
 // or returns "" for a grant they do not evaluate: one an embedder registered
-// with RegisterGrant, or an unknown one.
+// with RegisterGrant, an unknown one, or the asserted-tenant grant.
+//
+// The asserted-tenant grant is open only to the deployment's own services
+// (service_tokens.asserted_tenant_clients, private_key_jwt), refuses any
+// scope parameter with invalid_scope and issues no scopes, so no client ever
+// chooses a scope on it and every rule would answer exactly as it does today.
+// The on-behalf exchange, which shares the token-exchange grant type, is the
+// same: it never describes its request to the trace (see onBehalfExchange),
+// so it records nothing either.
 func scopeTraceGrant(grantType string) string {
 	switch grantType {
 	case "client_credentials":
@@ -179,6 +187,15 @@ type scopeTrace struct {
 	// refusalCode returns the code a refusal reaches the client with and
 	// whether it is a scope refusal. nil means the token endpoint's mapping.
 	refusalCode func(error) (string, bool)
+
+	// reserved is the deployer's reserved scopes (Server.SetReservedScopes).
+	// They are governed by the reserved-scope rules and the deployer's
+	// authorizer, not by ceilings: rule A treats them as the API key's own
+	// scopes, and rules B and C do not judge them. reservedRefused says the
+	// reserved-scope rules refused the request, which is their decision and
+	// not a scope-rule event.
+	reserved        *ReservedScopes
+	reservedRefused bool
 }
 
 // traceScopes returns ctx carrying a new scopeTrace for one request of grant,
@@ -187,7 +204,7 @@ func (s *CredentialService) traceScopes(ctx context.Context, grant string) (cont
 	if s == nil || grant == "" || !s.scopeRules.shadow.Load() {
 		return ctx, nil
 	}
-	t := &scopeTrace{grant: grant}
+	t := &scopeTrace{grant: grant, reserved: s.reserved}
 	return context.WithValue(ctx, scopeTraceKey{}, t), t
 }
 
@@ -315,6 +332,21 @@ func (t *scopeTrace) deliveredByPush() {
 	}
 }
 
+// refusedByReservedScopes records that the reserved-scope rules refused the
+// request: the api_key grant's checks (the key must list the scope, the key
+// must name its creator, the deployer's authorizer must allow it) or the
+// issuance chokepoint's refusal of a reserved scope on any other path.
+func (t *scopeTrace) refusedByReservedScopes() {
+	if t != nil {
+		t.reservedRefused = true
+	}
+}
+
+// isReserved reports whether sc is one of the deployer's reserved scopes.
+func (t *scopeTrace) isReserved(sc string) bool {
+	return len(t.reserved.in([]string{sc})) > 0
+}
+
 // done compares the request's outcome, err or the scopes issued, with what
 // the stricter rules would do, and records each rule that would change it.
 // It never changes the outcome.
@@ -325,6 +357,10 @@ func (t *scopeTrace) done(ctx context.Context, err error) {
 	var today scopeOutcome
 	switch {
 	case err != nil:
+		if t.reservedRefused {
+			// The reserved-scope rules decided this request, not a ceiling.
+			return
+		}
 		codeOf := t.refusalCode
 		if codeOf == nil {
 			codeOf = scopeRefusalCode
@@ -371,9 +407,13 @@ func (t *scopeTrace) changes(today scopeOutcome) []scopeRuleChange {
 	// A: a request that names no scope gets none, unless the deployer
 	// configured its default (omittedApplies is false then).
 	// A request refused today stays refused: a token with no scopes claim is
-	// never a stricter outcome than a refusal.
-	if t.omittedApplies && !named && !today.refused && len(authorityScopes(today.scopes)) > 0 {
-		out = append(out, scopeRuleChange{rule: scopeRuleOmittedRequest, would: scopeOutcome{}})
+	// never a stricter outcome than a refusal. A reserved scope comes from
+	// the API key's own row, which rule A keeps, so it is never a default
+	// the rule takes away.
+	if t.omittedApplies && !named && !today.refused {
+		if kept, dropped := t.splitReserved(authorityScopes(today.scopes)); len(dropped) > 0 {
+			out = append(out, scopeRuleChange{rule: scopeRuleOmittedRequest, would: scopeOutcome{scopes: kept}})
+		}
 	}
 
 	// B: a scope is issued only when a deployer-controlled ceiling lists it.
@@ -388,7 +428,7 @@ func (t *scopeTrace) changes(today scopeOutcome) []scopeRuleChange {
 	}
 
 	// C: a request is issued what it named, or refused.
-	if named && !today.refused && len(droppedScopes(t.requested, today.scopes)) > 0 {
+	if named && !today.refused && len(t.droppedScopes(today.scopes)) > 0 {
 		out = append(out, scopeRuleChange{rule: scopeRuleAllOrNothing, would: refusedInvalidScope})
 	}
 	if t.delegation && !named && today.refused {
@@ -403,10 +443,11 @@ func (t *scopeTrace) changes(today scopeOutcome) []scopeRuleChange {
 }
 
 // splitListed splits scopes into those a deployer-controlled ceiling lists
-// and those none does. openid is always listed.
+// and those none does. openid is always listed, and a reserved scope is not
+// judged by listing: the reserved-scope rules govern it.
 func (t *scopeTrace) splitListed(scopes []string) (listed, unlisted []string) {
 	for _, sc := range scopes {
-		ok := t.allListed || sc == openIDScope
+		ok := t.allListed || sc == openIDScope || t.isReserved(sc)
 		for _, l := range t.listings {
 			ok = ok || slices.Contains(l, sc)
 		}
@@ -430,12 +471,26 @@ func authorityScopes(scopes []string) []string {
 	return out
 }
 
-// droppedScopes returns the scopes requested names that issued lacks,
-// openid aside.
-func droppedScopes(requested, issued []string) []string {
+// splitReserved splits scopes into the deployer's reserved scopes and the
+// rest.
+func (t *scopeTrace) splitReserved(scopes []string) (reserved, rest []string) {
+	for _, sc := range scopes {
+		if t.isReserved(sc) {
+			reserved = append(reserved, sc)
+		} else {
+			rest = append(rest, sc)
+		}
+	}
+	return reserved, rest
+}
+
+// droppedScopes returns the scopes the request named that issued lacks,
+// openid and reserved scopes aside: whether a reserved scope is issued is
+// the reserved-scope rules' decision, not a ceiling's narrowing.
+func (t *scopeTrace) droppedScopes(issued []string) []string {
 	var out []string
-	for _, sc := range authorityScopes(requested) {
-		if !slices.Contains(issued, sc) && !slices.Contains(out, sc) {
+	for _, sc := range authorityScopes(t.requested) {
+		if !t.isReserved(sc) && !slices.Contains(issued, sc) && !slices.Contains(out, sc) {
 			out = append(out, sc)
 		}
 	}

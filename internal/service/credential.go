@@ -707,6 +707,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// Reserved scopes are issued only through the api_key grant's checks; an
 	// unbounded ceiling, an exchange or any other grant never yields one.
 	if r := s.reserved.in(req.Scopes); len(r) > 0 && !req.ReservedScopesAuthorized {
+		trace.refusedByReservedScopes()
 		return nil, nil, fmt.Errorf("%w: %q is issued only on the api_key grant, from a key that lists it", ErrScopesNotAllowed, r[0])
 	}
 

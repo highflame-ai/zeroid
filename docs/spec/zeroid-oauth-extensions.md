@@ -488,7 +488,9 @@ listing, and an empty ceiling lists nothing); a request that would be narrowed
 is refused whole with `invalid_scope`, and a delegation that names no scope is
 issued none; and every scope refusal answers `invalid_scope`. Each request
 whose outcome would differ is logged as `scope_rule_would_change` and counted
-in `zeroid_scope_rule_would_change_total`. Issuance is unchanged. Details:
+in `zeroid_scope_rule_would_change_total`. Issuance is unchanged. Reserved
+scopes are left to the reserved-scope rules, and the internal service grants
+(§5.8), which issue no scopes, are not evaluated. Details:
 `docs/scope-ceilings.md`.
 
 ### 5.2 Delegation depth tracking and capping

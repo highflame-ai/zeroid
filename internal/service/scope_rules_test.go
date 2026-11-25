@@ -148,6 +148,7 @@ func TestScopeTrace_NilIsANoOp(t *testing.T) {
 		tr.minted([]string{"a"}, []string{"a"})
 		tr.codeIssued([]string{"a"})
 		tr.deliveredByPush()
+		tr.refusedByReservedScopes()
 		tr.done(context.Background(), nil)
 		tr.done(context.Background(), ErrScopesNotAllowed)
 	})
@@ -172,8 +173,10 @@ func TestScopeTraceGrant(t *testing.T) {
 		"authorization_code":                "authorization_code",
 		"refresh_token":                     "refresh_token",
 		"urn:openid:params:grant-type:ciba": "urn:openid:params:grant-type:ciba",
-		"urn:example:custom-grant":          "",
-		"":                                  "",
+		// Only the deployment's own services reach it, and it issues no scopes.
+		domain.GrantTypeAssertedTenantURN: "",
+		"urn:example:custom-grant":        "",
+		"":                                "",
 	} {
 		assert.Equal(t, want, scopeTraceGrant(wire), "grant %q", wire)
 	}
@@ -465,6 +468,151 @@ func TestScopeTrace_RecordsNothingWithoutAChange(t *testing.T) {
 
 	ctx, undescribed := svc.traceScopes(context.Background(), "client_credentials")
 	undescribed.done(ctx, ErrScopesNotAllowed)
+
+	assert.Empty(t, points())
+	assert.Empty(t, lines())
+}
+
+// reservedTrace returns a credential service in shadow mode whose deployer
+// reserves the "deployer." prefix, a trace for grant and the context carrying
+// it.
+func reservedTrace(t *testing.T, grant string) (*CredentialService, context.Context, *scopeTrace) {
+	t.Helper()
+	return reservedTraceWith(t, grant, allowAll)
+}
+
+// reservedTraceWith is reservedTrace with the given authorizer.
+func reservedTraceWith(t *testing.T, grant string, authorize ReservedScopeAuthorizer) (*CredentialService, context.Context, *scopeTrace) {
+	t.Helper()
+	r := &ReservedScopes{}
+	require.NoError(t, r.Set([]string{"deployer."}, authorize, 0))
+	svc := &CredentialService{reserved: r, defaultTTL: 300, maxTTL: 3600}
+	require.NoError(t, svc.SetScopeRulesMode(ScopeRulesModeShadow))
+	ctx, tr := svc.traceScopes(context.Background(), grant)
+	require.NotNil(t, tr)
+	require.Same(t, r, tr.reserved, "the trace sees the deployer's reserved scopes")
+	return svc, ctx, tr
+}
+
+// Reserved scopes are governed by the reserved-scope rules, not by ceilings:
+// rule A keeps them as the key's own scopes, and rules B and C do not judge
+// them. Every other scope is judged as before.
+func TestScopeRules_ReservedScopes(t *testing.T) {
+	_, _, base := reservedTrace(t, "api_key")
+	issued := func(s ...string) scopeOutcome { return scopeOutcome{scopes: s} }
+	with := func(tr scopeTrace) scopeTrace {
+		tr.reserved = base.reserved
+		return tr
+	}
+
+	for _, tc := range []struct {
+		name  string
+		trace scopeTrace
+		today scopeOutcome
+		want  []string
+	}{
+		{
+			name:  "A: an omitted request issued only reserved scopes keeps them",
+			trace: with(scopeTrace{asked: true, omittedApplies: true, listed: true}),
+			today: issued("deployer.config.manage"),
+		},
+		{
+			name:  "A: an omitted request keeps its reserved scopes and loses the rest",
+			trace: with(scopeTrace{asked: true, omittedApplies: true, listed: true, listings: [][]string{{"a"}}}),
+			today: issued("a", "deployer.config.manage"),
+			want:  []string{"omitted_request→issued[deployer.config.manage]"},
+		},
+		{
+			name:  "B: a reserved scope no ceiling lists is not unlisted",
+			trace: with(scopeTrace{asked: true, requested: []string{"deployer.config.manage"}, listed: true}),
+			today: issued("deployer.config.manage"),
+		},
+		{
+			name:  "B: the other scopes are still judged, and the reserved one kept",
+			trace: with(scopeTrace{asked: true, requested: []string{"a", "deployer.config.manage"}, listed: true}),
+			today: issued("a", "deployer.config.manage"),
+			want:  []string{"listing→issued[deployer.config.manage]"},
+		},
+		{
+			name:  "C: a reserved scope a ceiling dropped is not narrowing",
+			trace: with(scopeTrace{asked: true, requested: []string{"a", "deployer.config.manage"}, listed: true, listings: [][]string{{"a"}}}),
+			today: issued("a"),
+		},
+		{
+			name:  "C: dropping another scope still is",
+			trace: with(scopeTrace{asked: true, requested: []string{"a", "b", "deployer.config.manage"}, listed: true, listings: [][]string{{"a", "b"}}}),
+			today: issued("a", "deployer.config.manage"),
+			want:  []string{"all_or_nothing→refused/invalid_scope"},
+		},
+		{
+			name:  "D: another scope refusal is still judged",
+			trace: with(scopeTrace{asked: true, requested: []string{"a"}}),
+			today: scopeOutcome{refused: true, code: policyViolationCode},
+			want:  []string{"one_code→refused/invalid_scope"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []string
+			for _, c := range tc.trace.changes(tc.today) {
+				got = append(got, ruleOutcome(c))
+			}
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// A request the reserved-scope rules refuse records nothing: the issuance
+// chokepoint's refusal on another grant, and each api_key grant refusal.
+func TestScopeTrace_ReservedRefusalRecordsNothing(t *testing.T) {
+	points, lines := captureScopeRules(t)
+
+	t.Run("the chokepoint refuses a reserved scope on another grant", func(t *testing.T) {
+		svc, ctx, tr := reservedTrace(t, "client_credentials")
+		tr.ask([]string{"deployer.config.manage"}, true)
+		_, _, err := svc.IssueCredential(ctx, IssueRequest{
+			Identity: &domain.Identity{ID: "id-1", Status: domain.IdentityStatusActive, IdentityType: domain.IdentityTypeService},
+			Scopes:   []string{"deployer.config.manage"},
+		})
+		require.ErrorIs(t, err, ErrScopesNotAllowed, "precondition: today it is refused as insufficient_scope")
+		assert.True(t, tr.reservedRefused)
+		tr.done(ctx, err)
+	})
+
+	service := &domain.Identity{ID: "id-1", IdentityType: domain.IdentityTypeService}
+	for _, tc := range []struct {
+		name      string
+		createdBy string
+		keyScopes []string
+		authorize ReservedScopeAuthorizer
+	}{
+		{name: "the key does not list the scope", createdBy: "alice", keyScopes: []string{"data:read"}, authorize: allowAll},
+		{name: "the key names no creator", keyScopes: []string{"deployer.config.manage"}, authorize: allowAll},
+		{name: "the authorizer refuses", createdBy: "alice", keyScopes: []string{"deployer.config.manage"},
+			authorize: func(context.Context, ReservedScopeGrant) error { return ErrReservedScopeDenied }},
+		{name: "the authorizer fails", createdBy: "alice", keyScopes: []string{"deployer.config.manage"},
+			authorize: func(context.Context, ReservedScopeGrant) error { return errors.New("lookup failed") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, ctx, tr := reservedTraceWith(t, "api_key", tc.authorize)
+			s := &OAuthService{credentialSvc: svc}
+			tr.ask([]string{"deployer.config.manage"}, false)
+			issue := IssueRequest{Scopes: []string{"deployer.config.manage"}}
+			key := &domain.APIKey{ID: "key-1", AccountID: "acct", ProjectID: "proj", CreatedBy: tc.createdBy, Scopes: tc.keyScopes}
+			err := s.authorizeReservedScopes(ctx, &issue, key, service)
+			require.Error(t, err)
+			assert.True(t, tr.reservedRefused)
+			tr.done(ctx, err)
+		})
+	}
+
+	t.Run("an authorized grant is not marked", func(t *testing.T) {
+		svc, ctx, tr := reservedTrace(t, "api_key")
+		s := &OAuthService{credentialSvc: svc}
+		issue := IssueRequest{Scopes: []string{"deployer.config.manage"}}
+		key := &domain.APIKey{ID: "key-1", CreatedBy: "alice", Scopes: []string{"deployer.config.manage"}}
+		require.NoError(t, s.authorizeReservedScopes(ctx, &issue, key, service))
+		assert.False(t, tr.reservedRefused)
+	})
 
 	assert.Empty(t, points())
 	assert.Empty(t, lines())

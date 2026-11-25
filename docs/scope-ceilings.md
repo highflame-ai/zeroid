@@ -258,6 +258,23 @@ scope that was dropped, unlisted or issued by default.
 Grants registered with `RegisterGrant` are not evaluated, nor is issuance that
 is not an OAuth grant: the admin issue and rotate endpoints and attestation.
 
+The internal service grants (the on-behalf exchange and the asserted-tenant
+grant) record nothing. Only the deployment's own services can use them, they
+refuse a `scope` parameter with `invalid_scope`, and their tokens carry no
+scopes, so no client chooses a scope there and every rule would answer as
+today. A session broker's external-principal exchange and a
+`client_credentials` request into the service tenant are evaluated like any
+other request on those grants.
+
+**Reserved scopes.** A scope under a prefix reserved with
+`Server.SetReservedScopes` is governed by the reserved-scope rules and the
+deployer's authorizer, not by ceilings. For rule A it is one of the API key's
+own scopes, which the rule keeps. Rules B and C do not judge it: it is never
+counted as unlisted, nor as dropped from a request. A request the
+reserved-scope rules refuse (the key does not list the scope or names no
+creator, the authorizer refuses or fails, or another grant asks for a
+reserved scope) records nothing.
+
 **What is recorded.** Each rule that would change a request is counted in
 `zeroid_scope_rule_would_change_total` (OpenTelemetry
 `zeroid.scope.rule_would_change`) by `mode`, `rule`, `grant_type`,
