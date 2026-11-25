@@ -410,11 +410,11 @@ refused with the same `409` when the parent is full.
 
 ## Schema
 
-`identities.parent_identity_id` is a nullable `UUID` (migration 070), indexed
+`identities.parent_identity_id` is a nullable `UUID` (migration 071), indexed
 by `(account_id, project_id, parent_identity_id)` for the rows that have one
-(migration 071). Existing identities have no parent; there is no backfill.
-`identities.cascade_pending_at` (`TIMESTAMPTZ`, also 070) is the mark, with a
-partial index on the rows that carry it (071), so the hourly pass reads the
+(migration 072). Existing identities have no parent; there is no backfill.
+`identities.cascade_pending_at` (`TIMESTAMPTZ`, also 071) is the mark, with a
+partial index on the rows that carry it (072), so the hourly pass reads the
 index, not the table; the identity audit trigger ignores it.
 There is no foreign key: identities are soft-deleted, and the write path
 resolves the parent inside the child's own account and project under a row
@@ -422,10 +422,10 @@ lock, which a key on `id` alone could not express.
 
 ### Large tables
 
-071 builds both indexes inside the migration runner's transaction, which
+072 builds both indexes inside the migration runner's transaction, which
 holds writes to `identities` for two table scans. The runner applies each file
 as one transaction, so it cannot build them `CONCURRENTLY`. On a large table,
-apply 070 and 071 by hand first:
+apply 071 and 072 by hand first:
 
 1. Run, on every pod, a release that tolerates columns it does not know
    (v1.31.0 or later).
@@ -439,7 +439,7 @@ apply 070 and 071 by hand first:
    ```
 
 3. Build both indexes, each statement on its own (outside a transaction),
-   with 071's definitions:
+   with 072's definitions:
 
    ```sql
    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_identities_parent
@@ -460,12 +460,12 @@ apply 070 and 071 by hand first:
 
    Drop an invalid one (`DROP INDEX CONCURRENTLY <name>`) and build it again:
    `IF NOT EXISTS` would skip it.
-4. Deploy the release with the tree. 070 then only swaps the audit trigger
-   (catalog-only), and 071 finds both indexes.
+4. Deploy the release with the tree. 071 then only swaps the audit trigger
+   (catalog-only), and 072 finds both indexes.
 
 ### Rolling back
 
-Rolling back past 070 keeps both columns, so roll back only to a release that
+Rolling back past 071 keeps both columns, so roll back only to a release that
 tolerates columns it does not know (v1.31.0 or later).
 
 A release without the tree, whether the rollback target or an old pod still

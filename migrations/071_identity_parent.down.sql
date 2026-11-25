@@ -1,7 +1,7 @@
--- 070_identity_parent.down.sql
+-- 071_identity_parent.down.sql
 -- IRREVERSIBLE FOR DATA, so a no-op: the columns and the trigger are kept.
 -- Dropping parent_identity_id would discard every recorded registration edge,
--- which re-applying 070 could not restore.
+-- which re-applying 071 could not restore.
 --
 -- Keeping the columns is safe only for a binary that tolerates columns it
 -- does not know. An older binary does read them: its writes name their
@@ -18,6 +18,6 @@
 --
 -- The redefined audit trigger is kept too: it ignores cascade_pending_at,
 -- which a rolled-back binary never sets, and audits every other change as 066
--- did. 070's up is idempotent (ADD COLUMN IF NOT EXISTS, DROP/CREATE TRIGGER),
+-- did. 071's up is idempotent (ADD COLUMN IF NOT EXISTS, DROP/CREATE TRIGGER),
 -- so re-applying it after a revert is a no-op.
 SELECT 1;

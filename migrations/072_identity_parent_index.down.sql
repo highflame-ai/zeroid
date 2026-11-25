@@ -1,4 +1,4 @@
--- 071_identity_parent_index.down.sql
+-- 072_identity_parent_index.down.sql
 -- Not CONCURRENTLY: that drops one index per statement and only outside a
 -- transaction, and the runner sends this file as one. Dropping an index is
 -- catalog-only, so the lock is held briefly once acquired; lock_timeout keeps

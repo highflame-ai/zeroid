@@ -543,7 +543,7 @@ AND p.cascade_pending_at IS NULL`,
 
 // ListCascadePending returns up to limit identities, across every tenant,
 // still marked cascade_pending, oldest mark first, through the partial index
-// on the mark (migration 071).
+// on the mark (migration 072).
 func (r *IdentityRepository) ListCascadePending(ctx context.Context, limit int) ([]*domain.Identity, error) {
 	var identities []*domain.Identity
 	if err := dbOrTx(ctx, r.db).NewSelect().Model(&identities).
