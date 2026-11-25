@@ -1252,6 +1252,15 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		} else {
 			identity.ExpiresAt = &t
 		}
+		// A calling identity can only bring a stored expiry forward: it
+		// cannot move it later, which would revive a child whose expiry has
+		// passed before the sweep ran or undo a shortening the deployer made,
+		// and it cannot clear it.
+		if caller != nil {
+			if err := callerExpiryChange(stored.ExpiresAt, identity.ExpiresAt); err != nil {
+				return nil, err
+			}
+		}
 		// Bringing an expiry forward is always allowed; anything else must
 		// stay within the parent's and the caller's.
 		earlier := stored.ExpiresAt != nil && identity.ExpiresAt != nil && !identity.ExpiresAt.After(*stored.ExpiresAt)
@@ -1522,7 +1531,16 @@ func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, erro
 func (s *IdentityService) PurgeIdentity(ctx context.Context, id, accountID, projectID string) error {
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
-		// Fall through to Delete so callers get the same not-found semantics.
+		// A request marked with CallerIdentity cannot be authorized against a
+		// target that could not be read, so it is refused. Only a genuine
+		// not-found falls through to Delete, so unmarked callers get the same
+		// not-found semantics.
+		if _, marked := CallerIdentityFromContext(ctx); marked {
+			return fmt.Errorf("%w: the identity could not be read to authorize the write: %w", ErrParentIdentityRefused, err)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Warn().Err(err).Str("identity_id", id).Msg("purge: could not read the identity; deleting by id")
+		}
 		return s.repo.Delete(ctx, id, accountID, projectID)
 	}
 	if _, err := s.authorizeCallerWrite(ctx, identity, accountID, projectID); err != nil {

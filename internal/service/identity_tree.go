@@ -464,6 +464,24 @@ func (s *IdentityService) authorizeCallerWrite(ctx context.Context, target *doma
 	return caller, nil
 }
 
+// callerExpiryChange refuses an expiry change a calling identity may not make
+// on a child that has one stored: later than the stored one, or none. With no
+// expiry stored, any date within the caller's bound is allowed (checkExpiry
+// applies it). A stored expiry that has passed counts as stored, so a child
+// the sweep has not yet retired cannot be revived by moving it.
+func callerExpiryChange(stored, next *time.Time) error {
+	if stored == nil {
+		return nil
+	}
+	if next == nil {
+		return fmt.Errorf("%w: a calling identity cannot clear an identity's expiry", ErrParentIdentityRefused)
+	}
+	if next.After(*stored) {
+		return fmt.Errorf("%w: a calling identity cannot move an identity's expiry later than %s", ErrParentIdentityRefused, stored.Format(time.RFC3339))
+	}
+	return nil
+}
+
 // callerStatusChange refuses a status change a calling identity may not make
 // on a child: it may lower a status (active to suspended, anything to
 // deactivated or expired), never raise one. Reactivating a child, or

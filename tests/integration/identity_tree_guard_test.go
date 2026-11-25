@@ -188,6 +188,52 @@ func TestIdentityTree_CallerWritesOnlyLowerItsChildren(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, status, "an identity maintaining discovery sources: %s", raw)
 }
 
+// TestIdentityTree_CallerOnlyBringsExpiryForward: a calling identity can
+// bring a child's stored expiry forward, but cannot move it later or clear it.
+// So it cannot revive a child whose expiry has passed before the sweep ran, or
+// push back an expiry the deployer brought forward. An admin still can.
+func TestIdentityTree_CallerOnlyBringsExpiryForward(t *testing.T) {
+	tn := newTreeTenant()
+	parent, _ := mustTreeAgent(t, tn.headers(), map[string]any{"created_by": "owner-alice"})
+	byParent := tn.as(parent.ID)
+	patch := func(headers map[string]string, id string, expiresAt string) (int, []byte) {
+		t.Helper()
+		return treeRequest(t, http.MethodPatch, adminPath("/identities/"+id), map[string]any{"expires_at": expiresAt}, headers)
+	}
+	in := func(d time.Duration) string { return time.Now().Add(d).UTC().Format(time.RFC3339) }
+
+	// The child's expiry has passed and the sweep has not run.
+	child, childKey := mustTreeAgent(t, byParent, map[string]any{})
+	_, err := testDB.ExecContext(t.Context(), "UPDATE identities SET expires_at = now() - interval '1 minute' WHERE id = ?", child.ID)
+	require.NoError(t, err)
+	code, _ := apiKeyToken(t, childKey, "")
+	require.NotEqual(t, http.StatusOK, code, "an expired child is refused an api_key grant")
+	status, raw := patch(byParent, child.ID, in(24*time.Hour))
+	assert.Equal(t, http.StatusForbidden, status, "the parent reviving an expired child: %s", raw)
+	code, _ = apiKeyToken(t, childKey, "")
+	assert.NotEqual(t, http.StatusOK, code, "the child stays refused")
+
+	// A stored future expiry cannot be pushed back or cleared, only brought forward.
+	second, _ := mustTreeAgent(t, byParent, map[string]any{})
+	status, raw = patch(tn.headers(), second.ID, in(2*time.Hour))
+	require.Equal(t, http.StatusOK, status, "an admin sets the expiry: %s", raw)
+	status, raw = patch(byParent, second.ID, in(48*time.Hour))
+	assert.Equal(t, http.StatusForbidden, status, "pushing a future expiry back: %s", raw)
+	status, raw = patch(byParent, second.ID, "")
+	assert.Equal(t, http.StatusForbidden, status, "clearing a stored expiry: %s", raw)
+	status, raw = patch(byParent, second.ID, in(time.Hour))
+	assert.Equal(t, http.StatusOK, status, "bringing the expiry forward: %s", raw)
+
+	// With none stored, any date within the bound is allowed.
+	third, _ := mustTreeAgent(t, byParent, map[string]any{})
+	status, raw = patch(byParent, third.ID, in(72*time.Hour))
+	assert.Equal(t, http.StatusOK, status, "setting an expiry where none is stored: %s", raw)
+
+	// The deployer's own write is not held to this.
+	status, raw = patch(tn.headers(), second.ID, in(96*time.Hour))
+	assert.Equal(t, http.StatusOK, status, "an unmarked write moving the expiry later: %s", raw)
+}
+
 // TestIdentityTree_ReactivationHeldToChildLimit: bringing a deactivated
 // child back is refused when its parent already has max_children children
 // that are not deactivated.

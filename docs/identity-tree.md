@@ -219,6 +219,11 @@ Anything else is a `403`. On a child, then:
 - **No owner change** (`403`; see above).
 - `allowed_scopes`, `credential_policy_id`, `trust_level` and `expires_at`
   stay within the caller's bound, as for a registration.
+- **`expires_at` only moves earlier.** A child that has an expiry stored can
+  have it brought forward, never moved later and never cleared (`403`), so a
+  parent cannot revive a child whose expiry has passed before the hourly
+  sweep ran, or push back an expiry the deployer brought forward. A child
+  with no expiry stored can be given any date within the caller's bound.
 - `name`, `labels`, `metadata`, the descriptive fields and `sub_type` are
   otherwise the caller's to set on its children.
 
@@ -236,6 +241,12 @@ a marked request is treated as any other admin request. The embedder must not
 let an identity's own token reach those routes. Mark only the routes an
 identity may use to manage its children, and send everything else through the
 embedder's own authorization.
+
+The embedder must not set `CallerIdentity` on requests from its own internal
+services, for example discovery ingest or owner offboarding: a marked request
+is refused on those routes (see
+[Writes by a calling identity](#writes-by-a-calling-identity)). Mark only the
+requests an identity's own token makes.
 
 ## Deactivation
 
@@ -286,7 +297,10 @@ suspension, which does not change the children's status, still stops them.
   that follows `parent_jti` up, at most 50 hops (the cascade revocation cap).
   A chain that does not end at a root within the cap, names an identity
   outside its tenant or one that no longer exists, or a delegation chain
-  longer than 50, refuses.
+  longer than 50, refuses. A delegation lineage longer than 50 links reads
+  inactive on introspection for the same reason: it is held to the same cap
+  as the revocation walk, so a token the walk could not reach is never
+  reported active.
 - **What it cannot do.** A token verified locally, from its signature
   alone, is not checked: a resource server that must honour a stop at once
   introspects. And the issuance check reads the chain, then signs: a stop
