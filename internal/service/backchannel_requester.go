@@ -230,6 +230,11 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	// The approval extends the chain, so the token holds the chain's scopes,
 	// never more (RFC 8693: a child never exceeds its parent). The approval
 	// itself grants the authorization_details entry, not scopes.
+	//
+	// A step-up that names no scope beside openid keeps the chain's scopes;
+	// for the stricter rules' shadow count that is a request naming none.
+	trace := scopeTraceFrom(ctx)
+	trace.ask(authorityScopes(req.Scopes), true)
 	scopes, err := requestingChainScopes(cred.Scopes, req.Scopes)
 	if err != nil {
 		return true, err
@@ -254,6 +259,7 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if ident.IsExpired() {
 		return true, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 	}
+	trace.setIdentity(ident)
 	if refused := scopeRefusedForIdentityType(ident.IdentityType, req.Scopes); refused != "" {
 		return true, oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not issued to this identity", refused))
 	}

@@ -21,6 +21,22 @@ var ErrPolicyNotFound = errors.New("credential policy not found")
 // ErrPolicyViolation is returned when a credential issuance request violates the policy.
 var ErrPolicyViolation = errors.New("credential policy violation")
 
+// policyScopeViolation marks a policy refusal on its scope axis, so a scope
+// refusal can be told from a refusal on the policy's other axes (TTL, grant
+// type, trust level) without reading its text. Its text and errors.Is are the
+// wrapped error's, so the refusal reads exactly as it did without the mark.
+type policyScopeViolation struct{ err error }
+
+func (e policyScopeViolation) Error() string { return e.err.Error() }
+func (e policyScopeViolation) Unwrap() error { return e.err }
+
+// isPolicyScopeViolation reports whether err is a policy refusal on its scope
+// axis.
+func isPolicyScopeViolation(err error) bool {
+	var v policyScopeViolation
+	return errors.As(err, &v)
+}
+
 // ErrPolicyNameConflict is returned when a policy with the same name already exists in the tenant.
 var ErrPolicyNameConflict = errors.New("credential policy with this name already exists")
 
@@ -448,7 +464,7 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 		}
 		for _, requested := range req.Scopes {
 			if !policyScopes[requested] {
-				return fmt.Errorf("%w: scope %q is not permitted by the policy's %s", ErrPolicyViolation, requested, field)
+				return policyScopeViolation{fmt.Errorf("%w: scope %q is not permitted by the policy's %s", ErrPolicyViolation, requested, field)}
 			}
 		}
 	}
