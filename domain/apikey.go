@@ -68,3 +68,16 @@ func (k *APIKey) IsExpired() bool {
 	}
 	return !time.Now().Before(*k.ExpiresAt)
 }
+
+// APIKeyListFilter narrows a list of API keys. An empty field filters nothing.
+type APIKeyListFilter struct {
+	IdentityID   string       // keys bound to this identity
+	IdentityType IdentityType // keys whose identity is of this type
+	// CreatedBy is the user a key is attributed to: whoever created it, or,
+	// for a key made by rotating an identity's key, the identity's owner
+	// (only the owner or an org admin may rotate).
+	CreatedBy string
+	Product   string
+	State     string // active, revoked or expired
+	Label     string // key:value on the key's identity
+}
