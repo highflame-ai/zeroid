@@ -49,6 +49,14 @@ docker compose down -v
 | `demo-resource` | `/whoami`, an AAuth resource guarded by aauth-go; `/mcp`, an OAuth-only tool that takes the bridged DPoP token and introspects it |
 | `demo-agent` | The workload, narrating each step |
 
+### Use a throwaway database
+
+This branch adds migration 073 but not main's 069–072. A persistent database
+migrated by it is recorded at version 73, and later builds of main would then
+skip 069–072. The compose demo uses its own Postgres volume
+(`docker compose down -v` removes it); don't point this branch at a shared or
+long-lived database until it is rebased onto main.
+
 ### Dev-only settings
 
 The compose file turns on settings that must stay off in production:
