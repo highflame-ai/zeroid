@@ -153,6 +153,10 @@ type IssuerInput struct {
 	Source           domain.IssuerSource
 	SourceRef        string
 	Enabled          *bool
+	// FirstContact and its mapping. Empty FirstContact is off.
+	FirstContact            domain.FirstContactMode
+	FirstContactProjectID   string
+	FirstContactOwnerUserID string
 }
 
 // IssuerPatch is an update. Nil fields are unchanged; issuer, kind, source,
@@ -168,6 +172,10 @@ type IssuerPatch struct {
 	JWKSCacheTTL     *int
 	TrustEmail       *bool
 	Enabled          *bool
+	// FirstContact and its mapping. An empty string clears a mapping field.
+	FirstContact            *domain.FirstContactMode
+	FirstContactProjectID   *string
+	FirstContactOwnerUserID *string
 	// IfUpdatedAt, when set, applies the patch only if the row's updated_at
 	// still equals it (409 issuer_changed otherwise). A deployer that checked
 	// the row before enabling it (a workload row's proof of control) enables
@@ -197,8 +205,13 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		Source:              in.Source,
 		SourceRef:           in.SourceRef,
 		Enabled:             in.Enabled == nil || *in.Enabled,
-		CreatedBy:           actor,
-		UpdatedBy:           actor,
+		// Stored whether or not the row is enabled; it acts only once the
+		// row is.
+		FirstContact:            in.FirstContact,
+		FirstContactProjectID:   in.FirstContactProjectID,
+		FirstContactOwnerUserID: in.FirstContactOwnerUserID,
+		CreatedBy:               actor,
+		UpdatedBy:               actor,
 	}
 	if err := domain.ApplyIssuerPreset(row, in.Preset); err != nil {
 		return nil, nil, validationToAPIError(err)
@@ -355,6 +368,9 @@ func staticIssuerView(c domain.ExternalIssuerConfig, accountID string) *domain.E
 		TrustEmail:          c.TrustEmail,
 		Source:              domain.IssuerSourceConfig,
 		Enabled:             true,
+		// First contact registers through bindings on rows; a static entry
+		// has neither.
+		FirstContact: domain.FirstContactOff,
 	}
 }
 
@@ -416,11 +432,12 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 		applyIssuerPatch(r, p)
 		r.UpdatedBy = actor
 		r.Normalize()
-		// A rename or a disable changes nothing uniqueness or validation
-		// decide on. Skipping both keeps such rows manageable when the
-		// deployment's rules moved under them (an issuer dropped from the
-		// shared list leaves rows in several accounts).
-		if !p.onlyNameOrDisable() {
+		// A rename, a disable or a first-contact change touches nothing
+		// uniqueness or the token checks decide on. Skipping both keeps such
+		// rows manageable when the deployment's rules moved under them (an
+		// issuer dropped from the shared list leaves rows in several
+		// accounts); the first-contact fields are still checked on their own.
+		if !p.onlyNameFirstContactOrDisable() {
 			pin := s.sharedPin(r.Issuer)
 			if err := r.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, PinClaim: pin}); err != nil {
 				return validationToAPIError(err)
@@ -433,8 +450,13 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 			if uniquenessConflict(existing, r, pin) {
 				return errIssuerAlreadyTrusted
 			}
-		} else if r.DisplayName = strings.TrimSpace(r.DisplayName); len(r.DisplayName) > 255 {
-			return issuerErr(http.StatusBadRequest, "invalid_request", "display_name is at most 255 characters")
+		} else {
+			if r.DisplayName = strings.TrimSpace(r.DisplayName); len(r.DisplayName) > 255 {
+				return issuerErr(http.StatusBadRequest, "invalid_request", "display_name is at most 255 characters")
+			}
+			if err := r.ValidateFirstContact(); err != nil {
+				return validationToAPIError(err)
+			}
 		}
 		if err := s.repo.Update(ctx, r); err != nil {
 			if isDuplicateKeyError(err) {
@@ -451,10 +473,11 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 	return row, check, nil
 }
 
-// onlyNameOrDisable reports whether p changes nothing but display_name and,
-// at most, disables the row. An enable is re-checked: re-enabling a row
-// stranded in conflict would make grants for both accounts ambiguous.
-func (p IssuerPatch) onlyNameOrDisable() bool {
+// onlyNameFirstContactOrDisable reports whether p changes nothing but
+// display_name and the first-contact settings and, at most, disables the
+// row. An enable is re-checked: re-enabling a row stranded in conflict would
+// make grants for both accounts ambiguous.
+func (p IssuerPatch) onlyNameFirstContactOrDisable() bool {
 	return p.Audiences == nil && p.Algorithms == nil && p.ClaimMapping == nil && p.PropagateClaims == nil &&
 		p.ClaimConstraints == nil && p.MaxTokenAge == nil && p.JWKSCacheTTL == nil && p.TrustEmail == nil &&
 		(p.Enabled == nil || !*p.Enabled)
@@ -490,6 +513,15 @@ func applyIssuerPatch(r *domain.ExternalIssuer, p IssuerPatch) {
 	}
 	if p.Enabled != nil {
 		r.Enabled = *p.Enabled
+	}
+	if p.FirstContact != nil {
+		r.FirstContact = *p.FirstContact
+	}
+	if p.FirstContactProjectID != nil {
+		r.FirstContactProjectID = *p.FirstContactProjectID
+	}
+	if p.FirstContactOwnerUserID != nil {
+		r.FirstContactOwnerUserID = *p.FirstContactOwnerUserID
 	}
 }
 

@@ -369,6 +369,20 @@ const (
 	OriginOkta            Origin = "okta"
 	OriginEntra           Origin = "entra"
 	OriginGoogleWorkspace Origin = "google_workspace"
+	// OriginFirstContact marks an identity ZeroID registered itself when a
+	// verified credential from a trusted issuer named an agent no binding
+	// mapped yet (docs/external-issuers.md, "First contact"). Reserved: no
+	// API caller may create an identity with it.
+	OriginFirstContact Origin = "first_contact"
+)
+
+// First-contact markers on an identity: the label a list can filter on
+// (label=discovered_via:first_contact), and the metadata key holding the
+// verified claims the agent arrived with.
+const (
+	FirstContactLabelKey    = "discovered_via"
+	FirstContactLabelValue  = "first_contact"
+	FirstContactMetadataKey = "first_contact"
 )
 
 // IsExternal reports whether the identity was discovered in an external IdP
@@ -617,6 +631,7 @@ func GetIdentitySchema() *IdentitySchema {
 			{Value: string(OriginOkta), Label: "Okta", Description: "Discovered via the Okta connector"},
 			{Value: string(OriginEntra), Label: "Microsoft Entra", Description: "Discovered via the Microsoft Entra connector"},
 			{Value: string(OriginGoogleWorkspace), Label: "Google Workspace", Description: "Discovered via the Google Workspace connector"},
+			{Value: string(OriginFirstContact), Label: "First contact", Description: "Registered on its first verified call through a trusted issuer"},
 		},
 	}
 }

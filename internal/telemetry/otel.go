@@ -84,6 +84,11 @@ var (
 	// unknown, a workload issuer, disabled, or matched no single row. The
 	// wire answer is one generic invalid_grant. Attribute: reason.
 	FederationIssuerRefused metric.Int64Counter
+
+	// FederationFirstContact counts first-contact attempts: a verified
+	// credential from an issuer row with first_contact on, naming an agent no
+	// binding mapped. Attributes: account_id, grant_type, mode, outcome.
+	FederationFirstContact metric.Int64Counter
 )
 
 func init() {
@@ -136,6 +141,9 @@ func registerInstruments(m metric.Meter) {
 	)
 	FederationIssuerRefused, _ = m.Int64Counter("zeroid.federation.issuer_refused",
 		metric.WithDescription("Federated person grants refused at issuer resolution, by reason"),
+	)
+	FederationFirstContact, _ = m.Int64Counter("zeroid.federation.first_contact",
+		metric.WithDescription("First-contact attempts on issuer rows, by mode and outcome"),
 	)
 }
 

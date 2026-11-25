@@ -53,6 +53,13 @@ type dbFederation struct {
 
 func newDBFederation(t *testing.T) *dbFederation {
 	t.Helper()
+	return newDBFederationWith(t, nil)
+}
+
+// newDBFederationWith is newDBFederation with configure applied to the
+// server's config, and opts passed to the server.
+func newDBFederationWith(t *testing.T, configure func(*zeroid.Config), opts ...zeroid.ServerOption) *dbFederation {
+	t.Helper()
 	idp, err := mockidp.New("https://placeholder")
 	require.NoError(t, err)
 	idpSrv := httptest.NewTLSServer(idp.Handler())
@@ -62,7 +69,8 @@ func newDBFederation(t *testing.T) *dbFederation {
 	f := &dbFederation{idp: idp, idpSrv: idpSrv, members: map[string]string{}}
 	// One mock Entra tenant stands in for a shared issuer (like
 	// accounts.google.com), beside the built-in list.
-	f.srv, f.http = newDBFederationServer(t, append(slices.Clone(domain.DefaultSharedIssuers), domain.SharedIssuer{Issuer: idp.EntraIssuer(sharedTenant), PinClaim: "hd"})...)
+	f.srv, f.http = newDBFederationServerWith(t, configure, opts,
+		append(slices.Clone(domain.DefaultSharedIssuers), domain.SharedIssuer{Issuer: idp.EntraIssuer(sharedTenant), PinClaim: "hd"})...)
 	f.srv.SetFederatedPersonResolver(func(_ context.Context, r zeroid.FederatedPersonRequest) (string, error) {
 		f.resolverCalls.Add(1)
 		f.mu.Lock()
@@ -79,6 +87,13 @@ func newDBFederation(t *testing.T) *dbFederation {
 // newDBFederationServer starts a ZeroID reading issuer rows, on the shared
 // database, as federationIssuer.
 func newDBFederationServer(t *testing.T, sharedIssuers ...domain.SharedIssuer) (*zeroid.Server, *httptest.Server) {
+	t.Helper()
+	return newDBFederationServerWith(t, nil, nil, sharedIssuers...)
+}
+
+func newDBFederationServerWith(t *testing.T, configure func(*zeroid.Config), opts []zeroid.ServerOption,
+	sharedIssuers ...domain.SharedIssuer,
+) (*zeroid.Server, *httptest.Server) {
 	t.Helper()
 	require.NoError(t, initFederationKeyMaterial())
 	cfg := zeroid.Config{
@@ -105,9 +120,13 @@ func newDBFederationServer(t *testing.T, sharedIssuers ...domain.SharedIssuer) (
 		Timeout:   5 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec
 	}
-	srv, err := zeroid.NewServer(cfg,
+	if configure != nil {
+		configure(&cfg)
+	}
+	srv, err := zeroid.NewServer(cfg, append([]zeroid.ServerOption{
 		zeroid.WithExternalIssuerHTTPClient(insecure),
-		zeroid.WithExternalIssuerJWKSOption(authjwt.WithHTTPClient(insecure)))
+		zeroid.WithExternalIssuerJWKSOption(authjwt.WithHTTPClient(insecure)),
+	}, opts...)...)
 	require.NoError(t, err)
 	httpSrv := httptest.NewServer(srv.Router())
 	t.Cleanup(httpSrv.Close)

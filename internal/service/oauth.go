@@ -66,6 +66,10 @@ type OAuthService struct {
 	// issuerBindings maps federated agents to identities when issuers are
 	// account rows (ADR 0042 D6). Nil in static mode.
 	issuerBindings issuerBindingSource
+	// firstContact registers an agent a verified credential names when no
+	// binding maps it yet, as its issuer row's first_contact says. Nil keeps
+	// first contact off. Wired via SetFirstContact.
+	firstContact *FirstContactRegistrar
 	// federatedPerson resolves the person in an IdP token to the deployer's
 	// user (ADR 0042 D5a).
 	federatedPerson federatedPersonHook

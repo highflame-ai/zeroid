@@ -21,6 +21,9 @@ federation:
   issuer_store: db                 # Env: ZEROID_FEDERATION_ISSUER_STORE
   allow_private_endpoints: false   # Env: ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS
   shared_issuers: []               # [{issuer, pin_claim}]; empty = the built-in list below
+  first_contact:                   # bounds on first contact (below)
+    rate_per_minute: 10            # Env: ZEROID_FEDERATION_FIRST_CONTACT_RATE_PER_MINUTE
+    max_discovered_per_account: 500  # Env: ZEROID_FEDERATION_FIRST_CONTACT_MAX_DISCOVERED_PER_ACCOUNT
 ```
 
 `allow_private_endpoints` relaxes the SSRF guard on issuer rows' discovery and JWKS fetches and admits `http` issuer and JWKS URLs.
@@ -47,6 +50,9 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 | `jwks_cache_ttl_seconds` | 30 to 86400, default 300. |
 | `source`, `source_ref` | `admin`, or `connector` with the connector that created the row. |
 | `enabled` | A disabled row refuses every token at the next request. |
+| `first_contact` | `off` (default), `discover` or `adopt`: what a credential that verified under this row does when no binding maps its subject key yet. See [First contact](#first-contact). Stored on a disabled row, but acts only once the row is enabled. |
+| `first_contact_project_id` | The project first contact registers agents into. Required for `discover` and `adopt`. ZeroID checks its shape (a WIMSE URI path segment, at most 255 bytes), not that the project exists: the caller does. |
+| `first_contact_owner_user_id` | The owner of the agents first contact adopts. Required for `adopt`, optional for `discover`. At most 255 bytes. |
 
 ### Who may hold an issuer
 
@@ -129,6 +135,7 @@ The subject key is the value the credential carries at runtime:
 At most one **enabled** binding may exist per `(issuer row, subject key)`.
 A binding for an identity that is not `active` is created disabled, and enabling one requires the identity to be active.
 ZeroID never enables a binding itself: the deployer (in SaaS, Admin) enables an agent's bindings when an org admin adopts or activates it.
+The one exception is the binding [first contact](#first-contact) creates under an `adopt` row, whose standing mapping is the adoption.
 Each binding carries `explicitly_disabled`: true when an admin disabled it (`PATCH {"enabled": false}`) or created it with `"enabled": false`, false when it is disabled only because its identity was not active yet.
 At adoption the deployer enables bindings with the conditional PATCH below, which skips any with `explicitly_disabled: true`, so adoption never undoes an admin's decision; a plain `PATCH {"enabled": true}` clears it.
 Until then the mint refuses it as not adopted (D7), naming the state.
@@ -162,6 +169,7 @@ When the assertion's `iss` names a `workload` row in database mode, ZeroID takes
 5. `jti` is present, and the lifetime from `iat` to `exp` is at most the row's `max_token_age_seconds` (600 by default). That fits STS's 300-second default and Kubernetes' 600-second minimum, and refuses a long-lived token at any point in its life. A `client_id`, if sent, must be `sub` (RFC 7523 §3), `<iss>#<sub>`, or `iss`.
 6. The `jti` is recorded for single use, keyed on `(iss, sub, jti)` because a Kubernetes subject repeats across clusters. It is spent here, before the binding is read, so a captured assertion cannot replay binding refusals. If minting then fails on the server side (5xx) and nothing was issued, the `jti` is released, so retrying the same platform token works: a Kubernetes or STS token can't be re-signed on demand. A refusal (4xx) keeps it spent.
 7. An enabled binding maps `(row, sub)` to an `active` identity (D6, D7). The tenant is that identity's, and a request that names another tenant is refused (D5).
+   With no binding at all, the row's `first_contact` may register the agent first ([First contact](#first-contact)).
 
 The token is for the bound identity. Scopes are the request narrowed by the identity's policy and allowed scopes. The agent must have a scope limit: if neither its identity nor its credential policy sets `allowed_scopes`, the request is refused with `invalid_scope`, whatever it asks for, as a registered `client_credentials` client with no scopes is. Without that, the grant would issue whatever scopes the request names. `client_id` is always `<iss>#<sub>`: a Kubernetes subject repeats across clusters, and any account can add its own issuer and bind any subject string, so `sub` alone never names one client. Issuer URLs carry no fragment, so the first `#` separates the two. `client_auth` is `federated_assertion`. No registered OAuth client can carry a `client_id` containing `#`: admin registration and a binding's presenting client refuse one with 400, and a CIMD client id containing `#` is invalid. So a registered client can never share a `client_id` with a federated one.
 
@@ -226,6 +234,7 @@ The draft also makes the `resource` claim OPTIONAL: an ID-JAG without one is bou
 A registered client linked to a different identity is refused, and a CIMD client gets its tenant from the binding.
 The subject must not be a workload, and checks 4 to 6 above apply.
 Every check, including person resolution, runs before the ID-JAG's `jti` is consumed, after the replay check, so a refused request leaves the grant redeemable.
+The exception is [first contact](#first-contact), which spends the `jti` before it registers the agent.
 
 ### Refusals that are events
 
@@ -235,6 +244,66 @@ Every check, including person resolution, runs before the ID-JAG's `jti` is cons
 - **Agent not adopted** (D7): the bound identity, through an enabled or disabled binding, is not `active`; the error names the state (`agent identity is discovered; ...`); logged as `federation_agent_not_adopted` and counted in `zeroid.federation.agent_not_adopted{account_id, grant_type, status}`, the adoption queue's demand.
 
 ZeroID has no event bus; an embedder that needs ADR 0027 findings reads these.
+
+## First contact
+
+An agent can become known on its first call, instead of waiting for an inventory sync or an admin to bind it.
+An issuer row's `first_contact` says what a credential does when it has verified in full under the row and names an agent no binding maps:
+
+| `first_contact` | What happens |
+|---|---|
+| `off` (default) | The refusal above: `invalid_grant`, "no enabled binding", and the unmatched-agent event. |
+| `discover` | ZeroID registers a `discovered` identity in `first_contact_project_id`, with a **disabled** binding on the subject key, then refuses the request as it refuses any unadopted agent: `invalid_grant`, "agent identity is discovered; ...". The unmatched-agent event names the new identity (`reason` `first_contact_registered`, `identity_id`), and the not-adopted event follows. Adoption later enables the binding as for any discovered agent (its `explicitly_disabled` is false). |
+| `adopt` | ZeroID registers an **active** identity in `first_contact_project_id`, owned by `first_contact_owner_user_id`, with trust level `verified_third_party` and an **enabled** binding, and the request goes on to mint for it. Setting `adopt` on a row is the adoption decision for every agent that first arrives through it, so set it only where the account means that. |
+
+**Triggers.** Two, each only once the credential has verified in full against an enabled row of the right kind:
+
+- A federated client assertion under a `workload` row ([steps 1 to 6](#the-workload-path-federated-client-assertions): signature, `aud`, lifetime, the `jti` spent) whose `(iss, sub)` has no binding at all. The subject key is `sub`.
+- An ID-JAG under a `person` row whose agent (`act.sub`, or the ID-JAG's `client_id` when it has no `act`) has no binding under the row. Only when the redeeming client is a CIMD client, whose registration is the IdP-signed ID-JAG itself: a registered client must be linked to the agent it redeems for, and first contact never creates or links OAuth clients. A registered client's ID-JAG is refused as with `off` (logged with outcome `registered_client`), and stays redeemable.
+  The tenant is the row's account and `first_contact_project_id`; a request that names another is refused. The ID-JAG passes every check that needs no binding, then the replay check, then **person resolution** in that tenant (with no `AgentIdentityID`, since the agent is not registered yet). Only then is its `jti` spent and the agent registered, so a person the resolver refuses leaves no identity or binding behind, and its ID-JAG stays redeemable once the person is a member. With `adopt` the request then mints with the person already resolved; a later refusal, such as the person-grant scope ceiling, keeps the registered agent.
+
+The ID-token exchange (P1c) never registers an agent: its presenting client must already be bound.
+
+**What it never does.**
+
+- It never touches an identity that exists. A subject with any binding, enabled or disabled, keeps today's behaviour, so a dismissed, suspended or deactivated agent is refused naming its state and is never registered again.
+- It never creates a person, a membership or an OAuth client, and never trusts an issuer that is not already a row of the account.
+- A disabled row registers nothing, whatever its mode. A deployer that creates workload rows disabled until their control is proven therefore keeps first contact inert until then.
+
+**The identity.** Filled from the verified credential only:
+
+| Field | Value |
+|---|---|
+| `origin` | `first_contact`. Reserved: no API caller can create an identity with it, and the discovered-identity ingest refuses it (400). |
+| `status`, `trust_level`, `owner_user_id` | `discover`: `discovered`, `unverified`, the mapped owner if set. `adopt`: `active` (with `adopted_at`), `verified_third_party`, the mapped owner. |
+| `account_id`, `project_id` | The row's account, `first_contact_project_id`. |
+| `identity_type`, `sub_type` | `agent`, `tool_agent`. |
+| `credential_policy_id` | The project's default credential policy. For `adopt` to mint, that policy must allow the grant (`client_credentials` or `jwt_bearer`) and, on the workload path, set `allowed_scopes` (see the scope rule above). |
+| `name` | The subject key (cut to 255 bytes). |
+| `external_id` | The subject key when it is a valid WIMSE URI path segment (letters, digits, `.`, `-`, `_`) of at most 128 bytes, as an opaque IdP client id is. Otherwise (an AWS role ARN, a Kubernetes service account, a SPIFFE ID, a URL) its last 160 bytes with every other byte replaced by `_`, then `-` and 20 hex digits of SHA-256(issuer row id, subject key). The subject key itself is always in the binding and in the metadata below. If the project already has an identity with that `external_id`, nothing is registered: the request gets the plain refusal, logged with outcome `external_id_taken`. |
+| `labels` | `{"discovered_via": "first_contact"}`, so `GET /identities?label=discovered_via:first_contact` lists them (add `status=discovered` for the unadopted ones: a list leaves those out unless asked). |
+| `metadata.first_contact` | `issuer`, `issuer_id`, `subject_key`, `first_seen_at`, `grant_type` (`client_credentials` or `id_jag`), `mode`, and for an AWS STS web identity token `aws`: `account`, `org_id`, `ou_path` and `principal_tags` from its `https://sts.amazonaws.com/` claims. Request tags are never kept: the caller of `GetWebIdentityToken` chooses them. The person behind an ID-JAG is never recorded on the agent. |
+
+The binding's `created_by` is `system:first_contact`, and so is the actor of every audit row the registration writes.
+
+**Bounds.** Two, from `federation.first_contact` (defaults above):
+
+- `rate_per_minute`: the agents registered under one row in any minute.
+- `max_discovered_per_account`: the account's `first_contact` identities still `discovered`. `adopt` registers active identities, which this does not count.
+
+Past either, the credential gets the plain no-binding refusal instead, and the attempt is logged.
+
+**Concurrency.** Registration runs in one transaction under a per-account lock, and re-reads the row (still enabled, still on, same project) and the subject's bindings under it. Two first contacts for one subject therefore register one identity and one binding; the later one reads the first one's binding and is answered as for any bound agent.
+
+**Events.** Every attempt is logged as `federation_first_contact` (account, issuer row, subject key, grant, mode, `outcome`, and the identity when one was registered) and counted in `zeroid.federation.first_contact{account_id, grant_type, mode, outcome}`. Outcomes: `registered`, `already_bound`, `row_changed` (disabled, deleted, switched off or re-mapped since the request read it), `rate_limited`, `account_cap`, `external_id_taken`, `subject_too_long`, `registered_client`.
+
+**Merging with an inventory sync.** An agent first contact registered may later be found by a discovery connector. A `POST /identities/discovered` (or the batch) whose `external_id` matches no identity, and whose `metadata.issuer_binding` names the same subject, updates the first-contact identity instead of creating a second one:
+
+```json
+{"metadata": {"issuer_binding": {"issuer_id": "<issuer row id>", "subject_key": "<subject key>"}}}
+```
+
+`issuer` (the row's issuer URL) may stand in for `issuer_id`. Only within the same account and project: an ingest into another project creates its own identity. The update is the usual discovered reconcile (name, description, labels, metadata and the rest), except that the `discovered_via` label and `metadata.first_contact` are kept whatever the ingest sends. The identity keeps its `external_id` and `origin`.
 
 ## Person resolution
 
@@ -311,6 +380,8 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 |---|---|---|
 | 400 | `invalid_issuer` | Not an absolute https URL (http only with `allow_private_endpoints`), templated, an Entra multi-tenant endpoint on a person row, or not the shape a preset requires |
 | 400 | `invalid_identity_id`, `invalid_kind`, `invalid_audiences` (a workload row with none), `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_trust_email` (on a workload row), `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
+| 400 | `first_contact_mapping_required` | `first_contact` is `discover` without `first_contact_project_id`, or `adopt` without `first_contact_project_id` and `first_contact_owner_user_id`; on PATCH, checked against the stored fields the patch leaves unchanged |
+| 400 | `invalid_first_contact` | `first_contact_project_id` is not a WIMSE URI path segment, or either mapping field is over 255 bytes. A `first_contact` other than `off`, `discover` or `adopt` is refused by the body schema first (huma's 422) |
 | 400 | `claim_mapping_reserved` | `claim_mapping` names `role` or `privilege_scope`, on create or on any PATCH that is not only a rename or a disable (a row stored with one must drop it to be edited) |
 | 401 | `unauthorized` | No tenant context |
 | 404 | `not_found` | No such row or binding in this account |
@@ -371,7 +442,10 @@ On a `config` server the items are the static entries that admit the account, wi
   "jwks_cache_ttl_seconds": 300,
   "source": "admin",
   "source_ref": "",
-  "enabled": true
+  "enabled": true,
+  "first_contact": "off",
+  "first_contact_project_id": "",
+  "first_contact_owner_user_id": ""
 }
 ```
 
@@ -399,6 +473,9 @@ The response is the issuer:
   "source": "admin",
   "source_ref": "",
   "enabled": true,
+  "first_contact": "off",
+  "first_contact_project_id": "",
+  "first_contact_owner_user_id": "",
   "created_by": "user_abc",
   "updated_by": "user_abc",
   "created_at": "2026-10-15T10:00:00Z",
@@ -413,11 +490,12 @@ The issuer, without `jwks_check`.
 
 ### `PATCH /external-issuers/{id}` → 200
 
-Any of `display_name`, `audiences`, `algorithms`, `claim_mapping`, `propagate_claims`, `claim_constraints`, `max_token_age_seconds`, `jwks_cache_ttl_seconds`, `trust_email`, `enabled`; absent fields are unchanged.
+Any of `display_name`, `audiences`, `algorithms`, `claim_mapping`, `propagate_claims`, `claim_constraints`, `max_token_age_seconds`, `jwks_cache_ttl_seconds`, `trust_email`, `enabled`, `first_contact`, `first_contact_project_id`, `first_contact_owner_user_id`; absent fields are unchanged.
+An empty `first_contact_project_id` or `first_contact_owner_user_id` clears it; switching `first_contact` to `off` keeps the mapping.
 `issuer`, `kind`, `source` and `jwks_uri` never change through PATCH (an unknown field is a 422).
 Neither do `claim_mapping.user_id`, `claim_mapping.email` and `claim_mapping.email_verified`: they decide who a token's person is, and remapping one to a claim an IdP user can set (`upn`, `preferred_username`) would let that user take over an existing link (nOAuth).
 A `claim_mapping` patch replaces the whole map, so it must repeat those three unchanged; otherwise it is 422 `claim_mapping_immutable`. Delete and re-create the issuer to change them.
-The whole row is re-validated and re-checked for uniqueness, except for a patch that changes only `display_name` and/or disables the row, so rows stay manageable when the deployment's rules move under them (an issuer dropped from the shared list leaves rows in several accounts that can still be renamed and disabled).
+The whole row is re-validated and re-checked for uniqueness, except for a patch that changes only `display_name` and the first-contact fields (which are checked on their own) and/or disables the row, so rows stay manageable when the deployment's rules move under them (an issuer dropped from the shared list leaves rows in several accounts that can still be renamed and disabled).
 Any patch that enables a row is re-checked, so a row stranded in conflict cannot be re-enabled.
 `if_updated_at` (the row's `updated_at` as last read) makes the patch conditional: it applies only while the row is unchanged since then, checked under the issuer lock every writer takes, else 409 `issuer_changed`. A deployer that checked a row before enabling it, as for a workload row's proof of control, enables exactly the row it checked.
 A workload create refused with 409 `issuer_already_trusted` is logged as a warning (account, issuer, actor): the first account to add an issuer holds it, so it can be a rightful customer blocked by a squatter's row, for an operator to resolve.
@@ -637,13 +715,15 @@ Clients that an older release left unlinked when their identity was hard-deleted
 
 ## Migration ordering
 
-The tables are migration 056.
+The tables are migration 056. The first-contact columns, their CHECK constraint and the binding index the rate limit reads are migration 069.
 Migration 055 (the refresh-token family, PRs #421 to #423) must be applied before it: golang-migrate never applies a version below the database's current one, so a database that reached 056 first would silently skip 055.
 If this change merges before 055, renumber it at merge.
 
 ## Audit
 
 Every insert, update and delete of a row or binding writes `identity_audit_logs` (`table_name` `external_issuers` or `external_issuer_bindings`, actions `INSERT_EXTERNAL_ISSUER`, `UPDATE_EXTERNAL_ISSUER`, `DELETE_EXTERNAL_ISSUER`, `INSERT_ISSUER_BINDING`, ...), with the actor from `X-User-ID` and the binding's identity as `identity_id`.
+An issuer row's audit documents include `first_contact`, `first_contact_project_id` and `first_contact_owner_user_id` (migration 069), so who set `adopt`, and with which mapping, is kept.
+What first contact writes names `system:first_contact` as the actor.
 
 ## Running it locally
 
@@ -656,4 +736,5 @@ Every insert, update and delete of a row or binding writes `identity_audit_logs`
 - The connector "Trust for agent access" toggle (ADR 0042 open question 7) is not built; `source: connector` rows can be written through the API.
 - Proof of issuer control (open question 8): the first account to add a customer-unique issuer holds it. For `person` rows the deployer gates person resolution on an ownership proof (`/discovery` and `/verify-id-token` above); for `workload` rows, including a shared issuer's pinning value, it enables a row only after a challenge token verifies under it (`/verify-workload-token` above). ZeroID does not enforce either itself: a row written enabled through this API mints.
 - Account lifecycle (D4a follow-up a): deleting an account in Admin does not yet remove its rows.
+- First contact maps a row to one project, one owner and the project's default credential policy. A per-row credential policy, labels or tags from the mapping are not built. Nor is first contact on the ID-token exchange, or an inventory sync naming a subject by anything but `metadata.issuer_binding`.
 - JWKS refreshes on an unknown `kid` are rate-limited per key set (one every 10 seconds), and rows that share a `jwks_uri` share the key set. Tokens with made-up `kid`s, presented on the ID-token exchange or on `/verify-id-token`, can hold that slot, so a real key rotation at the IdP is picked up up to 10 seconds late for every account on the key set.

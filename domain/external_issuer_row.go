@@ -39,6 +39,34 @@ const (
 	IssuerSourceConfig IssuerSource = "config"
 )
 
+// FirstContactMode says what a credential that verified under an enabled
+// issuer row does when no binding maps its subject key yet. See
+// docs/external-issuers.md, "First contact".
+type FirstContactMode string
+
+const (
+	// FirstContactOff refuses the credential, as with no binding. The default.
+	FirstContactOff FirstContactMode = "off"
+	// FirstContactDiscover registers a discovered identity with a disabled
+	// binding, then refuses the credential as it refuses any unadopted agent.
+	FirstContactDiscover FirstContactMode = "discover"
+	// FirstContactAdopt registers an active identity under the row's mapping
+	// (project and owner), with an enabled binding, and serves the request.
+	// Setting it on a row is the adoption decision for every agent that first
+	// arrives through the row.
+	FirstContactAdopt FirstContactMode = "adopt"
+)
+
+// Valid reports whether m is a known mode.
+func (m FirstContactMode) Valid() bool {
+	return m == FirstContactOff || m == FirstContactDiscover || m == FirstContactAdopt
+}
+
+// On reports whether first contact registers anything.
+func (m FirstContactMode) On() bool {
+	return m == FirstContactDiscover || m == FirstContactAdopt
+}
+
 // Defaults for an external issuer row.
 const (
 	DefaultIssuerMaxTokenAgeSeconds  = 600
@@ -71,11 +99,17 @@ type ExternalIssuer struct {
 	Source              IssuerSource `bun:"source,notnull"                            json:"source"`
 	SourceRef           string       `bun:"source_ref,notnull"                        json:"source_ref"`
 	Enabled             bool         `bun:"enabled,notnull"                           json:"enabled"`
-	CreatedBy           string       `bun:"created_by,notnull"                        json:"created_by"`
-	UpdatedBy           string       `bun:"updated_by,notnull"                        json:"updated_by"`
-	CreatedAt           time.Time    `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt           time.Time    `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
-	DeletedAt           *time.Time   `bun:"deleted_at"                                json:"-"`
+	// FirstContact and its mapping: the project an agent first seen through
+	// this row is registered into, and, for adopt, its owner. A disabled row
+	// registers nothing, whatever the mode.
+	FirstContact            FirstContactMode `bun:"first_contact,notnull"               json:"first_contact"`
+	FirstContactProjectID   string           `bun:"first_contact_project_id,notnull"    json:"first_contact_project_id"`
+	FirstContactOwnerUserID string           `bun:"first_contact_owner_user_id,notnull" json:"first_contact_owner_user_id"`
+	CreatedBy               string           `bun:"created_by,notnull"                        json:"created_by"`
+	UpdatedBy               string           `bun:"updated_by,notnull"                        json:"updated_by"`
+	CreatedAt               time.Time        `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt               time.Time        `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
+	DeletedAt               *time.Time       `bun:"deleted_at"                                json:"-"`
 }
 
 // IssuerBinding maps a credential's runtime subject key, under one issuer
@@ -207,6 +241,46 @@ func (e *ExternalIssuer) Normalize() {
 		e.PropagateClaims = []string{}
 	}
 	e.Audiences = compactStrings(e.Audiences)
+	if e.FirstContact == "" {
+		e.FirstContact = FirstContactOff
+	}
+	e.FirstContactProjectID = strings.TrimSpace(e.FirstContactProjectID)
+	e.FirstContactOwnerUserID = strings.TrimSpace(e.FirstContactOwnerUserID)
+}
+
+// ValidateFirstContact checks the first-contact mode and its mapping. Validate
+// calls it; an update that changes nothing else calls it alone. The project
+// is checked for shape only: ZeroID does not know which projects exist, so the
+// caller checks that.
+func (e *ExternalIssuer) ValidateFirstContact() error {
+	if !e.FirstContact.Valid() {
+		return issuerInvalid("invalid_first_contact", "first_contact must be off, discover or adopt")
+	}
+	if p := e.FirstContactProjectID; p != "" {
+		// The project lands in the registered identity's WIMSE URI.
+		if len(p) > 255 {
+			return issuerInvalid("invalid_first_contact", "first_contact_project_id is at most 255 bytes")
+		}
+		if err := ValidateSPIFFEPathSegment("first_contact_project_id", p); err != nil {
+			return issuerInvalid("invalid_first_contact", "%v", err)
+		}
+	}
+	if len(e.FirstContactOwnerUserID) > 255 {
+		return issuerInvalid("invalid_first_contact", "first_contact_owner_user_id is at most 255 bytes")
+	}
+	switch e.FirstContact {
+	case FirstContactDiscover:
+		if e.FirstContactProjectID == "" {
+			return issuerInvalid("first_contact_mapping_required",
+				"first_contact discover needs first_contact_project_id, the project agents are registered into")
+		}
+	case FirstContactAdopt:
+		if e.FirstContactProjectID == "" || e.FirstContactOwnerUserID == "" {
+			return issuerInvalid("first_contact_mapping_required",
+				"first_contact adopt needs first_contact_project_id and first_contact_owner_user_id: the agents it registers are adopted into that project, owned by that user")
+		}
+	}
+	return nil
 }
 
 // Validate checks a row before it is written. Call Normalize first.
@@ -333,7 +407,7 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	if len(e.DisplayName) > 255 || len(e.SourceRef) > 255 {
 		return issuerInvalid("invalid_request", "display_name and source_ref are at most 255 characters")
 	}
-	return nil
+	return e.ValidateFirstContact()
 }
 
 // UniquenessKey is the constraints_key column: empty for a customer-unique

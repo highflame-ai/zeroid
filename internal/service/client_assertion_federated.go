@@ -173,7 +173,7 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 		return nil, oauthServerError("client assertion replay check failed", err)
 	}
 
-	accessToken, err := s.mintFederatedClientCredentials(ctx, req, row, sub, clientID)
+	accessToken, err := s.mintFederatedClientCredentials(ctx, req, row, sub, clientID, tokenClaimsAsMap(verified))
 	if err != nil && federatedServerFailure(err) {
 		// Nothing was minted, and the caller was told to retry. The assertion
 		// is single use, and a Kubernetes or STS token can't be re-signed on
@@ -187,11 +187,13 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 }
 
 // mintFederatedClientCredentials resolves the agent bound to (row, sub) and
-// mints its token. The assertion has been verified and its jti spent.
+// mints its token. The assertion has been verified and its jti spent, so it
+// may register the agent on first contact; claims are its verified claims.
 func (s *OAuthService) mintFederatedClientCredentials(
-	ctx context.Context, req TokenRequest, row *domain.ExternalIssuer, sub, clientID string,
+	ctx context.Context, req TokenRequest, row *domain.ExternalIssuer, sub, clientID string, claims map[string]any,
 ) (*domain.AccessToken, error) {
-	identity, err := s.bindFederatedAgent(ctx, row, sub, nil, federatedGrantClientCredentials)
+	firstContact := s.firstContactFor(row, sub, federatedGrantClientCredentials, claims, nil)
+	identity, err := s.bindFederatedAgent(ctx, row, sub, nil, federatedGrantClientCredentials, firstContact)
 	if err != nil {
 		return nil, err
 	}

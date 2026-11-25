@@ -42,17 +42,23 @@ const (
 //
 // There is no synthetic identity: no binding, or a client registered to a
 // different identity, is invalid_grant and an unmatched-agent event.
+//
+// firstContact, when set, runs when no binding at all maps the subject key
+// (first contact, docs/external-issuers.md). If it registered the agent, or
+// found it registered concurrently, the bindings are read again and decide
+// as for any agent: a discovered one is refused naming its state, an adopted
+// one is served. A subject with a binding, enabled or not, never reaches it.
 func (s *OAuthService) bindFederatedAgent(ctx context.Context, row *domain.ExternalIssuer, subjectKey string,
-	client *domain.OAuthClient, grant string,
+	client *domain.OAuthClient, grant string, firstContact firstContactFunc,
 ) (*domain.Identity, error) {
 	if s.issuerBindings == nil {
 		return nil, oauthServerError("credential bindings are not configured", nil)
 	}
-	return bindAgent(ctx, s.issuerBindings, s.identitySvc.repo.GetByIDInAccounts, row, subjectKey, client, grant)
+	return bindAgent(ctx, s.issuerBindings, s.identitySvc.repo.GetByIDInAccounts, row, subjectKey, client, grant, firstContact)
 }
 
 func bindAgent(ctx context.Context, bindings issuerBindingSource, lookup linkedIdentityLookup, row *domain.ExternalIssuer,
-	subjectKey string, client *domain.OAuthClient, grant string,
+	subjectKey string, client *domain.OAuthClient, grant string, firstContact firstContactFunc,
 ) (*domain.Identity, error) {
 	if subjectKey == "" {
 		recordUnmatchedAgent(ctx, row, subjectKey, grant, "no_subject_key")
@@ -61,6 +67,17 @@ func bindAgent(ctx context.Context, bindings issuerBindingSource, lookup linkedI
 	all, err := bindings.BindingsFor(ctx, row.ID, subjectKey)
 	if err != nil {
 		return nil, oauthServerError("failed to read the agent's credential binding", err)
+	}
+	if len(all) == 0 && firstContact != nil {
+		reread, err := firstContact(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if reread {
+			if all, err = bindings.BindingsFor(ctx, row.ID, subjectKey); err != nil {
+				return nil, oauthServerError("failed to read the agent's credential binding", err)
+			}
+		}
 	}
 	if len(all) == 0 {
 		recordUnmatchedAgent(ctx, row, subjectKey, grant, "no_binding")
@@ -122,19 +139,29 @@ func federatedTenant(identity *domain.Identity, reqAccountID, reqProjectID strin
 // from a trusted issuer that maps to no adopted identity. A log line and a
 // metric; ZeroID has no event bus.
 func recordUnmatchedAgent(ctx context.Context, row *domain.ExternalIssuer, subjectKey, grant, reason string) {
+	recordUnmatchedAgentIdentity(ctx, row, subjectKey, grant, reason, "")
+}
+
+// recordUnmatchedAgentIdentity is the unmatched-agent event naming the
+// identity the credential now points at, when there is one (an agent first
+// contact registered unadopted).
+func recordUnmatchedAgentIdentity(ctx context.Context, row *domain.ExternalIssuer, subjectKey, grant, reason, identityID string) {
 	telemetry.FederationUnmatchedAgent.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("account_id", row.AccountID),
 		attribute.String("grant_type", grant),
 		attribute.String("reason", reason),
 	))
-	log.Warn().
+	ev := log.Warn().
 		Str("account_id", row.AccountID).
 		Str("issuer_id", row.ID).
 		Str("issuer", row.Issuer).
 		Str("subject_key", subjectKey).
 		Str("grant_type", grant).
-		Str("reason", reason).
-		Msg("federation_unmatched_agent")
+		Str("reason", reason)
+	if identityID != "" {
+		ev = ev.Str("identity_id", identityID)
+	}
+	ev.Msg("federation_unmatched_agent")
 }
 
 func recordAgentNotAdopted(ctx context.Context, row *domain.ExternalIssuer, identity *domain.Identity, grant string) {

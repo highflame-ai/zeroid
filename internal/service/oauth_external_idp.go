@@ -301,7 +301,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	// caller-named application, or a synthetic carrier.
 	var actors []domain.Actor
 	if entry.Row != nil {
-		identity, err = s.bindFederatedAgent(ctx, entry.Row, authedClient.ClientID, authedClient, federatedGrantIDToken)
+		identity, err = s.bindFederatedAgent(ctx, entry.Row, authedClient.ClientID, authedClient, federatedGrantIDToken, nil)
 		if err != nil {
 			return nil, err
 		}
