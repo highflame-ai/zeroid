@@ -111,6 +111,10 @@ func newDBFederationServerWith(t *testing.T, configure func(*zeroid.Config), opt
 		Logging:     zeroid.LoggingConfig{Level: "warn"},
 		WIMSEDomain: testWIMSE,
 		Federation:  zeroid.FederationConfig{IssuerStore: "db", AllowPrivateEndpoints: true, SharedIssuers: sharedIssuers},
+		ReservedClientIDs: zeroid.ReservedClientIDsConfig{
+			Names:    []string{testReservedClientID},
+			Prefixes: []string{testReservedClientPrefix},
+		},
 	}
 	insecure := &http.Client{
 		Timeout:   5 * time.Second,

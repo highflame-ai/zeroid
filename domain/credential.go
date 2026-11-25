@@ -44,7 +44,17 @@ const (
 	// GrantTypeRefreshToken is used to rotate refresh tokens for long-lived sessions (RFC 6749 §6).
 	// Implements family-based rotation with reuse detection.
 	GrantTypeRefreshToken GrantType = "refresh_token"
+	// GrantTypeAssertedTenant is the stored form of the asserted-tenant grant
+	// (GrantTypeAssertedTenantURN), in which a deployment's own service names
+	// the tenant it acts in. It is recorded on the credential row and in the
+	// grant_type claim. Credential policies cannot name it: server
+	// configuration governs the grant, not a tenant's policy.
+	GrantTypeAssertedTenant GrantType = "asserted_tenant"
 )
+
+// GrantTypeAssertedTenantURN is the grant_type a client sends for the
+// asserted-tenant grant.
+const GrantTypeAssertedTenantURN = "urn:highflame:params:oauth:grant-type:asserted-tenant"
 
 // urnToShortGrantType maps OAuth2 URN grant type identifiers to their canonical short forms.
 var urnToShortGrantType = map[string]GrantType{

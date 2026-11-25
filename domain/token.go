@@ -45,6 +45,9 @@ type TokenClaims struct {
 type ActorClaims struct {
 	Subject string `json:"sub"`
 	Issuer  string `json:"iss,omitempty"`
+	// ClientID is the OAuth client the actor authenticated as, when the grant
+	// that minted the token authenticated it as one (`act.client_id`).
+	ClientID string `json:"client_id,omitempty"`
 }
 
 // AccessToken is the RFC 6749 §5.1 token response returned to the caller after issuance.
@@ -178,7 +181,8 @@ type OAuthClient struct {
 	ChannelTrusted bool `bun:"channel_trusted,notnull" json:"-"`
 
 	// Dynamic Client Registration (RFC 7591/7592)
-	// RegistrationSource is "internal" for clients created via the admin/internal
+	// RegistrationSource is "seed" for clients created by Server.EnsureClient
+	// (RegistrationSourceSeed), and "internal" for clients created via the admin/internal
 	// API path, "dynamic" for clients created via POST /oauth2/register, and
 	// RegistrationSourceCIMD for an ephemeral client synthesized from a Client ID
 	// Metadata Document. See SelfAsserted.
@@ -297,6 +301,12 @@ type ProofToken struct {
 	UsedAt     *time.Time `bun:"used_at"        json:"used_at,omitempty"`
 	CreatedAt  time.Time  `bun:"created_at"     json:"created_at"`
 }
+
+// RegistrationSourceSeed marks a client registered by the operator's seeding
+// path (Server.EnsureClient). A seed linked to an identity adopts only a row
+// it created itself, so a client someone else registered and linked to the
+// same identity is never taken over.
+const RegistrationSourceSeed = "seed"
 
 // RegistrationSourceCIMD marks a client synthesized from a Client ID Metadata
 // Document rather than registered. See OAuthClient.SelfAsserted.

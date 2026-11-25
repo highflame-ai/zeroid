@@ -89,3 +89,11 @@ func (r *AuditLogRepository) Feed(ctx context.Context, afterTxID string, afterSe
 
 	return entries, err
 }
+
+// Insert writes one audit row. txid and seq take their column defaults, so
+// the row joins the ordered feed like a trigger-written one.
+func (r *AuditLogRepository) Insert(ctx context.Context, entry *AuditLogEntry) error {
+	db := dbOrTx(ctx, r.db)
+	_, err := db.NewInsert().Model(entry).Exec(ctx)
+	return err
+}
