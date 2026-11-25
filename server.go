@@ -354,6 +354,15 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// issuance chokepoint reads it (human-rooted delegation, phase 1).
 	credentialSvc.SetTenantSettingsService(tenantSettingsSvc)
 	tenantSettingsSvc.SetCredentialService(credentialSvc)
+	// The stricter scope rules' mode. Validate() already rejected an unknown
+	// value; empty is off.
+	scopeRulesMode, err := service.ParseScopeRulesMode(cfg.Token.ScopeRules)
+	if err != nil {
+		return nil, fmt.Errorf("token.scope_rules: %w", err)
+	}
+	if err := credentialSvc.SetScopeRulesMode(scopeRulesMode); err != nil {
+		return nil, fmt.Errorf("token.scope_rules: %w", err)
+	}
 	signalSvc := service.NewSignalService(signalRepo, credentialSvc, identityRepo)
 	signingCredSvc := service.NewSigningCredentialService(
 		signingCredRepo,
@@ -1592,6 +1601,24 @@ func (s *Server) SetFederatedPersonResolver(fn FederatedPersonResolver) {
 // Can be called any time after NewServer; safe to call concurrently.
 func (s *Server) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrantMode) error {
 	return s.credentialSvc.SetPersonGrantResolver(fn, mode)
+}
+
+// SetScopeRulesMode sets token.scope_rules at runtime. In ScopeRulesModeShadow
+// every grant (authorization_code, refresh_token, api_key,
+// client_credentials, jwt_bearer, token exchange, ID-token exchange, ID-JAG
+// and CIBA) is evaluated against the stricter scope issuance rules, and each
+// request whose outcome they would change is logged as
+// scope_rule_would_change and counted in
+// zeroid_scope_rule_would_change_total. Nothing is enforced: every token and
+// every response is exactly what ScopeRulesModeOff produces. The internal
+// service grants, which issue no scopes, are not evaluated, and reserved
+// scopes (SetReservedScopes) are left to their own rules. An empty or
+// unknown mode is rejected and the setting left unchanged. See
+// docs/scope-ceilings.md, "Stricter scope rules".
+//
+// Can be called any time after NewServer; safe to call concurrently.
+func (s *Server) SetScopeRulesMode(mode ScopeRulesMode) error {
+	return s.credentialSvc.SetScopeRulesMode(mode)
 }
 
 // SetReservedScopes reserves scope prefixes for the deployer's own APIs

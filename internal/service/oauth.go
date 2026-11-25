@@ -834,8 +834,13 @@ type TokenRequest struct {
 }
 
 // Token handles the /oauth2/token endpoint dispatch.
-func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (tok *domain.AccessToken, err error) {
 	ctx = withPolicyMemo(ctx)
+	// With token.scope_rules=shadow, record what the stricter scope rules
+	// would change about this request once its outcome is known. The trace
+	// only observes: the token and the error returned are untouched.
+	ctx, trace := s.credentialSvc.traceScopes(ctx, scopeTraceGrant(req.GrantType))
+	defer func() { trace.done(ctx, err) }()
 	// RFC 8707 resource indicators (CAP-IDN-026). Resolved here, once, BEFORE
 	// grant dispatch so every grant — including custom ones registered via
 	// RegisterGrant — sees the same validated list and no grant can forget the
@@ -866,7 +871,7 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		// so all three exchange modes (NHI delegation, the trusted-broker
 		// principal exchange, OIDC ID-token federation) carry it and a new
 		// mode cannot forget to. Every mode issues a ZeroID access token.
-		tok, err := s.tokenExchange(ctx, req)
+		tok, err = s.tokenExchange(ctx, req)
 		if tok != nil {
 			tok.IssuedTokenType = TokenTypeAccessToken
 		}
@@ -911,6 +916,10 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidRequest,
 			"account_id and project_id must be sent together, or both omitted")
 	}
+	trace := scopeTraceFrom(ctx)
+	trace.ask(parseScopeString(req.Scope), true)
+	// The tenant is recorded from the identity once it resolves, never from
+	// the request: a caller could otherwise name any tenant it likes.
 
 	// A client_assertion from a trusted workload issuer authenticates the
 	// agent with no registered client (ADR 0042 D8).
@@ -930,6 +939,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	if err != nil {
 		return nil, err
 	}
+	trace.setClient(client)
 
 	// Ensure client_credentials grant is permitted.
 	allowed := slices.Contains(client.GrantTypes, "client_credentials")
@@ -1015,6 +1025,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	if identity.IsExpired() {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 	}
+	trace.setIdentity(identity)
 	// A token in the service tenant is one of the deployment's services
 	// calling as itself, which a receiver recognises by client_id and this
 	// account. Only such a service's own client may mint one, and it lives
@@ -1192,6 +1203,9 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	if err != nil {
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
 	}
+	trace := scopeTraceFrom(ctx)
+	trace.setIdentity(identity)
+	trace.ask(parseScopeString(req.Scope), true)
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
 	scopes, err := grantScopes(req.Scope, policyScopes, rowScopes)
 	if err != nil {
@@ -1402,6 +1416,11 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// never receive more than its principal currently holds, per RFC 8693
 	// intent.
 	requestedScopes := parseScopeString(req.Scope)
+	trace := scopeTraceFrom(ctx)
+	trace.ask(requestedScopes, false)
+	trace.markDelegation()
+	trace.setIdentity(actorIdentity)
+	trace.setClientID(actorIdentity.ExternalID)
 	// The parent's depth. jwx v4: jwt.Get[float64] replaces the v2 Token.Get
 	// + assertion; JSON numbers decode as float64 regardless of integer intent.
 	var parentDepth int
@@ -1676,6 +1695,8 @@ func (s *OAuthService) parentPrincipal(subjectParsed jwt.Token, subjectCred *dom
 // ExternalPrincipalExchange issues an RS256 token for an externally-authenticated principal.
 // Exported so deployers can call it from custom grant handlers.
 func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	trace := scopeTraceFrom(ctx)
+	trace.setGrant(PersonGrantExternalPrincipal)
 	// Step 1: Verify the caller. A session broker (a client on
 	// service_tokens.session_broker_clients) authenticates as that client and
 	// nothing else: its client authentication must pass, the trusted-service
@@ -1870,6 +1891,13 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		}
 		scopes = slices.Clone(profile)
 		audience = []string{req.Audience}
+	}
+	// A profiled audience's scopes are the server's, not the caller's: they
+	// are what was asked, every one is listed, and rule A keeps them.
+	trace.setIdentity(identity)
+	trace.ask(scopes, len(audience) == 0)
+	if len(audience) > 0 {
+		trace.listAll()
 	}
 
 	issue := IssueRequest{
@@ -2283,6 +2311,13 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		}
 		keyPolicyScopes = kp.AllowedScopes
 	}
+	// The key's stored scopes are a deployer-controlled listing, and the
+	// default an omitted request keeps under rule A when the key has any.
+	trace := scopeTraceFrom(ctx)
+	trace.setIdentity(identity)
+	trace.ask(parseScopeString(req.Scope), len(sk.Scopes) == 0)
+	trace.addListing(sk.Scopes)
+	trace.addListing(keyPolicyScopes)
 	identityPolicyScopes, rowScopes := identityScopeCeilings(identityPolicy, identity)
 	scopes, err := grantScopes(req.Scope, sk.Scopes, keyPolicyScopes, identityPolicyScopes, rowScopes)
 	if err != nil {
@@ -2690,7 +2725,16 @@ func (s *OAuthService) ResolveCIMDClientForDisplay(
 
 // Returns a signed JWT on success, or an *OAuthError shaped for direct
 // surfacing from the /oauth2/authorize handler.
-func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeRequest) (string, error) {
+func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeRequest) (code string, err error) {
+	// The authorization request is where an omitted scope, and a narrowing
+	// of the scope the caller named, are visible: the code carries only the
+	// result. With token.scope_rules=shadow, record what the stricter rules
+	// would change about it; the code and the error are untouched.
+	ctx, trace := s.credentialSvc.traceScopes(ctx, string(domain.GrantTypeAuthorizationCode))
+	defer func() { trace.done(ctx, err) }()
+	trace.setClientID(req.ClientID)
+	trace.setTenant(req.AccountID, req.ProjectID)
+
 	// Required-field gate.
 	if req.ClientID == "" {
 		return "", oauthBadRequest(oautherror.InvalidRequest, "client_id is required")
@@ -2743,6 +2787,12 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 	if _, err := checkAuthorizeClientPolicy(oauthClient, req.RedirectURI); err != nil {
 		return "", err
 	}
+	trace.setClient(oauthClient)
+	if oauthClient.IdentityID != nil {
+		// The identity a token redeemed from this code is minted for.
+		trace.setIdentityID(*oauthClient.IdentityID)
+	}
+	trace.ask(parseScopeString(req.RequestedScope), true)
 
 	// Scope intersection: the issued code can never authorize a scope the
 	// client itself isn't allowed. Which meaning req.Scopes==[] carries is
@@ -2791,6 +2841,7 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 			return "", personGrantOAuthError(err, oautherror.InvalidScope)
 		}
 	}
+	trace.codeIssued(scopes)
 
 	// Build the claim shape that decodeAuthCodeJWT reads. Use time.Now
 	// as the issuance instant — mintAuthCodeJWT derives jti + exp from
@@ -2963,6 +3014,13 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	if !verifyCodeChallenge(req.CodeVerifier, authCode.CodeChallenge) {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "PKCE verification failed")
 	}
+
+	// The code's scopes are what this redemption asks for. Whether the
+	// authorization request named any was judged when the code was issued.
+	trace := scopeTraceFrom(ctx)
+	trace.setClient(oauthClient)
+	trace.setTenant(authCode.AccountID, authCode.ProjectID)
+	trace.ask(authCode.Scopes, false)
 
 	// Resolve the RFC 8707 binding against the ceiling the code recorded
 	// (CAP-IDN-027) BEFORE the code is consumed.
@@ -3361,6 +3419,11 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 				"audience profile, so it cannot be rotated into a resource-bound token")
 	}
 
+	// A refresh repeats its family's grant (RFC 6749 §6), so the family's
+	// scopes are what it asks for. An audience-profile family's scopes are
+	// the server's profile, every one listed; any other family's client
+	// lists its scopes when the deployer's trusted path created it.
+	trace := scopeTraceFrom(ctx)
 	var accessTTL, refreshTokenTTL int
 	if audienceRefreshToken != nil {
 		// Client-less audience-profile token. The refreshed access token is
@@ -3371,6 +3434,8 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		if audienceRefreshToken.ClientID != req.ClientID {
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
 		}
+		trace.setClientID(req.ClientID)
+		trace.listAll()
 		accessTTL = externalPrincipalAccessTokenTTL
 		refreshTokenTTL = s.externalPrincipalRefreshTokenTTL
 		if refreshTokenTTL <= 0 {
@@ -3394,6 +3459,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret, req.ClientAssertion, req.ClientAssertionType); err != nil {
 			return nil, err
 		}
+		trace.setClient(oauthClient)
 	} else if err == nil {
 		// CIMD client, re-resolved from its metadata document (served from
 		// cache in steady state). CIMD clients are public PKCE clients —
@@ -3408,6 +3474,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 			return nil, oauthBadRequest(oautherror.UnauthorizedClient,
 				"client metadata document no longer permits the refresh_token grant")
 		}
+		trace.setClient(oauthClient)
 	} else if viaCIMD {
 		// Resolution failure fails closed WITHOUT consuming the token (we're
 		// before rotation).
@@ -3511,6 +3578,10 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 			}
 			identityPolicyID = policy.ID
 		}
+
+		trace.setTenant(peeked.AccountID, peeked.ProjectID)
+		trace.setIdentity(identity)
+		trace.ask(parseScopeString(peeked.Scopes), false)
 
 		// The person's current ceiling, on the peek like every other gate, so
 		// a demoted user's refresh is refused without burning the token and
@@ -3639,6 +3710,10 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	if err != nil {
 		return nil, err
 	}
+
+	// The claimed row is authoritative, as for the binding above; it carries
+	// the scopes the peek did.
+	trace.ask(parseScopeString(oldToken.Scopes), false)
 
 	// Inherit scopes from the original refresh token. Without this the
 	// refreshed access token would be issued with no scopes (or default
