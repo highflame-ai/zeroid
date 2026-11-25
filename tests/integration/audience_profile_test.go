@@ -90,13 +90,13 @@ func scopesOf(t *testing.T, claims map[string]any) []string {
 func TestExternalPrincipalExchange_AudienceProfile(t *testing.T) {
 	baseExchange := func(userID string) map[string]any {
 		return map[string]any{
-			"grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-			// Not verified on the external-principal path — trust comes from the
-			// TrustedServiceValidator, not the subject_token signature.
-			"subject_token": "external-principal-assertion",
-			"account_id":    testAccountID,
-			"project_id":    testProjectID,
-			"user_id":       userID,
+			// The deployer's session grant reaches the external-principal
+			// exchange with no subject_token: trust comes from the
+			// TrustedServiceValidator alone.
+			"grant_type": testUserSessionGrant,
+			"account_id": testAccountID,
+			"project_id": testProjectID,
+			"user_id":    userID,
 		}
 	}
 	trusted := map[string]string{testTrustedServiceHeader: "trusted-service"}

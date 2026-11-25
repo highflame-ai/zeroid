@@ -321,13 +321,13 @@ func TestRevocationNotifier_AbsenceIsNoOp(t *testing.T) {
 func TestExternalPrincipalExchange_RoleClaimGating(t *testing.T) {
 	baseExchange := func() map[string]any {
 		return map[string]any{
-			"grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-			// Not verified on the external-principal path — trust comes from the
-			// TrustedServiceValidator, not the subject_token signature.
-			"subject_token": "external-principal-assertion",
-			"account_id":    testAccountID,
-			"project_id":    testProjectID,
-			"user_id":       "ext-user-001",
+			// The deployer's session grant reaches the external-principal
+			// exchange with no subject_token: trust comes from the
+			// TrustedServiceValidator alone.
+			"grant_type": testUserSessionGrant,
+			"account_id": testAccountID,
+			"project_id": testProjectID,
+			"user_id":    "ext-user-001",
 		}
 	}
 

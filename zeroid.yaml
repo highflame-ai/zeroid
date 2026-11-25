@@ -116,6 +116,44 @@ token:
   # Env: ZEROID_REFRESH_REUSE_GRACE_SECONDS
   # refresh_reuse_grace_seconds: 10
 
+  # allow_unverified_external_principal_subject: the external-principal
+  # exchange (token-exchange with no actor_token, gated by the deployer's
+  # TrustedServiceValidator) verifies a presented subject_token: it must be an
+  # active token this server issued, for the account_id/project_id and the
+  # person (user_id) the request names, or the exchange fails with
+  # invalid_grant. A request with no subject_token is unaffected. Set true only
+  # while a trusted service still presents tokens from another issuer there;
+  # move it to the ID-token exchange instead. Default false.
+  # Env: ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT
+  # allow_unverified_external_principal_subject: false
+
+# reserved_client_ids: OAuth client ids only the operator may register, via
+# Server.EnsureClient. POST /oauth/clients, dynamic registration and
+# trusted-issuer bindings refuse them for every caller. Use it for the client
+# ids your own services authenticate as, which resource servers recognise by
+# name. Matching ignores case, surrounding space, invisible characters and
+# Unicode compatibility forms (NFKC). Empty (default) reserves nothing.
+# reserved_client_ids:
+#   names: ["billing-service"]
+#   prefixes: ["svc-"]
+
+# service_tokens: the grants your own services use to call each other on a
+# tenant's behalf (on-behalf exchange, asserted-tenant grant, session broker).
+# Off unless account_id and project_id name the service tenant, which holds
+# your services' identities (Server.EnsureServiceIdentity) and nothing else.
+# Only a client whose id is reserved above, that authenticates with
+# private_key_jwt, was seeded by Server.EnsureClient and is linked to a
+# service identity there may use them. Lists are exact client ids; a client
+# id used as a served_resources key must not contain ".". Every token is
+# bound to one resource and lives at most 5 minutes.
+# service_tokens:
+#   account_id: "platform"
+#   project_id: "services"
+#   asserted_tenant_clients: ["svc-jobs"]      # may name a tenant (audited)
+#   session_broker_clients: ["svc-sessions"]   # may start a person's session
+#   served_resources:                          # may exchange a subject bound to these
+#     svc-gateway: ["https://gateway.example.com/mcp/"]
+
 wimse_domain: "highflame.ai"
 
 # Admin routes (served at the router root; see server.admin_path_prefix) have no built-in auth.
@@ -186,6 +224,16 @@ backchannel:
   # Go duration; default 720h (30 days).
   # Env: ZEROID_BACKCHANNEL_RESOLVED_RETENTION
   resolved_retention: 720h
+
+  # Let a PUBLIC client start a CIBA request on /oauth2/bc-authorize without
+  # authenticating. Default false: a public client's request is accepted only
+  # from a caller the embedding application's TrustedServiceValidator accepts
+  # (Server.SetTrustedServiceValidator), and is otherwise refused with
+  # invalid_client. Confidential clients authenticate with their secret either
+  # way. Migration aid only — turn it off once callers authenticate. The
+  # client's registered scopes bound every request regardless.
+  # Env: ZEROID_BACKCHANNEL_ALLOW_UNAUTHENTICATED_PUBLIC_CLIENTS
+  allow_unauthenticated_public_clients: false
 
 # OAuth CLIENT authentication — RFC 7523 §2.2 private_key_jwt, where a client
 # proves its identity with a JWT signed by a key it published rather than with a

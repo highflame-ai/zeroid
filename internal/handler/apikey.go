@@ -39,6 +39,17 @@ type APIKeyIDInput struct {
 	ID string `path:"id" doc:"API key UUID"`
 }
 
+// Resolve refuses a created_by that is present but empty: as a filter it
+// would match nothing, and silently dropping it would list every key to a
+// caller that meant to narrow the list.
+func (i *APIKeyListInput) Resolve(ctx huma.Context) []error {
+	u := ctx.URL()
+	if v, present := u.Query()["created_by"]; present && (len(v) == 0 || v[0] == "") {
+		return []error{&huma.ErrorDetail{Location: "query.created_by", Message: "created_by must not be empty", Value: ""}}
+	}
+	return nil
+}
+
 type APIKeyOutput struct {
 	Body *domain.APIKey
 }
@@ -47,6 +58,8 @@ type APIKeyListInput struct {
 	Product       string `query:"product" doc:"Filter by product namespace"`
 	ApplicationID string `query:"application_id" doc:"Filter by owning identity ID (any identity type)"`
 	IdentityID    string `query:"identity_id" doc:"Filter by owning identity ID. Alias of application_id"`
+	IdentityType  string `query:"identity_type" doc:"Filter by the type of the key's identity: agent, application, mcp_server or service. Shared product keys belong to the product's service identity"`
+	CreatedBy     string `query:"created_by" doc:"Filter by the user a key is attributed to: its creator, or for a rotated identity key the identity's owner. Must not be empty when given"`
 	State         string `query:"state" enum:"active,revoked,expired" doc:"Filter by key state (active, revoked, expired)"`
 	Label         string `query:"label" doc:"Filter by identity label (key:value, e.g. env:production)"`
 	Page          int    `query:"page" default:"1" doc:"Page number"`
@@ -138,6 +151,12 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		if herr := approvalChannelWriteError(err); herr != nil {
 			return nil, herr
 		}
+		if errors.Is(err, service.ErrReservedScopeWriteNotTrusted) {
+			return nil, huma.Error403Forbidden(err.Error())
+		}
+		if errors.Is(err, service.ErrScopeHasWhitespace) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		// Neither identity_id nor product supplied — the key has no identity to
 		// link. A caller-side omission, so return 400 naming both fields
 		// instead of a 500 from the failed UUID cast at insert time.
@@ -197,7 +216,20 @@ func (a *API) listAPIKeysOp(ctx context.Context, input *APIKeyListInput) (*APIKe
 		}
 	}
 
-	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, ownerID, input.Product, input.State, input.Label, input.Page, input.Limit)
+	identityType := domain.IdentityType(input.IdentityType)
+	if identityType != "" && !identityType.Valid() {
+		return nil, huma.Error400BadRequest("identity_type must be agent, application, mcp_server or service")
+	}
+
+	page, limit := service.KeyListPage(input.Page, input.Limit)
+	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, domain.APIKeyListFilter{
+		IdentityID:   ownerID,
+		IdentityType: identityType,
+		CreatedBy:    input.CreatedBy,
+		Product:      input.Product,
+		State:        input.State,
+		Label:        input.Label,
+	}, page, limit)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list API keys")
 		return nil, huma.Error500InternalServerError("failed to list API keys")
@@ -210,8 +242,8 @@ func (a *API) listAPIKeysOp(ctx context.Context, input *APIKeyListInput) (*APIKe
 	out := &APIKeyListOutput{}
 	out.Body.Keys = keys
 	out.Body.Total = total
-	out.Body.Page = input.Page
-	out.Body.Limit = input.Limit
+	out.Body.Page = page
+	out.Body.Limit = limit
 	return out, nil
 }
 

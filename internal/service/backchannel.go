@@ -154,6 +154,14 @@ type BackchannelServiceConfig struct {
 	// "off" (or empty) skips them, "shadow" evaluates and records would-deny
 	// but allows, "on" refuses ineligible approvers with 403 access_denied.
 	EnforceHints string
+
+	// AllowUnauthenticatedPublicClients lets a public client start a CIBA
+	// request without authenticating and without the deployer's
+	// TrustedServiceValidator accepting the caller. Default false: such a
+	// request is refused with invalid_client. A migration aid only — see
+	// requireAuthenticatedInitiator. The client's registered scopes bound the
+	// request either way.
+	AllowUnauthenticatedPublicClients bool
 }
 
 // DefaultBackchannelConfig returns sensible defaults for production deployments.
@@ -309,9 +317,9 @@ type CreateAuthRequestInput struct {
 	// the deployer's notifier (SMS/push prompts to a real end user), so an
 	// unauthenticated caller must not be able to spam approval prompts at
 	// arbitrary users using a confidential client's identity. Public clients
-	// (CIBA Core §7.1 permits them) carry no secret and may remain
-	// unauthenticated here; the trust anchor for token issuance is still the
-	// user's approval, not the client credential. Empty for public clients.
+	// carry no secret; their requests are accepted only from a caller the
+	// deployer's TrustedServiceValidator accepts (see
+	// requireAuthenticatedInitiator). Empty for public clients.
 	ClientSecret string
 	AccountID    string
 	ProjectID    string
@@ -430,14 +438,13 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		return nil, oauthBadRequest(oautherror.InvalidClient, fmt.Sprintf("unknown client %s", in.ClientID))
 	}
 
-	// Authenticate confidential clients. CIBA Core §7.1 permits public clients
-	// to initiate the flow unauthenticated — the trust anchor for token
-	// issuance is the user's approval, not the client credential — but a
-	// CONFIDENTIAL client registered a secret precisely so it can be
-	// authenticated. bc-authorize fires the deployer's notifier (real SMS/push
-	// approval prompts to an end user), so allowing an unauthenticated party to
-	// initiate against a confidential client lets them spam prompts at
-	// arbitrary users under that client's identity. Require + verify the
+	// Authenticate confidential clients. A CONFIDENTIAL client registered a
+	// secret precisely so it can be authenticated (public clients are handled
+	// by requireAuthenticatedInitiator below). bc-authorize fires the
+	// deployer's notifier (real SMS/push approval prompts to an end user), so
+	// allowing an unauthenticated party to initiate against a confidential
+	// client lets them spam prompts at arbitrary users under that client's
+	// identity. Require + verify the
 	// client_secret when the client must authenticate — a question derived from
 	// the REGISTERED method, with the old client_type/stored-hash test surviving
 	// inside the predicate as the fallback for rows that predate it.
@@ -463,16 +470,31 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		}
 	}
 
-	// requesting_token and the group_hint-only refusal are evaluated only
-	// after the client has been resolved and authenticated, so the response
-	// reveals nothing about a token to an unauthenticated caller. Only a
-	// client that authenticated above, or a caller the deployer's
-	// TrustedServiceValidator accepts, may send requesting_token.
-	var requesting *RequestingToken
-	if in.RequestingToken != "" {
-		if !s.callerAuthenticated(ctx, client) {
+	// Only a client that authenticated above, or a caller the deployer's
+	// TrustedServiceValidator accepts, may send requesting_token or start a
+	// request at all (requireAuthenticatedInitiator). Both refusals come
+	// before anything else is evaluated, so the response reveals nothing
+	// about a token, a scope or a user to an unauthenticated caller.
+	if !s.callerAuthenticated(ctx, client) {
+		if in.RequestingToken != "" {
 			return nil, oauthBadRequest(oautherror.InvalidRequest, "requesting_token requires an authenticated client")
 		}
+		if err := s.requireAuthenticatedInitiator(client); err != nil {
+			return nil, err
+		}
+	}
+
+	// The client's registration bounds what any of its requests may ask the
+	// human to grant (requireCIBAScopeWithinClient). Issuance re-checks it, so
+	// a registration narrowed while the request was pending is honoured too.
+	if err := requireCIBAScopeWithinClient(client, in.Scope); err != nil {
+		return nil, err
+	}
+
+	// requesting_token and the group_hint-only refusal are evaluated only
+	// after the caller has been authenticated above.
+	var requesting *RequestingToken
+	if in.RequestingToken != "" {
 		rt, err := s.resolveRequestingToken(ctx, in)
 		if err != nil {
 			return nil, err
@@ -1077,6 +1099,17 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		anchor := *bound
 		anchor.Name = ""
 		identity = &anchor
+	}
+	// The scope the human approved was checked against the client's
+	// registration at bc-authorize; check it again against the registration
+	// as it stands now, before the burn, so narrowing a client's scopes takes
+	// effect on requests already pending. Redemption carries no scope of its
+	// own: the token is minted from row.Scope only, so this is the whole of
+	// what a redeem can be granted.
+	if cerr == nil {
+		if err := requireCIBAScopeWithinClient(client, row.Scope); err != nil {
+			return nil, err
+		}
 	}
 
 	customClaims := map[string]any{

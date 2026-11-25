@@ -60,6 +60,16 @@ type GrantRequest struct {
 	// otherwise. The principal presents the Audience name as `client_id` when
 	// rotating; every rotation re-stamps the same `aud`/scope profile.
 	IssueRefreshToken bool
+	// ClientAssertion and ClientAssertionType are the request's RFC 7523 §2.2
+	// private_key_jwt client authentication, unverified. ClientID is the
+	// client the request names. Server.ExternalPrincipalExchange verifies
+	// them when ClientID is a session broker (ServiceTokensConfig); a handler
+	// must not treat them as authenticated on its own.
+	ClientAssertion     string
+	ClientAssertionType string
+	// Resource is the validated RFC 8707 resource list, on a grant registered
+	// with Server.RegisterGrantAcceptingResource. Always empty otherwise.
+	Resource []string
 }
 
 // Principal is the resolved caller at /oauth2/authorize — the tenant +
@@ -242,6 +252,14 @@ type OAuthClientConfig struct {
 	// supports: "poll" (default), "ping", or "push". ping/push require a
 	// non-empty ClientNotificationEndpoint.
 	BackchannelTokenDeliveryMode string
+	// IdentityID links the client to an identity (its UUID), as the admin
+	// API's identity_id does: client_credentials then mints for that identity
+	// and in its tenant only. Set it for a service's own client (see
+	// Server.EnsureServiceIdentity). EnsureClient then adopts an existing row
+	// only when EnsureClient registered it and it is linked to this identity,
+	// and refuses any other with ErrClientNotOwned. Empty keeps an unlinked
+	// client, as before.
+	IdentityID string
 }
 
 // TrustedServiceValidator checks whether the current request comes from a trusted
@@ -472,4 +490,26 @@ func WithTrustedApprovalChannelWrite(ctx context.Context) context.Context {
 // WithTrustedApprovalChannelWrite.
 func TrustedApprovalChannelWrite(ctx context.Context) bool {
 	return service.TrustedApprovalChannelWrite(ctx)
+}
+
+// ReservedScopeGrant and ReservedScopeAuthorizer: see Server.SetReservedScopes.
+type (
+	ReservedScopeGrant      = service.ReservedScopeGrant
+	ReservedScopeAuthorizer = service.ReservedScopeAuthorizer
+)
+
+// ErrReservedScopeDenied is what a ReservedScopeAuthorizer wraps to refuse.
+var ErrReservedScopeDenied = service.ErrReservedScopeDenied
+
+// WithReservedScopeWrite returns ctx marked as the deployer's trusted path,
+// which may write reserved scopes (Server.SetReservedScopes) onto an API key.
+// Without it, a create-key request listing one is refused with 403. Set it in
+// the AdminAuth layer for the most trusted caller class only.
+func WithReservedScopeWrite(ctx context.Context) context.Context {
+	return service.WithReservedScopeWrite(ctx)
+}
+
+// ReservedScopeWrite reports whether ctx carries WithReservedScopeWrite.
+func ReservedScopeWrite(ctx context.Context) bool {
+	return service.ReservedScopeWrite(ctx)
 }

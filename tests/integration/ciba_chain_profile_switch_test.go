@@ -35,7 +35,7 @@ func (tn hrdTenant) stepUp(t *testing.T, requestingToken, scope string) map[stri
 		"client_id": c.ID, "client_secret": c.Secret,
 		"account_id": tn.account, "project_id": tn.project,
 		"login_hint": "user-a", "requesting_token": requestingToken, "scope": scope,
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	id, _ := decode(t, resp)["auth_req_id"].(string)
 	require.NotEmpty(t, id)

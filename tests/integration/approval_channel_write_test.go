@@ -20,6 +20,12 @@ func channelWriteHeaders() map[string]string {
 	return h
 }
 
+// operatorChannelWriteHeaders is the trusted approval-channel context with no
+// tenant, the operator's context for managing unlinked clients.
+func operatorChannelWriteHeaders() map[string]string {
+	return map[string]string{testApprovalChannelWriteHeader: "1"}
+}
+
 func requireForbidden(t *testing.T, resp *http.Response, what string) {
 	t.Helper()
 	defer func() { _ = resp.Body.Close() }()

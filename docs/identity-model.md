@@ -215,7 +215,34 @@ in the right tenant. With issuer rows the agent and its tenant come from a bindi
 A deployer-controlled service authenticates the upstream user (perhaps
 because it already does OIDC for many backend services), then calls ZeroID
 with pre-validated user claims. ZeroID validates the **caller** via
-`TrustedServiceValidator` but does **not** re-verify the upstream JWT.
+`TrustedServiceValidator`. It does not call the upstream IdP.
+
+What ZeroID checks of the request itself:
+
+- `user_id` must name a person. A SPIFFE/WIMSE URI is refused with
+  `invalid_request`: the issued token's `sub` is `user_id` and its principal
+  is a person, so a workload URI there would present a workload as someone's
+  own session.
+- A presented `subject_token` must be a token **this server issued**: valid
+  signature, not expired, not revoked, for the request's `account_id` and
+  `project_id`, and naming `user_id` as its person (`sub` on an rfc8693
+  person token; under the legacy profile `user_id`, else a delegated
+  token's `act.sub`, else `sub`; a workload URI never qualifies). Anything
+  else is `invalid_grant`. A service relaying a token from another issuer
+  should use [direct federation](#direct-oidc-idp-federation-preferred) instead, or, while
+  it moves, set `token.allow_unverified_external_principal_subject: true`
+  (env `ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT`), which restores
+  the old behaviour of accepting it unverified.
+- A deployer's own grant that calls `Server.ExternalPrincipalExchange`
+  presents no `subject_token`, so the trusted caller alone vouches for the
+  person, as before.
+- With [internal service tokens](spec/zeroid-oauth-extensions.md#58-internal-service-tokens)
+  configured, a client on `service_tokens.session_broker_clients` may call
+  the exchange by authenticating as itself with `private_key_jwt` instead of
+  passing the `TrustedServiceValidator`. Its token names the client in
+  `client_id` and `trusted_by`, and only such a token counts as a person's
+  own session when a service exchanges it on the person's behalf. The
+  service tenant can never be named.
 
 ### When to use it
 
@@ -231,7 +258,7 @@ with pre-validated user claims. ZeroID validates the **caller** via
 ```
 POST /oauth2/token
   grant_type    = urn:ietf:params:oauth:grant-type:token-exchange
-  subject_token = <pre-validated jwt>      # NOT re-verified by ZeroID
+  subject_token = <a token this server issued for user_id>   # verified
   account_id    = <tenant>
   project_id    = <tenant>
   user_id       = <external user ID>

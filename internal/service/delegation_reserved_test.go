@@ -28,3 +28,12 @@ func TestReservedClaims_PrincipalTypeAndMissionID(t *testing.T) {
 		}
 	}
 }
+
+// TestAPIKeyIDIsReserved: an embedding service audits changes by api_key_id
+// (ADR 0051 D2), so a caller who could set it through additional_claims would
+// attribute its changes to another key.
+func TestAPIKeyIDIsReserved(t *testing.T) {
+	if !reservedClaims["api_key_id"] {
+		t.Fatal("api_key_id must be in reservedClaims: additional_claims would otherwise be able to forge it")
+	}
+}

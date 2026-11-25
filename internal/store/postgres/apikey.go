@@ -74,51 +74,58 @@ func (r *APIKeyRepository) GetByID(ctx context.Context, id, accountID, projectID
 }
 
 // ListByAccountProject returns paginated API keys for an account/project,
-// optionally filtered by application ID, product, or identity label.
-// The label parameter accepts "key:value" format (e.g. "env:production")
-// and filters by joining on the identities table using JSONB containment.
-func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, projectID, applicationID, product, state, label string, limit, offset int) ([]*domain.APIKey, int, error) {
+// newest first, narrowed by f. The label filter ("key:value", e.g.
+// "env:production") and the identity_type filter join the key's identity.
+func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, projectID string, f domain.APIKeyListFilter, limit, offset int) ([]*domain.APIKey, int, error) {
 	var keys []*domain.APIKey
 
 	q := r.db.NewSelect().
 		Model(&keys).
 		Where("sk.account_id = ?", accountID).
-		OrderExpr("sk.created_at DESC").
+		// id breaks created_at ties, so pages never repeat or skip a key.
+		OrderExpr("sk.created_at DESC, sk.id DESC").
 		Limit(limit).
 		Offset(offset)
 
 	if projectID != "" {
 		q = q.Where("sk.project_id = ?", projectID)
 	}
-	if applicationID != "" {
-		q = q.Where("sk.identity_id = ?", applicationID)
+	if f.IdentityID != "" {
+		q = q.Where("sk.identity_id = ?", f.IdentityID)
 	}
-	if product != "" {
-		q = q.Where("sk.product = ?", product)
+	if f.CreatedBy != "" {
+		q = q.Where("sk.created_by = ?", f.CreatedBy)
+	}
+	if f.Product != "" {
+		q = q.Where("sk.product = ?", f.Product)
 	}
 	// Expiry is derived from expires_at, not stored in sk.state (rows only
 	// ever hold 'active' or 'revoked'), so the filter translates states:
 	// active = active row that has not aged out; expired = active row past
 	// its expires_at; revoked = raw state match.
-	switch state {
+	switch f.State {
 	case "":
 	case domain.APIKeyStateActive:
-		q = q.Where("sk.state = ?", state).
+		q = q.Where("sk.state = ?", f.State).
 			Where("(sk.expires_at IS NULL OR sk.expires_at > now())")
 	case domain.APIKeyStateExpired:
 		q = q.Where("sk.state = ?", domain.APIKeyStateActive).
 			Where("sk.expires_at <= now()")
 	default:
-		q = q.Where("sk.state = ?", state)
+		q = q.Where("sk.state = ?", f.State)
 	}
-	if label != "" {
-		parts := strings.SplitN(label, ":", 2)
-		if len(parts) == 2 && parts[0] != "" {
-			labelJSON, _ := json.Marshal(map[string]string{parts[0]: parts[1]})
-
-			q = q.Join("JOIN identities AS i ON i.id = sk.identity_id").
-				Where("i.labels @> ?::jsonb", string(labelJSON))
-		}
+	// Both identity filters read the key's identity; join it once.
+	labelParts := strings.SplitN(f.Label, ":", 2)
+	byLabel := len(labelParts) == 2 && labelParts[0] != ""
+	if byLabel || f.IdentityType != "" {
+		q = q.Join("JOIN identities AS i ON i.id = sk.identity_id")
+	}
+	if byLabel {
+		labelJSON, _ := json.Marshal(map[string]string{labelParts[0]: labelParts[1]})
+		q = q.Where("i.labels @> ?::jsonb", string(labelJSON))
+	}
+	if f.IdentityType != "" {
+		q = q.Where("i.identity_type = ?", f.IdentityType)
 	}
 
 	count, err := q.ScanAndCount(ctx)

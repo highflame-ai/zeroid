@@ -203,11 +203,12 @@ zeroid token revoke eyJhbGc...
 
 ### `zeroid ciba init`
 
-Initiate an OpenID CIBA backchannel authentication request. The CLI sends tenant context in the request body because `/bc-authorize` is a public OAuth endpoint.
+Initiate an OpenID CIBA backchannel authentication request. The CLI sends tenant context in the request body because `/bc-authorize` is a public OAuth endpoint. The client must authenticate: pass a confidential client's secret with `--client-secret` (or `ZID_CLIENT_SECRET`). A public client's request is accepted only from a caller the deployment trusts, and `--scope` must be within the client's registered scopes.
 
 ```bash
 zeroid ciba init \
   --client-id my-ciba-client \
+  --client-secret "$ZID_CLIENT_SECRET" \
   --login-hint user@example.com \
   --scope "openid profile" \
   --binding-message "Approve login on Production?" \
@@ -226,6 +227,7 @@ zeroid ciba init \
 | Flag | Description | Default |
 |---|---|---|
 | `--client-id <id>` | OAuth client initiating the request | required |
+| `--client-secret <secret>` | Confidential client's secret (or `ZID_CLIENT_SECRET`) | — |
 | `--login-hint <hint>` | User identifier for the out-of-band prompt | required |
 | `--scope <scopes>` | Space-separated scopes to request | — |
 | `--binding-message <text>` | Context shown to the approving user | — |

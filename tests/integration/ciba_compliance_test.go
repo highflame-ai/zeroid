@@ -45,7 +45,7 @@ func TestCIBACore1_0_S7_1_ClientIdRequired(t *testing.T) {
 		"project_id": testProjectID,
 		"login_hint": "alice@example.com",
 		"scope":      "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	// Huma's required-field validator may reject before our handler; both
 	// 400/422 are conformant signals (the spec says reject, doesn't pin status).
 	require.NotEqual(t, http.StatusOK, resp.StatusCode,
@@ -65,7 +65,7 @@ func TestCIBACore1_0_S7_1_AtLeastOneHintRequired(t *testing.T) {
 		"project_id": testProjectID,
 		// neither login_hint nor group_hint
 		"scope": "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.NotEqual(t, http.StatusOK, resp.StatusCode,
 		"bc-authorize with no hints (login_hint AND group_hint omitted) MUST be rejected")
 }
@@ -88,7 +88,7 @@ func TestCIBACore1_0_Ext_GroupHintAcceptedWithoutLoginHint(t *testing.T) {
 		"group_hint": "highflame:role:finance_lead",
 		// login_hint deliberately omitted — group_hint MUST satisfy §7.1
 		"scope": "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode,
 		"bc-authorize with group_hint and no login_hint MUST be accepted")
 }
@@ -110,7 +110,7 @@ func TestCIBACore1_0_Ext_GroupHintOversized(t *testing.T) {
 		"project_id": testProjectID,
 		"group_hint": oversized,
 		"scope":      "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"group_hint > 255 characters MUST be rejected with 400")
 
@@ -141,7 +141,7 @@ func TestCIBACore1_0_Ext_GroupHintMultibyteAcceptedUnderRuneCap(t *testing.T) {
 		"project_id": testProjectID,
 		"group_hint": multibyte,
 		"scope":      "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode,
 		"100-rune (300-byte) group_hint MUST be accepted; a byte-length check would over-reject")
 }
@@ -160,7 +160,7 @@ func TestCIBACore1_0_S7_2_ResponseContainsRequiredFields(t *testing.T) {
 		"login_hint":      "alice@example.com",
 		"scope":           "openid",
 		"binding_message": "compliance smoke test",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body := decode(t, resp)
 	assert.NotEmpty(t, body["auth_req_id"], "auth_req_id REQUIRED in success response")
@@ -183,7 +183,7 @@ func TestCIBACore1_0_S11_AuthorizationPendingWhilePending(t *testing.T) {
 		"project_id": testProjectID,
 		"login_hint": "alice@example.com",
 		"scope":      "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	authReqID, _ := decode(t, resp)["auth_req_id"].(string)
 	require.NotEmpty(t, authReqID)
@@ -278,7 +278,7 @@ func TestCIBACore1_0_Ext_GroupHintReachesNotifier(t *testing.T) {
 		"project_id": testProjectID,
 		"group_hint": "highflame:role:finance_lead",
 		"scope":      "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	got := notifier.last()

@@ -53,7 +53,7 @@ func TestCIBA_PushMode_HappyPath(t *testing.T) {
 		"login_hint":                "dave@example.com",
 		"scope":                     "openid",
 		"client_notification_token": notificationToken,
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, bcResp.StatusCode)
 	authReqID, _ := decode(t, bcResp)["auth_req_id"].(string)
 	require.NotEmpty(t, authReqID)
@@ -122,7 +122,7 @@ func TestCIBA_PushMode_Denial(t *testing.T) {
 		"project_id":                testProjectID,
 		"login_hint":                "eve@example.com",
 		"client_notification_token": "deny-bearer",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, bcResp.StatusCode)
 	authReqID, _ := decode(t, bcResp)["auth_req_id"].(string)
 

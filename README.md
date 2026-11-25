@@ -713,6 +713,7 @@ def handle_query_database(request_headers: dict, query: str) -> dict:
 #    in the approval prompt.
 curl -s -X POST https://auth.highflame.ai/oauth2/bc-authorize \
   -d 'client_id=alice-agent' \
+  -d 'client_secret=<client_secret>' \
   -d 'login_hint=alice@example.com' \
   -d 'scope=gmail:read' \
   -d 'binding_message=alice-agent wants to read your unread Gmail'
@@ -728,7 +729,8 @@ curl -s -X POST https://auth.highflame.ai/oauth2/bc-authorize \
 curl -s -X POST https://auth.highflame.ai/oauth2/token \
   -d 'grant_type=urn:openid:params:grant-type:ciba' \
   -d 'auth_req_id=<auth_req_id>' \
-  -d 'client_id=alice-agent'
+  -d 'client_id=alice-agent' \
+  -d 'client_secret=<client_secret>'
 # After Alice approves:
 # {
 #   "access_token": "...",       ← sub = alice@example.com, backchannel_client_id = alice-agent
@@ -736,6 +738,8 @@ curl -s -X POST https://auth.highflame.ai/oauth2/token \
 #   "expires_in": 900
 # }
 ```
+
+**Who may start a request, and for what.** The client authenticates at `/oauth2/bc-authorize` (CIBA Core §7.1): a confidential client with its `client_secret`. A public client has nothing to authenticate with, so its requests are accepted only from a caller your `TrustedServiceValidator` accepts — typically the service of yours that fronts it — and are otherwise refused with `invalid_client` (`backchannel.allow_unauthenticated_public_clients` restores the old behaviour while callers migrate; it defaults to off). The requested `scope` must be within the client's registered `scopes`; anything else is refused with `invalid_scope` before a prompt is sent, and checked again when the token is issued. `openid` is always allowed. A public client registered with no scopes may request only `openid`; a confidential client registered with none has no client-level ceiling, as on the other grants. Redemption carries no scope: the token holds what the user was asked to approve, never more.
 
 **Requests made with a `requesting_token`.** A bc-authorize request may carry the access token of the request it is for (`requesting_token`, accepted from an authenticated client or a caller your `TrustedServiceValidator` accepts). The approved token then keeps that token's `sub`, `act`, identity claims and DPoP binding (`cnf.jkt`) and never outlives it. It also keeps that token's scopes: `scope=openid` (the CIBA protocol scope) or no scope means "no narrowing", other named scopes narrow the result to those, and a named scope the requesting token does not hold is refused with `invalid_scope`, because a step-up never adds a scope to its chain. The requesting identity's `allowed_scopes` and credential policy still bound the result; for a chain acting for a person the policy's `user_grant_scopes` applies in place of its `allowed_scopes`. A requesting token issued to no identity is bounded instead by the polling client's bound identity, as a root grant is, and `ciba:approve` is never issued by an approval. Each of these refusals leaves the approval redeemable. Redeeming such a request requires the same token on every poll, as the `requesting_token` form parameter (`-d 'requesting_token=<token>'`); when that token is DPoP-bound, the poll must also carry a `DPoP` proof for its key. A poll without them gets `access_denied` and leaves the approval redeemable. Requests made without `requesting_token` are polled as shown above.
 
@@ -990,8 +994,11 @@ only when `Server.EnsureClient` is called with a marked context.
 | GET | `/identities` | List identities |
 | GET | `/identities/{id}/oauth-clients` | List the OAuth2 clients linked to an identity |
 | DELETE | `/identities/{id}/oauth-clients/{client_uuid}` | Delete an OAuth2 client linked to an identity (frees its `client_id`) |
-| POST | `/oauth/clients` | Register OAuth2 client |
+| POST | `/oauth/clients` | Register OAuth2 client (a [reserved](#reserved-client-ids) `client_id` is refused) |
+| GET | `/oauth/clients`, `/oauth/clients/{id}` | List or get OAuth2 clients. With a tenant in context, only clients linked to an identity in that tenant |
+| POST, DELETE | `/oauth/clients/{id}/rotate-secret`, `/oauth/clients/{id}` | Rotate a secret or delete a client, under the same visibility rule: an unlinked client is reached only with no tenant in context |
 | POST | `/api-keys` | Create API key |
+| GET | `/api-keys` | List API keys, newest first. Filters: `identity_id` (alias `application_id`; both must match when both are sent), `identity_type` (`agent`, `application`, `mcp_server` or `service`; shared product keys belong to the product's `service` identity), `created_by` (the user a key is attributed to: its creator, or for a rotated identity key the identity's owner; must not be empty), `product`, `state`, `label`. `page` is at least 1 and `limit` 1-100 (20 when out of range); the response reports the values used |
 | POST | `/credential-policies` | Create credential policy |
 | GET | `/credential-policies/{id}` | Get credential policy |
 | PATCH | `/credential-policies/{id}` | Update credential policy |
@@ -1017,6 +1024,12 @@ only when `Server.EnsureClient` is called with a marked context.
 | GET, PATCH, DELETE | `/external-issuers/{id}/bindings/{binding_id}` | Read, enable/disable or remove a binding |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
+
+<a id="reserved-client-ids"></a>
+**Reserved client ids.** `reserved_client_ids` (names and prefixes) keeps client ids your own services authenticate as for the operator: only `Server.EnsureClient` registers them, and `POST /oauth/clients`, dynamic registration and trusted-issuer bindings refuse them. Matching ignores case, surrounding space, invisible format characters and Unicode compatibility forms (NFKC); letters of another script that only look alike are distinct ids, since resource servers compare `client_id` byte for byte. On a token exchange, where `client_id` comes from the actor's `external_id`, a reserved id is written only when the reserved client is linked to that actor identity. `EnsureClient` updates only a row that is the seed's own (for a linked seed, one it registered itself and linked to the seed's `IdentityID`; for an unlinked seed, an unlinked, non-dynamic row alike in whether it authenticates, adopted with a logged warning if seeding did not register it) and otherwise returns `ErrClientNotOwned`. `Server.EnsureServiceIdentity` seeds the service identity a linked client authenticates as.
+
+<a id="internal-service-tokens"></a>
+**Internal service tokens.** Off by default. `service_tokens.account_id` / `project_id` name the service tenant that holds your own services' identities. A *service client* is a reserved, `private_key_jwt`, `EnsureClient`-seeded client linked to a service identity there. With the tenant set: `client_credentials` into it needs a service client and lives at most 5 minutes; the **on-behalf exchange** (token-exchange, no `actor_token`, `subject_token_type=access_token`, service client authentication, `grant_types` listing token-exchange) turns a caller's verified token into a 5-minute token for the caller's tenant, bound to one `resource`, with the service as `act` (`act.sub`, `act.client_id`), `subject_kind`, and `resolved_user_id`/`resolved_user_source`; `service_tokens.asserted_tenant_clients` enables the audited **asserted-tenant grant** (`urn:highflame:params:oauth:grant-type:asserted-tenant`, `tenant_source=asserted`); `service_tokens.session_broker_clients` lets a client call the external-principal exchange by authenticating as itself, and only such a client's person tokens count as a person's session on the on-behalf exchange; `service_tokens.served_resources` says which service may exchange a resource-bound subject. Register a session grant with `Server.RegisterGrantAcceptingResource` to let it take `resource`. Rules and claims: [extensions spec §5.8](docs/spec/zeroid-oauth-extensions.md#58-internal-service-tokens).
 
 `public_key_pem` on the agent and identity write paths must be an SPKI EC P-256 (ES256) key; anything else is a `400` naming the reason.
 The agent registry never returns the PEM: each agent carries `has_public_key` and, when a key is enrolled, `public_key_thumbprint` (its RFC 7638 JWK SHA-256 thumbprint, base64url).

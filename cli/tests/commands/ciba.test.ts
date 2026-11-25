@@ -67,8 +67,33 @@ describe("zeroid ciba init", () => {
     expect(captured["binding_message"]).toBe("Approve login?");
     expect(captured["requested_expiry"]).toBe(600);
     expect(captured["client_notification_token"]).toBe("opaque-token");
+    expect(captured).not.toHaveProperty("client_secret");
     expect(accountHeader).toBeNull();
     expect(stdout.join("\n")).toContain("ari_test_123");
+  });
+
+  it("sends client_secret for a confidential client", async () => {
+    let captured: Record<string, unknown> = {};
+    server.use(
+      http.post(`${BASE_URL}/oauth2/bc-authorize`, async ({ request }) => {
+        captured = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(INIT_RESPONSE);
+      }),
+    );
+
+    const { exitCode } = await runCLI([
+      "ciba",
+      "init",
+      "--client-id",
+      "my-ciba-client",
+      "--client-secret",
+      "s3cret",
+      "--login-hint",
+      "user@example.com",
+    ]);
+
+    expect(exitCode).toBeUndefined();
+    expect(captured["client_secret"]).toBe("s3cret");
   });
 
   it("outputs raw JSON with --json", async () => {
