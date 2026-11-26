@@ -1613,9 +1613,17 @@ func (s *Server) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrant
 // request whose outcome they would change is logged as
 // scope_rule_would_change and counted in
 // zeroid_scope_rule_would_change_total. Nothing is enforced: every token and
-// every response is exactly what ScopeRulesModeOff produces. The internal
-// service grants, which issue no scopes, are not evaluated, and reserved
-// scopes (SetReservedScopes) are left to their own rules. An empty or
+// every response is exactly what ScopeRulesModeOff produces. In
+// ScopeRulesModeEnforce the same evaluation decides the outcome: a request
+// that names no scope is issued only an API key's own scopes or an audience
+// profile's, and otherwise none; a scope no deployer-controlled ceiling lists,
+// or a request that would be narrowed, is refused whole; a delegation that
+// names no scope is issued none; and every scope refusal at the token endpoint
+// is answered invalid_scope. Any other request refused with the mode off
+// stays refused. Each request changed is recorded the same way, with
+// mode=enforce. Roll out off, then shadow, then enforce. In both modes the
+// internal service grants, which issue no scopes, are not evaluated, and
+// reserved scopes (SetReservedScopes) are left to their own rules. An empty or
 // unknown mode is rejected and the setting left unchanged. See
 // docs/scope-ceilings.md, "Stricter scope rules".
 //

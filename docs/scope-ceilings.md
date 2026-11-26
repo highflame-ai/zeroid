@@ -88,8 +88,8 @@ Rules:
   omitted request from a child that holds no scope.
 - No token ever carries a scope outside the identity's `allowed_scopes`.
 
-Stricter rules are planned for the default, the empty layer and narrowing. A
-deployment can count what they would change before any is enforced; see
+A deployment can make the default, the empty layer and narrowing stricter,
+counting what that would change before enforcing it; see
 [Stricter scope rules](#stricter-scope-rules).
 
 ## Where scopes are checked
@@ -223,30 +223,38 @@ enforcement would affect before turning it on.
 
 ## Stricter scope rules
 
-Four rules are planned that make issuance stricter: scopes someone chose,
-listed by a ceiling the deployer controls, issued whole or not at all, and
-refused with one error code. None is enforced yet. A deployment counts what
-they would change first, with `token.scope_rules` (env `ZEROID_SCOPE_RULES`),
-or at runtime with `Server.SetScopeRulesMode`:
+Four rules make issuance stricter: scopes someone chose, listed by a ceiling
+the deployer controls, issued whole or not at all, and refused with one error
+code. They are selected with `token.scope_rules` (env `ZEROID_SCOPE_RULES`), or
+at runtime with `Server.SetScopeRulesMode`:
 
 | Mode | Evaluated | Tokens and responses |
 |---|---|---|
 | `off` (default) | no rule; nothing is logged or counted | unchanged |
-| `shadow` | every grant, against each rule below | unchanged |
+| `shadow` | every grant, against each rule below; each change is recorded | unchanged |
+| `enforce` | the same evaluation, applied; each change is recorded | as the rules below say |
 
 An empty value means `off`. Any other value is refused, by config validation
 at startup and by `SetScopeRulesMode` (which also refuses an empty mode), so a
-typo never runs as `off` unnoticed. An enforcing mode is not available yet.
+typo never runs as `off` unnoticed. A request keeps the mode it started with.
+
+**Rollout.** Go from `off` to `shadow`, and read what is recorded: every
+record is a request that `enforce` would answer differently, with the outcome
+it would get. List the scopes that should keep working (on the identity's
+`allowed_scopes`, its credential policy, the API key, or a client created
+through the admin API), make clients name the scopes they need, and switch to
+`enforce` once shadow records only what should change. `enforce` can be
+switched back to `shadow` or `off` at runtime without a restart.
 
 **The rules.** Each rule is judged on its own against what today's rules did
 with the request.
 
-| Rule | Recorded as | Planned | Today |
+| Rule | Recorded as | In `enforce` | Today (`off` and `shadow`) |
 |---|---|---|---|
 | A, omitted request | `omitted_request` | A request that names no scope is issued only the scopes stored on the API key it exchanges (`api_key`) or an audience profile's scopes (the trusted external-principal exchange), and otherwise none. A request refused today stays refused. | An omitted request gets the client's registered scopes on `authorization_code` (for a client identified by a metadata document, the scopes the document publishes) and the first restricting ceiling on the self-mint grants. |
 | B, listing | `listing` | A scope is issued only when at least one ceiling the deployer controls lists it: the API key's scopes or the key's own credential policy, the identity's `allowed_scopes`, the governing credential policy's ceiling (`allowed_scopes`, or `user_grant_scopes` for a chain bounded by a person's grant), or the registered scopes of a client created through the admin API. A client's own metadata (a metadata document's `scope`, or a dynamically registered client's `scope`) is a request, never a listing. An empty ceiling neither lists nor excludes, except a child identity's empty `allowed_scopes`, which lists nothing and excludes everything; issuance applies that itself, so the rule never counts it as a change. | An empty ceiling places no restriction, so a scope nothing lists is granted. |
 | C, all or nothing | `all_or_nothing` | A request is issued every scope it names, or refused whole with `invalid_scope`. A delegation (RFC 8693) that names no scope is issued none. | A named scope is dropped silently where a layer narrows (delegation, the self-mint grants, an enforced person ceiling). A delegation that names no scope is refused. |
-| D, one code | `one_code` | Every scope refusal answers `invalid_scope`. | A scope refusal answers `invalid_scope`, `insufficient_scope` (outside the identity's `allowed_scopes`), `policy_violation` (outside a credential policy), `invalid_grant` (a person ceiling at the token endpoint) or `access_denied` (a CIBA policy refusal, or a person ceiling sent to a push client). |
+| D, one code | `one_code` | Every scope refusal at the token endpoint answers `invalid_scope`. | A scope refusal answers `invalid_scope`, `insufficient_scope` (outside the identity's `allowed_scopes`), `policy_violation` (outside a credential policy), `invalid_grant` (a person ceiling at the token endpoint) or `access_denied` (a CIBA policy refusal, or a person ceiling sent to a push client). |
 
 `openid` asks for authentication, not authority. It is never counted as a
 scope that was dropped, unlisted or issued by default.
@@ -285,6 +293,68 @@ reserved-scope rules refuse (the key does not list the scope or names no
 creator, the authorizer refuses or fails, or another grant asks for a
 reserved scope) records nothing.
 
+**Enforcement.** With `enforce`, the evaluation shadow mode records decides
+the outcome, so the two modes never disagree about a request: a request shadow
+records nothing for is answered exactly as with `off`, and every request
+`enforce` answers differently is recorded. The rules' changes combine as
+follows:
+
+- A request that names no scope loses the default it was given (rule A). It
+  keeps `openid`, the API key's own scopes (reserved scopes included) and an
+  audience profile's scopes, and still succeeds; with nothing left, its token
+  has no `scopes` claim. A refresh repeats its family's scopes.
+- A request today's rules refuse stays refused. Enforcement never turns a
+  refusal into a token without a `scopes` claim. The one exception is rule
+  C's: a delegation that names no scope is issued with no `scopes` claim.
+- Otherwise the request is refused whole when a scope it would be issued is
+  one no deployer-controlled ceiling lists (rule B), or when a scope it named
+  would be dropped (rule C). In a delegation the subject token's scopes are one
+  more ceiling. Nothing is narrowed silently, and no rule adds a scope.
+- Every scope refusal at the token endpoint answers `invalid_scope` (RFC 6749
+  §5.2), as does a refusal at `/oauth2/authorize` (RFC 6749 §4.1.2.1). The
+  `error_description` names the first offending scope, in the order the
+  request named them, and the ceiling that must list it, without quotes
+  (RFC 6749 §5.2 keeps `"` out of the description):
+
+  | Cause | `error_description` |
+  |---|---|
+  | A ceiling left the scope out (rule C, or a refusal a ceiling explains) | `scope tools:write is not granted: the identity's allowed_scopes must list it` |
+  | No ceiling lists it (rule B) | `scope tools:write is not granted: no scope ceiling an administrator controls lists it; list it in the API key's scopes or the identity's allowed_scopes` |
+  | No deployer-controlled ceiling applies (rule B) | `scope tools:write is not granted: no scope ceiling an administrator controls applies to this request, so none lists it` |
+
+  The ceilings a description names are the client's registered scopes (or
+  the client metadata document's scope), the identity's `allowed_scopes`, a
+  credential policy's `allowed_scopes` or `user_grant_scopes` (the
+  identity's, the tenant's default, the API key's, the actor's, a requesting
+  or bound identity's), the API key's scopes, the subject token's scopes, a
+  requesting token's scopes, the person's scope ceiling and the authenticated
+  principal's scopes. A scope refusal no recorded ceiling explains (a scope
+  never issued to an identity type, for one) keeps its own description, under
+  `invalid_scope`.
+- `insufficient_scope` stays where a resource server refuses a token for the
+  scope it lacks (RFC 6750 §3.1). Refusals that are not about scopes (grant
+  type, trust level, lifetime, an unusable identity or a stopped identity
+  tree, client authentication) keep their codes.
+
+Where the outcome is decided:
+
+| Where | What enforcement does |
+|---|---|
+| `/oauth2/authorize` | Rules A and C decide the code's scopes before the code is built: an omitted request's code carries no default, a narrowed request is refused with `invalid_scope`. Rule B is judged when the code is redeemed. |
+| The issuance chokepoint | After every check today's rules make and before anything is signed or stored, rules A, B and C decide the token's scopes. A refused refresh puts the presented refresh token back, as any failed refresh does. A CIBA approval is judged after the approval is consumed, like the chokepoint's other checks. |
+| Token exchange | A delegation that names no scope is issued none instead of refused. |
+| The token endpoint | Rule D's code and description. |
+
+A CIBA push client is sent CIBA Core §12 codes, which do not include
+`invalid_scope`, so rule D is not applied to it: a refusal by the person
+ceiling keeps `access_denied`, and that change is not recorded in `enforce`. A
+push-mode mint the stricter rules refuse is sent as `access_denied`, with the
+description above.
+
+**Exemptions.** In `enforce` exactly as in `shadow`: reserved scopes stay
+under the reserved-scope rules (below), and the internal service grants are
+not evaluated, so their answers are unchanged.
+
 **What is recorded.** Each rule that would change a request is counted in
 `zeroid_scope_rule_would_change_total` (OpenTelemetry
 `zeroid.scope.rule_would_change`) by `mode`, `rule`, `grant_type`,
@@ -293,13 +363,13 @@ reserved scope) records nothing.
 
 | Field | Value |
 |---|---|
-| `mode` | `shadow` |
+| `mode` | `shadow`, or `enforce` for a change enforcement made |
 | `rule` | `omitted_request`, `listing`, `all_or_nothing` or `one_code` |
 | `grant_type` | `authorization_code`, `refresh_token`, `api_key`, `client_credentials`, `jwt_bearer`, `id_jag`, `token_exchange`, `external_principal`, `external_id_token` or `urn:openid:params:grant-type:ciba` |
 | `client_id`, `identity_id`, `account_id`, `project_id` | The client and identity the token is for and their tenant, empty when the grant has none or failed before resolving it |
 | `requested_scopes` | What the request named |
 | `today` | `issued`, with `today_scopes`; or `refused`, with `today_code` |
-| `would` | `issued`, with `would_scopes`; or `refused`, with `would_code` (always `invalid_scope`) |
+| `would` | `issued`, with `would_scopes`; or `refused`, with `would_code` (always `invalid_scope`). In `enforce`, the outcome the request was given |
 | `unlisted_scopes` | Rule B only: the issued scopes no ceiling lists |
 
 One request can record several rules. A request that fails for a reason other

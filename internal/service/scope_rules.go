@@ -17,8 +17,8 @@ import (
 	"github.com/highflame-ai/zeroid/internal/telemetry"
 )
 
-// ScopeRulesMode says what the stricter scope issuance rules do. They are
-// counted, never enforced, in this release. See docs/scope-ceilings.md,
+// ScopeRulesMode says what the stricter scope issuance rules do: nothing,
+// count what they would change, or apply it. See docs/scope-ceilings.md,
 // "Stricter scope rules".
 type ScopeRulesMode string
 
@@ -29,40 +29,54 @@ const (
 	// records each request whose outcome they would change. Every token and
 	// every response is exactly what it is with the mode off.
 	ScopeRulesModeShadow ScopeRulesMode = "shadow"
+	// ScopeRulesModeEnforce applies what shadow mode records: the same
+	// evaluation decides the token or the refusal (scope_rules_enforce.go),
+	// and each request it changes is recorded as in shadow, with
+	// mode=enforce.
+	ScopeRulesModeEnforce ScopeRulesMode = "enforce"
 )
 
 // ParseScopeRulesMode returns the mode s names, with "" meaning off. Any
-// other value is an error, so a typo or a mode this release does not have
-// never runs as off unnoticed.
+// other value is an error, so a typo never runs as off unnoticed.
 func ParseScopeRulesMode(s string) (ScopeRulesMode, error) {
 	switch ScopeRulesMode(s) {
 	case "", ScopeRulesModeOff:
 		return ScopeRulesModeOff, nil
 	case ScopeRulesModeShadow:
 		return ScopeRulesModeShadow, nil
-	case "enforce":
-		return "", fmt.Errorf("scope rules mode %q is not available yet; use %q to count what it would change", s, ScopeRulesModeShadow)
+	case ScopeRulesModeEnforce:
+		return ScopeRulesModeEnforce, nil
 	}
-	return "", fmt.Errorf("unknown scope rules mode %q (want %q or %q)", s, ScopeRulesModeOff, ScopeRulesModeShadow)
+	return "", fmt.Errorf("unknown scope rules mode %q (want %q, %q or %q)", s, ScopeRulesModeOff, ScopeRulesModeShadow, ScopeRulesModeEnforce)
 }
 
 // scopeRulesState holds the mode. Kept apart from the constructor's fields so
 // the setter can run concurrently with issuance.
 type scopeRulesState struct {
-	shadow atomic.Bool
+	// mode holds a ScopeRulesMode; never stored means off.
+	mode atomic.Value
+}
+
+// load returns the current mode.
+func (st *scopeRulesState) load() ScopeRulesMode {
+	if m, ok := st.mode.Load().(ScopeRulesMode); ok {
+		return m
+	}
+	return ScopeRulesModeOff
 }
 
 // SetScopeRulesMode sets the stricter scope rules' mode. An empty or unknown
-// mode is rejected and leaves the mode unchanged.
+// mode is rejected and leaves the mode unchanged. A request already running
+// keeps the mode it started with.
 func (s *CredentialService) SetScopeRulesMode(mode ScopeRulesMode) error {
 	if mode == "" {
-		return fmt.Errorf("scope rules mode is empty; use %q or %q", ScopeRulesModeOff, ScopeRulesModeShadow)
+		return fmt.Errorf("scope rules mode is empty; use %q, %q or %q", ScopeRulesModeOff, ScopeRulesModeShadow, ScopeRulesModeEnforce)
 	}
 	parsed, err := ParseScopeRulesMode(string(mode))
 	if err != nil {
 		return err
 	}
-	s.scopeRules.shadow.Store(parsed == ScopeRulesModeShadow)
+	s.scopeRules.mode.Store(parsed)
 	return nil
 }
 
@@ -149,9 +163,9 @@ type scopeTraceKey struct{}
 
 // scopeTrace collects, while a grant runs, what the stricter scope rules need
 // to know about one request: what it asked for, the ceilings the deployer
-// controls, and what today's rules did with it. It exists only in shadow
-// mode, and every method is a no-op on a nil trace, so a grant calls them
-// unconditionally. A request runs on one goroutine, so it takes no lock.
+// controls, and what today's rules did with it. It exists only in shadow and
+// enforce mode, and every method is a no-op on a nil trace, so a grant calls
+// them unconditionally. A request runs on one goroutine, so it takes no lock.
 type scopeTrace struct {
 	grant      string
 	clientID   string
@@ -196,15 +210,29 @@ type scopeTrace struct {
 	// not a scope-rule event.
 	reserved        *ReservedScopes
 	reservedRefused bool
+
+	// pushed says a refusal reaches a CIBA push client as a notification.
+	pushed bool
+
+	// enf is what enforce mode adds (scope_rules_enforce.go); nil in shadow
+	// mode.
+	enf *scopeEnforcement
 }
 
 // traceScopes returns ctx carrying a new scopeTrace for one request of grant,
 // or ctx unchanged and a nil trace when the rules are off or grant is "".
 func (s *CredentialService) traceScopes(ctx context.Context, grant string) (context.Context, *scopeTrace) {
-	if s == nil || grant == "" || !s.scopeRules.shadow.Load() {
+	if s == nil || grant == "" {
+		return ctx, nil
+	}
+	mode := s.scopeRules.load()
+	if mode != ScopeRulesModeShadow && mode != ScopeRulesModeEnforce {
 		return ctx, nil
 	}
 	t := &scopeTrace{grant: grant, reserved: s.reserved}
+	if mode == ScopeRulesModeEnforce {
+		t.enf = &scopeEnforcement{}
+	}
 	return context.WithValue(ctx, scopeTraceKey{}, t), t
 }
 
@@ -261,6 +289,7 @@ func (t *scopeTrace) setClient(c *domain.OAuthClient) {
 	t.setClientID(c.ClientID)
 	if clientListsScopes(c) {
 		t.addListing(c.Scopes)
+		t.listableIn(ceilingClientScopes)
 	}
 }
 
@@ -306,12 +335,22 @@ func (t *scopeTrace) minted(scopes []string, listings ...[]string) {
 	if t == nil {
 		return
 	}
+	t.chokepoint(listings)
+	t.issued = slices.Clone(scopes)
+	t.issuedKnown = true
+}
+
+// chokepoint records the deployer-controlled ceilings the issuance chokepoint
+// applied, once: in enforce mode they are added where the scopes are decided,
+// before the token is minted.
+func (t *scopeTrace) chokepoint(listings [][]string) {
+	if t == nil || t.listed {
+		return
+	}
 	for _, l := range listings {
 		t.addListing(l)
 	}
 	t.listed = true
-	t.issued = slices.Clone(scopes)
-	t.issuedKnown = true
 }
 
 // codeIssued records the scopes an authorization code carries. No token is
@@ -329,6 +368,7 @@ func (t *scopeTrace) codeIssued(scopes []string) {
 func (t *scopeTrace) deliveredByPush() {
 	if t != nil {
 		t.refusalCode = pushScopeRefusalCode
+		t.pushed = true
 	}
 }
 
@@ -349,35 +389,55 @@ func (t *scopeTrace) isReserved(sc string) bool {
 
 // done compares the request's outcome, err or the scopes issued, with what
 // the stricter rules would do, and records each rule that would change it.
-// It never changes the outcome.
+// It never changes the outcome. In enforce mode the outcome was decided
+// earlier, where the token or code was minted; done then judges today's
+// outcome as it stood there, and records each change with the outcome the
+// request was given (scopeEnforcement.today).
 func (t *scopeTrace) done(ctx context.Context, err error) {
 	if t == nil || !t.asked {
 		return
 	}
-	var today scopeOutcome
+	today, ok := t.todayOutcome(err)
+	if prior := t.enf.priorOutcome(err); prior != nil {
+		today, ok = *prior, true
+	}
+	if !ok {
+		return
+	}
+	for _, c := range t.recorded(today) {
+		t.record(ctx, today, c)
+	}
+}
+
+// todayOutcome returns how today's rules end the request, from err or the
+// scopes issued, and false when the stricter rules do not judge it: a
+// failure that is not over scopes, a refusal by the reserved-scope rules, or
+// a request that never reached an outcome they see.
+func (t *scopeTrace) todayOutcome(err error) (scopeOutcome, bool) {
 	switch {
 	case err != nil:
 		if t.reservedRefused {
 			// The reserved-scope rules decided this request, not a ceiling.
-			return
+			return scopeOutcome{}, false
 		}
-		codeOf := t.refusalCode
-		if codeOf == nil {
-			codeOf = scopeRefusalCode
-		}
-		code, ok := codeOf(err)
+		code, ok := t.refusalCodeOf(err)
 		if !ok {
-			return
+			return scopeOutcome{}, false
 		}
-		today = scopeOutcome{refused: true, code: code}
+		return scopeOutcome{refused: true, code: code}, true
 	case t.issuedKnown:
-		today = scopeOutcome{scopes: t.issued}
-	default:
-		return
+		return scopeOutcome{scopes: t.issued}, true
 	}
-	for _, c := range t.changes(today) {
-		t.record(ctx, today, c)
+	return scopeOutcome{}, false
+}
+
+// refusalCodeOf returns the code err reaches the client with today and
+// whether it refuses the request over its scopes.
+func (t *scopeTrace) refusalCodeOf(err error) (string, bool) {
+	if t.refusalCode != nil {
+		return t.refusalCode(err)
 	}
+	return scopeRefusalCode(err)
 }
 
 // scopeOutcome is how a request ends: issued scopes, or refused with code.
@@ -501,14 +561,14 @@ func (t *scopeTrace) droppedScopes(issued []string) []string {
 // identity and the scopes; never a token, a secret or a person.
 func (t *scopeTrace) record(ctx context.Context, today scopeOutcome, c scopeRuleChange) {
 	telemetry.ScopeRuleWouldChange.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("mode", string(ScopeRulesModeShadow)),
+		attribute.String("mode", string(t.mode())),
 		attribute.String("rule", c.rule),
 		attribute.String("grant_type", t.grant),
 		attribute.String("account_id", t.accountID),
 		attribute.String("project_id", t.projectID),
 	))
 	ev := log.Info().
-		Str("mode", string(ScopeRulesModeShadow)).
+		Str("mode", string(t.mode())).
 		Str("rule", c.rule).
 		Str("grant_type", t.grant).
 		Str("client_id", t.clientID).

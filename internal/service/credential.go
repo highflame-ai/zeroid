@@ -865,6 +865,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		}
 		for _, requested := range req.Scopes {
 			if !allowed[requested] {
+				trace.ceiling(ceilingIdentityScopes, req.Identity.AllowedScopes)
 				return nil, nil, fmt.Errorf("%w: %q not in allowed_scopes", ErrScopesNotAllowed, requested)
 			}
 		}
@@ -968,6 +969,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 					Str("policy_id", identityPolicyID).
 					Str("policy_layer", "identity").
 					Msg("Identity policy enforcement denied issuance")
+				trace.policyRefused(err, policy, enforceReq, identityPolicyOwner(req.Identity))
 				return nil, nil, err
 			}
 			identityPolicy = policy
@@ -992,6 +994,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 					Str("policy_id", req.CredentialPolicyID).
 					Str("policy_layer", "credential").
 					Msg("Credential policy enforcement denied issuance")
+				trace.policyRefused(err, policy, enforceReq, ownerAPIKey)
 				return nil, nil, err
 			}
 			keyPolicy = policy
@@ -1000,6 +1003,26 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 
 	if identityPolicy == nil && req.EnforcedIdentityPolicy != nil {
 		identityPolicy = req.EnforcedIdentityPolicy
+	}
+
+	// With token.scope_rules=enforce the stricter scope rules decide the
+	// token's scopes here, after every check above and before anything is
+	// signed or stored: they judge the request exactly as shadow mode judges
+	// the token minted below, refusing it (rules B and C) or dropping the
+	// default a request that named no scope was given (rule A). A no-op in
+	// any other mode.
+	var listings [][]string
+	if trace != nil {
+		listings = scopeListings(req, principal, identityPolicy, keyPolicy)
+	}
+	if trace.enforcing() {
+		trace.chokepoint(listings)
+		trace.listableAt(req, principal, identityPolicy, keyPolicy)
+		scopes, err := trace.enforceScopes(req.Scopes)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Scopes = scopes
 	}
 
 	now := time.Now()
@@ -1340,7 +1363,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 
 	s.recordUnboundedScope(ctx, req, principal, identityPolicy)
 	if trace != nil {
-		trace.minted(req.Scopes, scopeListings(req, principal, identityPolicy, keyPolicy)...)
+		trace.minted(req.Scopes, listings...)
 	}
 
 	tokenType := "Bearer"
