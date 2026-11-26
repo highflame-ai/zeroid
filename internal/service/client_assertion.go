@@ -451,7 +451,7 @@ func (s *OAuthService) verifyClientAssertion(
 	// Single-use enforcement, LAST — after every other check has passed, so a
 	// malformed or unverifiable assertion cannot burn a jti and thereby lock out
 	// the legitimate assertion that happens to reuse it. Mirrors the ordering
-	// the ID-JAG path documents (ADR 0010 D2a).
+	// the ID-JAG path documents.
 	//
 	// Fail closed on a missing store: reaching here means a private_key_jwt
 	// client is authenticating for real, and accepting it with no replay ledger

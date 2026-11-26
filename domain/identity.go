@@ -113,7 +113,7 @@ const (
 	SubTypeEvaluator    SubType = "evaluator"
 	// SubTypeCodeAgent is a code-generation/analysis agent (e.g. a coding-agent
 	// workspace). It is valid for BOTH identity_type=agent (a delegated code
-	// agent, e.g. forge's per-sandbox mint) and identity_type=application (a
+	// agent, e.g. a broker's per-sandbox mint) and identity_type=application (a
 	// code-gen product registered as an application) — see the two sets below.
 	SubTypeCodeAgent SubType = "code_agent"
 
@@ -188,7 +188,7 @@ func (s SubType) ValidForIdentityType(t IdentityType) bool {
 // While a row sits in the discovered inbox it is a credential-less posture
 // signal (never an auth principal), so the connector remains the source of truth
 // for its classification. This lets an improved or late classification (e.g.
-// application → mcp_server once the connector recognises it, CAP-DSC-003) reach
+// application → mcp_server once the connector recognises it) reach
 // identities ingested before the classifier could type them — the reconcile path
 // otherwise leaves identity_type untouched. Once a row is adopted (status !=
 // discovered) its type may be human-curated, so it is never re-typed.

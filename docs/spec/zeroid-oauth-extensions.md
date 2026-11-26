@@ -501,10 +501,10 @@ that would exceed it **MUST** be rejected. `delegation_depth` is emitted as a
 claim only when &gt; 0 (Section 4.3).
 
 Under the `rfc8693` profile, an exchange whose actor already **is** the subject
-token's current actor (its `act.sub`, ADR 0043 D2) is a re-scoping, not a
+token's current actor (its `act.sub`) is a re-scoping, not a
 delegation: the actor replaces itself as the current actor rather than
 nesting, and `delegation_depth` does not increase. The legacy profile is
-frozen (ADR 0043 D1) and delegates on every exchange as before. This is the agent narrowing the person
+frozen and delegates on every exchange as before. This is the agent narrowing the person
 token an ID-JAG or ID-token exchange minted naming it as `act`. `parent_jti`
 still links the child for cascade revocation.
 
@@ -667,8 +667,8 @@ upstream ID token. The mode:
   client binding below *are* the trust anchor.
 - **MUST** authenticate the redeeming client (absent client credentials →
   `invalid_client`) with its registered method; with per-account issuer rows
-  only `private_key_jwt` is accepted and a client secret is `invalid_client`
-  (ADR 0042 D3a); static issuers (standalone) keep secrets. And
+  only `private_key_jwt` is accepted and a client secret is `invalid_client`;
+ static issuers (standalone) keep secrets. And
   **MUST** redeem only for the relying party the ID token was issued to (OpenID
   Connect Core §2, §3.1.3.7): the authenticated `client_id` must be one of the
   token's `aud` values, `azp`, if present, must be a string equal to it, and a token with

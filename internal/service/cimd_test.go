@@ -934,7 +934,7 @@ func TestEffectiveCIMDGrantTypes(t *testing.T) {
 			wantDropped: []string{"urn:ietf:params:oauth:grant-type:token-exchange"},
 		},
 		{
-			// jwt-bearer is kept for ID-JAG redemption (firehog#701), the only
+			// jwt-bearer is kept for ID-JAG redemption, the only
 			// grant that reads it from a CIMD client. The short form is not a
 			// metadata value and stays dropped.
 			name:        "jwt-bearer URN is kept, its short form is not",
@@ -1036,7 +1036,7 @@ func TestSynthesizeCIMDClient_M2MGrantsNeverReachTheClient(t *testing.T) {
 }
 
 // jwt-bearer reaches a CIMD client so it can redeem an ID-JAG (MCP
-// Enterprise-Managed Authorization §5, firehog#701). It is the only grant that
+// Enterprise-Managed Authorization §5). It is the only grant that
 // reads it from a CIMD client; see requireCIMDClientFitForIDJAG.
 func TestSynthesizeCIMDClient_JWTBearerReachesTheClient(t *testing.T) {
 	url := "https://app.example.com/client.json"
@@ -1230,8 +1230,7 @@ func TestCIMDDirectAuthOptInIsBounded(t *testing.T) {
 	allowed := map[string]bool{
 		// ID-JAG redemption (MCP Enterprise-Managed Authorization §5). Gates
 		// on private_key_jwt and on a non-contradictory ID-JAG profile claim,
-		// binds the ID-JAG's client_id, then needs a tenant binding (ADR 0042
-		// D5/D6).
+		// binds the ID-JAG's client_id, then needs a tenant binding.
 		"idJAGBearer": true,
 	}
 

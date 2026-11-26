@@ -112,7 +112,7 @@ type personIDToken struct {
 
 // verifyPersonIDToken verifies an OpenID Connect ID token naming a person,
 // issued by entry's IdP to clientID: the P1c checks that need no binding
-// (ADR 0042 D3a rules 1 to 3). Signature against the issuer's JWKS, iss,
+// (rules 1 to 3 below). Signature against the issuer's JWKS, iss,
 // exp/nbf/iat with the shared skew and max_token_age, the row's claim
 // constraints (and shared-issuer pin), the token being an ID token and not
 // an access token, aud naming clientID with azp equal to it when present,
@@ -160,7 +160,7 @@ func verifyPersonIDToken(ctx context.Context, raw string, entry *ExternalIssuerE
 	return out, nil
 }
 
-// requireIDToken is ADR 0042 D3a rule 2: the subject token is positively an
+// requireIDToken is rule 2: the subject token is positively an
 // ID token, not merely a JWT from a trusted issuer. IdPs do not type ID
 // tokens, so this means the OpenID Connect Core §2 claims are present and no
 // access-token marker is (RFC 9068 §2.1 typ, scp or scope). The aud check
@@ -261,7 +261,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 
 	var identity *domain.Identity
 	if entry.Row != nil {
-		// ADR 0042 D3a rule 1 (issuer rows): the relying party proves itself
+		// Rule 1 (issuer rows): the relying party proves itself
 		// with a key, never a shared secret, so an agent needs no Highflame
 		// secret (D8). Static issuers keep the client's registered method.
 		if authedClient.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
@@ -312,7 +312,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "application_id is not the agent the presenting client is bound to")
 		}
 		req.AccountID, req.ProjectID = identity.AccountID, identity.ProjectID
-		// The bound agent is the current actor (ADR 0043 D2), as on ID-JAG.
+		// The bound agent is the current actor, as on ID-JAG.
 		actors = idJAGActors(identity)
 	} else {
 		identity, err = s.resolveExternalPrincipalIdentity(ctx, req)
@@ -321,7 +321,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		}
 	}
 
-	// The person must be a member of the tenant (ADR 0042 D5a); the token's
+	// The person must be a member of the tenant; the token's
 	// sub becomes the deployer's user id and the IdP pair moves to user_idp_iss/user_idp_sub.
 	person, err := s.resolveFederatedPerson(ctx, entry.Row != nil, FederatedPersonRequest{
 		GrantType:       PersonGrantExternalIDToken,
@@ -425,7 +425,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 		PersonGrantType:   PersonGrantExternalIDToken,
 	}
-	// RFC 8707 resource binding (CAP-IDN-026). token-exchange forks THREE ways —
+	// RFC 8707 resource binding. token-exchange forks THREE ways —
 	// this id_token federation path, the trusted external-principal exchange, and
 	// NHI delegation — and the grant type as a whole is in
 	// resourceSupportedGrants, so the Token() gate admits `resource` for all
@@ -468,7 +468,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 }
 
 // resolvePersonIssuer reads the token's issuer and resolves the trusted
-// person issuer it must verify against (ADR 0042 D4: person grants accept
+// person issuer it must verify against (person grants accept
 // only enabled person rows). Every refusal is one generic invalid_grant on
 // the wire, since the token is not verified yet: telling an unknown issuer
 // from a disabled, workload or unmatched one would let a probe learn which
@@ -516,7 +516,7 @@ func (s *OAuthService) resolvePersonIssuer(ctx context.Context, token, fieldName
 // It is the single security-critical verification routine shared by BOTH
 // external-IdP ingestion paths:
 //   - externalIDTokenExchange (RFC 8693 subject_token_type=id_token, #88)
-//   - idJAGBearer (RFC 7523 jwt-bearer carrying an MCP ID-JAG, ADR 0010)
+//   - idJAGBearer (RFC 7523 jwt-bearer carrying an MCP ID-JAG)
 //
 // so neither path can drift from the other. The issuer lookup and the
 // AllowedAccounts tenant binding stay in each caller, because their OAuth
@@ -752,10 +752,10 @@ func extractMappedClaimString(claims map[string]any, path string) (string, bool)
 // a workload principal.
 //
 // The issuer's kind (person) is checked first; this also refuses the
-// well-known workload shapes a person issuer can still sign (ADR 0042 D3a
-// rule 3): an Entra app-only token (idtyp=app), a Kubernetes service-account
-// subject, and a SPIFFE ID. Both `sub` and the mapped user_id are checked,
-// since the mapping may point at a claim other than `sub`.
+// well-known workload shapes a person issuer can still sign (rule 3): an Entra
+// app-only token (idtyp=app), a Kubernetes service-account subject, and a
+// SPIFFE ID. Both `sub` and the mapped user_id are checked, since the mapping
+// may point at a claim other than `sub`.
 func refuseWorkloadSubject(claims map[string]any, userID string) error {
 	if idtyp, _ := claims["idtyp"].(string); strings.EqualFold(idtyp, "app") {
 		return oauthBadRequest(oautherror.InvalidGrant, "the subject is an app-only token (idtyp=app); this grant accepts person tokens only")

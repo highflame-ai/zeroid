@@ -343,7 +343,7 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 
 // ListByOwnerForOffboard returns every not-yet-deactivated identity owned by
 // ownerUserID within accountID — deliberately ACROSS ALL PROJECTS, unlike List:
-// offboarding a human (INV-IDN-010 / ADR 0028 D5) must sweep every project the
+// offboarding a human must sweep every project the
 // account has, mirroring the (owner_user_id, account_id) scoping of the
 // revoke_credentials_by_owner cascade (migration 041). No status default is
 // applied beyond excluding already-deactivated rows: discovered/pending/
@@ -736,7 +736,7 @@ func (r *IdentityRepository) ReleaseDiscoveredSource(ctx context.Context, accoun
 //
 // Called when a discovery connector is deleted: the agents it found are
 // inventory belonging to that connection, so removing the connection removes
-// them (highflame-discovery#65). A `discovered` row carries no owner and no
+// them. A `discovered` row carries no owner and no
 // credentials — nothing cascades — so this is a plain delete rather than the
 // deactivation cascade a real identity would need.
 //

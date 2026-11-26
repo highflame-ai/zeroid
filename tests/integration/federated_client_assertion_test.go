@@ -1,6 +1,6 @@
 package integration_test
 
-// Federated client assertions (ADR 0042 D8, path P2): an agent authenticates
+// Federated client assertions: an agent authenticates
 // on client_credentials with a token its workload issuer signed for it (here
 // a Kubernetes service account token from the mock IdP), resolved to its
 // identity through a binding, with no secret and no registered client.
@@ -343,7 +343,7 @@ func TestFederatedClientAssertion(t *testing.T) {
 // A token minted from a federated client assertion is held by whatever runs
 // the agent's credential provider, so it cannot enroll a durable key on an
 // agent that was meant to hold no secret.
-// A federated token lives 15 minutes (ADR 0042 D9), however long the
+// A federated token lives 15 minutes, however long the
 // identity's policy would allow, and no longer than a stricter policy allows.
 func TestFederatedClientAssertion_TokenLifetime(t *testing.T) {
 	lifetime := func(t *testing.T, resp tokenResponse) float64 {
@@ -369,7 +369,7 @@ func TestFederatedClientAssertion_TokenLifetime(t *testing.T) {
 
 // An agent with no scope limit (no allowed_scopes on its identity or its
 // credential policy, as on the tenant default policy) is refused, whatever it
-// asks for, rather than granted the scopes it names (highflame-authn#317).
+// asks for, rather than granted the scopes it names.
 func TestFederatedClientAssertion_NoScopeLimitIsRefused(t *testing.T) {
 	w := newWorkloadFed(t)
 
@@ -401,7 +401,7 @@ func TestFederatedClientAssertion_NoScopeLimitIsRefused(t *testing.T) {
 }
 
 // A server-side failure after the assertion's jti is spent releases it, so
-// retrying the same platform token works (highflame-authn#319). A refusal
+// retrying the same platform token works. A refusal
 // keeps it spent: the retry of a refused assertion is a replay.
 func TestFederatedClientAssertion_RetryAfterServerFailure(t *testing.T) {
 	w := newWorkloadFed(t)

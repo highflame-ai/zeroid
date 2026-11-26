@@ -269,7 +269,7 @@ func (a *API) buildASMetadata() map[string]any {
 			"api_key",
 			"urn:openid:params:grant-type:ciba",
 		},
-		// MCP Enterprise-Managed Authorization (ADR 0010 D6): advertise the
+		// MCP Enterprise-Managed Authorization: advertise the
 		// ID-JAG authorization grant profile so EMA-capable clients discover
 		// that this AS accepts an Identity Assertion Authorization Grant
 		// (presented via the jwt-bearer grant above). Distinct from
@@ -430,7 +430,7 @@ func (a *API) buildASMetadata() map[string]any {
 // leaves ZeroID undiscoverable to all of them even though the keyset it would
 // verify against is already public at /.well-known/jwks.json. Serving this
 // document is what makes "configure your cloud to trust identities ZeroID
-// issued" a one-time setup rather than an impossibility (ADR 0028 D8).
+// issued" a one-time setup rather than an impossibility.
 //
 // # ZeroID is NOT an OpenID Provider
 //

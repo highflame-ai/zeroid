@@ -15,7 +15,7 @@ import (
 	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
-// Federated client assertions (ADR 0042 D8, path P2): an agent authenticates
+// Federated client assertions: an agent authenticates
 // on client_credentials with a JWT a trusted workload issuer signed for it,
 // such as an AWS STS web identity token, a Kubernetes service account token
 // or a SPIFFE JWT-SVID. It holds no secret and registers no key. The
@@ -214,7 +214,7 @@ func (s *OAuthService) mintFederatedClientCredentials(
 	// row ceilings are the only bound. With neither set, refuse: the
 	// registered client_credentials path refuses a client with no scopes for
 	// the same reason, and grantScopes would otherwise grant whatever the
-	// request names, nhi:manage included (highflame-authn#317).
+	// request names, nhi:manage included.
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
 	if len(policyScopes) == 0 && len(rowScopes) == 0 {
 		return nil, oauthBadRequest(oautherror.InvalidScope,
@@ -267,7 +267,7 @@ func federatedClientID(issuer, sub string) string {
 
 // federatedAccessTokenMaxTTL is the lifetime (seconds) of a token minted on a
 // federated client assertion: 15 minutes, like the other paths where an
-// external issuer authenticates the caller (ADR 0042 D9; ID-JAG and ID-token
+// external issuer authenticates the caller (ID-JAG and ID-token
 // exchange set the same). Disabling a binding or an issuer row stops new
 // mints but does not revoke tokens already issued, so this bounds how long
 // one outlives that change.

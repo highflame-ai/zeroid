@@ -56,7 +56,8 @@ type IdentityIDInput struct {
 
 // OffboardByOwnerInput is the request for POST /identities/offboard-by-owner.
 // account_id comes from tenant context, never the body — the payload cannot
-// steer tenancy (INV-IDN-002 applied to the admin surface).
+// steer tenancy (the tenant comes from the caller, never the request, on the
+// admin surface too).
 type OffboardByOwnerInput struct {
 	Body struct {
 		OwnerUserID string `json:"owner_user_id" required:"true" minLength:"1" doc:"Stable user ID of the offboarded human (identities.owner_user_id)"`
@@ -182,7 +183,7 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Method:      http.MethodPost,
 		Path:        "/identities/offboard-by-owner",
 		Summary:     "Offboard a human: deactivate every identity they own and cascade-revoke credentials",
-		Description: "Human-offboarding composition (INV-IDN-010 / ADR 0028): deactivates every " +
+		Description: "Human-offboarding composition: deactivates every " +
 			"identity owned by the given user in the caller's account — across ALL projects; the " +
 			"X-Project-ID header is required by the admin surface but not used to scope this sweep — " +
 			"sweeping each identity's API keys and credentials and emitting retirement CAE signals, " +
@@ -229,7 +230,7 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Method:      http.MethodPost,
 		Path:        "/identities/{id}/expire",
 		Summary:     "Expire an active identity (time-bound authority lapsed)",
-		Description: "Transitions an active identity to expired status and runs cleanup (revoke credentials, API keys, emit CAE signal). Used by Cerberus on subagent session stop.",
+		Description: "Transitions an active identity to expired status and runs cleanup (revoke credentials, API keys, emit CAE signal). Used to end a subagent's session.",
 		Tags:        []string{"Identities"},
 	}, a.expireIdentityOp)
 
@@ -413,7 +414,7 @@ func (a *API) getIdentityOp(ctx context.Context, input *IdentityIDInput) (*Ident
 }
 
 // getIdentityByWIMSEOp resolves an identity by its WIMSE/SPIFFE URI within
-// the caller's tenant. Used by downstream gateways (firehog) to gate
+// the caller's tenant. Used by downstream gateways to gate
 // forwarding on identity status — a signature-valid, unexpired JWT for a
 // deactivated identity must still be rejected, and only the identity row
 // carries that signal.
@@ -592,7 +593,7 @@ func (a *API) deleteIdentityOp(ctx context.Context, input *IdentityIDInput) (*Id
 	// Soft delete: deactivate rather than hard-delete. Matches the route's
 	// "Deactivate an identity (soft delete)" summary and the platform "never
 	// hard DELETE" convention, and avoids the non-cascading service_keys FK
-	// that 500s a hard delete on existing deployments (authn#109). mapErr
+	// that 500s a hard delete on existing deployments. mapErr
 	// surfaces a missing identity as 404 rather than a blanket 500.
 	identity, err := a.identitySvc.DeactivateIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
@@ -663,10 +664,10 @@ type CreateDiscoveredIdentityInput struct {
 		Name         string `json:"name,omitempty" doc:"Human-readable identity name"`
 		IdentityType string `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
 		SubType      string `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
-		TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party" doc:"Trust level (default unverified). first_party is not assertable on the discovery path — connector-sourced trust tops out at verified_third_party (CAP-DSC-004)."`
+		TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party" doc:"Trust level (default unverified). first_party is not assertable on the discovery path — connector-sourced trust tops out at verified_third_party."`
 		OwnerUserID  string `json:"owner_user_id,omitempty" doc:"Optional owner — discovered identities may be ownerless until adopted"`
 		// OwnerResolved attests the connector definitively verified owner
-		// attribution against the tenant directory this sync (CAP-DSC-004);
+		// attribution against the tenant directory this sync;
 		// only then does a reconcile apply owner_user_id/trust_level to a
 		// still-discovered row (declaratively, clearing included).
 		OwnerResolved bool            `json:"owner_resolved,omitempty" doc:"Attests owner_user_id/trust_level carry a definitive directory-verification result for this sync; applies them to still-discovered rows on reconcile"`
@@ -825,9 +826,9 @@ type DiscoveredAgentItem struct {
 	Name         string `json:"name,omitempty" doc:"Human-readable identity name"`
 	IdentityType string `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
 	SubType      string `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
-	TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party" doc:"Trust level (default unverified). first_party is not assertable on the discovery path (CAP-DSC-004)."`
+	TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party" doc:"Trust level (default unverified). first_party is not assertable on the discovery path."`
 	OwnerUserID  string `json:"owner_user_id,omitempty" doc:"Optional owner"`
-	// See CreateDiscoveredIdentityInput.OwnerResolved (CAP-DSC-004).
+	// See CreateDiscoveredIdentityInput.OwnerResolved.
 	OwnerResolved bool            `json:"owner_resolved,omitempty" doc:"Attests owner_user_id/trust_level carry a definitive directory-verification result for this sync"`
 	Framework     string          `json:"framework,omitempty" doc:"Agent framework"`
 	Version       string          `json:"version,omitempty" doc:"Agent version"`

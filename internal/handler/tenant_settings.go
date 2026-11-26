@@ -17,7 +17,7 @@ import (
 
 // UpdateTenantSettingsInput is the request body for changing a tenant's
 // settings. The tenant itself always comes from the authenticated context,
-// never from the body (INV-IDN-002).
+// never from the body.
 type UpdateTenantSettingsInput struct {
 	Body struct {
 		TokenProfile string `json:"token_profile" required:"true" enum:"legacy,rfc8693" doc:"Claim shape the tenant's new tokens are issued in. legacy keeps today's shape; rfc8693 issues the RFC 8693 delegation shape (sub is the principal for the whole chain, act nests the actors). Already-issued tokens keep their shape until they expire."`

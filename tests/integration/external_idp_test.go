@@ -66,7 +66,7 @@ func TestExternalIDTokenFederation_EndToEnd(t *testing.T) {
 	defer fedHTTPSrv.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	// RFC 8707 resource binding on the id_token federation fork (CAP-IDN-026).
+	// RFC 8707 resource binding on the id_token federation fork.
 	//
 	// token-exchange forks three ways and the grant type as a whole is in
 	// resourceSupportedGrants, so the Token() gate admits `resource` for ALL of
@@ -103,7 +103,7 @@ func TestExternalIDTokenFederation_EndToEnd(t *testing.T) {
 		require.ElementsMatch(t, []any{mcpResource}, claims["aud"],
 			"aud must be the requested resource")
 		require.ElementsMatch(t, []any{mcpResource}, claims["resource"],
-			"the resource claim is what INV-IDN-006 enforcement keys on; without "+
+			"the resource claim is what resource-binding enforcement keys on; without "+
 				"it the token is silently unbound")
 	})
 

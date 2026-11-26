@@ -24,8 +24,8 @@ const (
 	testOtherID     = "some-other-client"
 )
 
-// TestResolveBasicClientAuth pins the RFC 6749 §2.3 decision table
-// (highflame-firehog#700): two client authentication METHODS in one request are
+// TestResolveBasicClientAuth pins the RFC 6749 §2.3 decision table:
+// two client authentication METHODS in one request are
 // refused, but a body client_id that merely repeats the Basic identifier is an
 // identifier (RFC 6749 §3.2.1, OAuth 2.1 §3.2.2), not a second method.
 func TestResolveBasicClientAuth(t *testing.T) {

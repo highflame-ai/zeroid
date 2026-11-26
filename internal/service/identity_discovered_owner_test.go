@@ -6,9 +6,9 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 )
 
-// These tests pin the CAP-DSC-004 owner-attribution contract on the discovered
+// These tests pin the owner-attribution contract on the discovered
 // reconcile path. The stakes: owner_user_id on a discovered row is the link
-// into the tenant's stable user-id space — the id the INV-IDN-010 offboarding
+// into the tenant's stable user-id space — the id the offboarding
 // cascade keys on — and trust_level=verified_third_party must be EARNED by
 // directory verification, never left behind stale or asserted by a connector.
 
@@ -99,7 +99,7 @@ func TestApplyDiscoveredOwnerAttribution_AdoptedRowsUntouched(t *testing.T) {
 
 func TestUpsertDiscoveredIdentity_RejectsFirstPartyAndUnknownTrust(t *testing.T) {
 	t.Parallel()
-	// Connector-sourced trust tops out at verified_third_party (CAP-DSC-004),
+	// Connector-sourced trust tops out at verified_third_party,
 	// and an unknown value is a caller bug that must never be written. The
 	// guard must fire before any repository access (nil deps would panic).
 	svc := &IdentityService{}

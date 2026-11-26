@@ -23,8 +23,7 @@ type idJAGTenant struct {
 type linkedIdentityLookup func(ctx context.Context, identityID string, accountIDs []string) (*domain.Identity, error)
 
 // deriveIDJAGTenant decides which tenant an ID-JAG redemption mints into. The
-// tenant is DERIVED from server-side facts; the request never chooses it
-// (ADR 0042 D5, amending ADR 0010 D3).
+// tenant is DERIVED from server-side facts; the request never chooses it.
 //
 // Why the request cannot supply it. The ID-JAG profile defines the access token
 // request as grant_type, assertion and client authentication "as registered
@@ -48,8 +47,8 @@ type linkedIdentityLookup func(ctx context.Context, identityID string, accountID
 //     client_id. The lookup is restricted to allowed_accounts in SQL, so the
 //     result is exactly one account or none.
 //   - For a CIMD client (no registration, so no tenant of its own), the
-//     tenant would come from the identity its client_id is bound to (ADR 0042
-//     D6). That binding does not exist yet, so a CIMD client is refused; see
+//     tenant would come from the identity its client_id is bound to. That
+//     binding does not exist yet, so a CIMD client is refused; see
 //     cimdClientTenant.
 //
 // Fail closed on every gap:
@@ -60,8 +59,8 @@ type linkedIdentityLookup func(ctx context.Context, identityID string, accountID
 //     project to derive, and with several allowed accounts no account either.
 //     An issuer with a single allowed account still cannot supply a project.
 //   - linked identity outside allowed_accounts → invalid_grant
-//   - linked identity not active, or expired  → invalid_grant (ADR 0042 D7)
-//   - CIMD client (no D6 binding exists yet)  → invalid_grant
+//   - linked identity not active, or expired  → invalid_grant
+//   - CIMD client (no client binding yet)     → invalid_grant
 //
 // account_id / project_id on the request are tolerated, not consulted: when
 // present they MUST equal the derived values (D5), otherwise invalid_grant.
@@ -99,7 +98,7 @@ func deriveIDJAGTenant(
 		return idJAGTenant{}, err
 	}
 
-	// ADR 0042 D5: a request that also names a tenant must name THIS one. The
+	// A request that also names a tenant must name THIS one. The
 	// messages do not echo the derived values; the caller either already knows
 	// them or has no business learning them from an error.
 	if reqAccountID != "" && reqAccountID != derived.AccountID {
@@ -117,7 +116,7 @@ func deriveIDJAGTenant(
 // which has no bindings, so it always refuses. Issuer rows bind the agent
 // through act.sub instead (bindFederatedAgent), which serves a CIMD client.
 //
-// ADR 0042 D5 takes the project for this path from "the identity the
+// The project for this path comes from "the identity the
 // credential maps to", and D6 says a CIMD client's credential maps to an
 // identity through a binding keyed on its client_id. That binding does not
 // exist yet: a CIMD client has no oauth_clients row, so no identity_id link,
@@ -178,7 +177,7 @@ func registeredClientTenant(
 		return idJAGTenant{}, oauthBadRequest(oautherror.InvalidGrant,
 			"the authenticated client's registered identity has no complete tenant")
 	}
-	// ADR 0042 D7 and the same gate authorization_code applies to a linked
+	// The same gate authorization_code applies to a linked
 	// client: a suspended, deactivated or expired identity mints nothing.
 	if !linked.Status.IsUsable() {
 		return idJAGTenant{}, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")

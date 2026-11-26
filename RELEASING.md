@@ -6,7 +6,7 @@ ZeroID is published as **four Go modules** from this one repository:
 |----|----|----|----|
 | `github.com/highflame-ai/zeroid` (the root OAuth/OIDC server library) | `./` | `vX.Y.Z` | Whenever zeroid features/fixes ship |
 | `github.com/highflame-ai/zeroid/pkg/authjwt` (token verification for resource servers) | `./pkg/authjwt/` | `pkg/authjwt/vX.Y.Z` | **Lockstep** — same vX.Y.Z |
-| `github.com/highflame-ai/zeroid/pkg/dpop` (RFC 9449 DPoP primitive — also consumed by Cerberus, Shield, Firehog directly) | `./pkg/dpop/` | `pkg/dpop/vX.Y.Z` | **Lockstep** — same vX.Y.Z |
+| `github.com/highflame-ai/zeroid/pkg/dpop` (RFC 9449 DPoP primitive — also consumed directly by downstream services) | `./pkg/dpop/` | `pkg/dpop/vX.Y.Z` | **Lockstep** — same vX.Y.Z |
 | `github.com/highflame-ai/zeroid/pkg/jwks` (remote JWKS fetch/cache/rotate — shared by the server and by pkg/authjwt) | `./pkg/jwks/` | `pkg/jwks/vX.Y.Z` | **Lockstep** — same vX.Y.Z |
 
 **Layering.** `pkg/jwks` is a primitive both sides may import. `pkg/authjwt` is the
@@ -17,14 +17,14 @@ was not enough last time.
 
 **Every nested module is referenced by a real published tag in `zeroid/go.mod`.** Local `replace` directives do not reach consumers — Go ignores `replace` in dependency modules — so the `require` pins are exactly what the proxy serves.
 
-- **pkg/dpop** — the RFC 9449 DPoP verifier used by `/oauth2/token`, also consumed directly by cerberus, shield and firehog. Lockstep cadence, as of this change: it previously had a decoupled one, and the section below records why that was abandoned.
-- **pkg/authjwt** — token verification for resource servers. Consumed directly by cerberus, shield and authn; inside this repo it is now reached **only from tests**, because extracting `pkg/jwks` moved the non-test importers (`server.go`, `internal/service/client_jwks.go`, `internal/service/external_issuer_registry.go`) onto the primitive instead. Lockstep cadence: tagged at every zeroid release.
+- **pkg/dpop** — the RFC 9449 DPoP verifier used by `/oauth2/token`, also consumed directly by downstream services. Lockstep cadence, as of this change: it previously had a decoupled one, and the section below records why that was abandoned.
+- **pkg/authjwt** — token verification for resource servers. Consumed directly by downstream resource servers; inside this repo it is now reached **only from tests**, because extracting `pkg/jwks` moved the non-test importers (`server.go`, `internal/service/client_jwks.go`, `internal/service/external_issuer_registry.go`) onto the primitive instead. Lockstep cadence: tagged at every zeroid release.
 
   **Its pin must stay a real tag anyway**, and the reason matters more than the status: a `require` puts a module in the consumer's graph whether or not any imported package reaches it, so `go get zeroid@vX.Y.Z` resolves this pin regardless. Verified — a fresh module with no `replace` lists all four modules in `go list -m all`. The old `v0.0.0` pin broke consumers during the window when non-test code did import it — but "test-only" was never the property that made a real tag optional, so restoring that status does not make the placeholder safe again. The status itself is now enforced by `TestNonTestSourceDoesNotImportAuthjwt` rather than left to memory, which is what changed since the note below.
 
 > **This section used to describe an asymmetry that no longer exists, and the drift was expensive.** It said pkg/authjwt was imported "only from `tests/integration/`", that Go doesn't follow test imports across module boundaries, and that its version reference was therefore "invisible to downstream consumers and never needs to be a real version" — so it was pinned `v0.0.0`. That was true when written. It stopped being true on **2026-06-19**, when #211 (direct OIDC IdP federation) added `internal/service/external_issuer_registry.go` and the `server.go` option plumbing — both importing pkg/authjwt from non-test code. `internal/service/client_jwks.go` joined later with `private_key_jwt` (#347). Nobody revisited the pin either time.
 >
-> The effect was that **zeroid could not be resolved from the proxy at all**, for every release from **v1.7.1** onward: `go get github.com/highflame-ai/zeroid@vX.Y.Z` in a fresh module fails with `unknown revision pkg/authjwt/v0.0.0` (verified on both v1.7.1 and v1.9.3). In-repo builds never noticed, because the local `replace` hides it. Only consumers who already pinned pkg/authjwt explicitly (as highflame-authn does) were unaffected.
+> The effect was that **zeroid could not be resolved from the proxy at all**, for every release from **v1.7.1** onward: `go get github.com/highflame-ai/zeroid@vX.Y.Z` in a fresh module fails with `unknown revision pkg/authjwt/v0.0.0` (verified on both v1.7.1 and v1.9.3). In-repo builds never noticed, because the local `replace` hides it. Only consumers who already pinned pkg/authjwt explicitly were unaffected.
 >
 > Two things now make that transition unrepeatable, rather than merely noticed. `TestNonTestSourceDoesNotImportAuthjwt` fails the build if non-test code imports pkg/authjwt at all, and the release check covers every nested module — comparing each pin against the version being released, which is strictly stronger than rejecting `v0.0.0`, since it also catches a pin left at any stale real tag.
 
@@ -68,7 +68,7 @@ this section:
   build were all skipped. v1.9.3 has zero release assets and no `pkg/authjwt/v1.9.3`
   tag. It cannot be un-published.
 - **Nobody used the decoupled cadence as a feature.** Consumers pinned mismatched
-  versions and lagged by minors — cerberus on `authjwt v1.7.5`, shield on `v1.8.1`,
+  versions and lagged by minors across consumers,
   authn on `v1.8.8` with `dpop v1.6.1` — not because they were deliberately holding
   back, but because nothing coordinated them. The independence cost coordination and
   bought nothing measurable.
@@ -202,7 +202,7 @@ deliberately pin different combinations.
 zeroid tried the independent model and the evidence says it did not fit:
 
 - Consumers never exercised the independence. They pinned whatever they happened to
-  get and lagged unevenly — cerberus on `authjwt v1.7.5`, shield on `v1.8.1`, authn
+  get and lagged unevenly across consumers,
   on `v1.8.8` + `dpop v1.6.1`. No one was deliberately holding a version back.
 - The coordination it demanded is what stranded the #347 replay-store fix unpublished,
   and what let `pkg/authjwt` sit at a `v0.0.0` placeholder for three months of

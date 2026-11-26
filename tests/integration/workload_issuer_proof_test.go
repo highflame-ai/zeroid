@@ -1,6 +1,6 @@
 package integration_test
 
-// Workload issuer proof of control (ADR 0042 open question 8): the deployer
+// Workload issuer proof of control: the deployer
 // writes a workload row disabled, ZeroID verifies a challenge token under it
 // (verify-workload-token), and the deployer enables exactly the row it
 // checked (if_updated_at). Against the real database and HTTP routes.

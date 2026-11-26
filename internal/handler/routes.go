@@ -46,7 +46,7 @@ type API struct {
 	// profile). Set with SetTenantSettingsService; the routes are registered
 	// only when it is non-nil.
 	tenantSettingsSvc *service.TenantSettingsService
-	// externalIssuerSvc backs /external-issuers (ADR 0042 D4). Set with
+	// externalIssuerSvc backs /external-issuers. Set with
 	// SetExternalIssuerService; the routes are registered only when non-nil.
 	externalIssuerSvc *service.ExternalIssuerService
 	db                *bun.DB

@@ -14,8 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// End-to-end contract for the RFC 8707 `resource` request parameter
-// (CAP-IDN-026, zeroid#258). These drive the real HTTP endpoint against a real
+// End-to-end contract for the RFC 8707 `resource` request parameter.
+// These drive the real HTTP endpoint against a real
 // database, so they cover the wiring the service-level unit tests cannot: JSON
 // binding of the string-or-array shape, the Token() gate ordering, and what
 // actually lands in the signed JWT.
@@ -79,7 +79,7 @@ func TestResourceIndicator_BindsClientCredentialsToken(t *testing.T) {
 		assert.Equal(t, []string{mcpGithub}, audienceOf(t, claims),
 			"aud must be the requested resource, not the issuer default")
 		assert.Equal(t, []string{mcpGithub}, resourceClaimOf(t, claims),
-			"the resource claim is what INV-IDN-006 enforcement keys on")
+			"the resource claim is what resource-binding enforcement keys on")
 	})
 
 	t.Run("without the parameter nothing changes", func(t *testing.T) {
@@ -173,7 +173,7 @@ func TestResourceIndicator_Rejections(t *testing.T) {
 
 // TestResourceIndicator_MutuallyExclusiveWithAudience pins the precedence rule.
 // Two meanings on one claim with no discriminator is the shape of the bug that
-// denied every MCP-targeted request in prod (shield#366); refusing the
+// denied every MCP-targeted request in prod; refusing the
 // combination means there is no precedence to get wrong.
 func TestResourceIndicator_MutuallyExclusiveWithAudience(t *testing.T) {
 	user := uid("res-excl-user")
@@ -238,7 +238,7 @@ func TestResourceIndicator_WideningAttemptViaAdditionalClaims(t *testing.T) {
 // exclusion of `resource` on the refresh grant.
 //
 // That exclusion was correct only while the binding could not survive rotation.
-// CAP-IDN-027 records the ceiling on the refresh family, so the grant now
+// The resource ceiling is recorded on the refresh family, so the grant now
 // accepts the parameter and narrows against that ceiling — which it must, since
 // a conformant MCP client sends `resource` on the refresh leg too and would
 // otherwise be refused at the moment its access token expires.
@@ -268,14 +268,14 @@ func TestResourceIndicator_RefreshGrantAcceptsResource(t *testing.T) {
 
 // TestResourceIndicator_AuthCodeIssuesRefreshTokenWhenBound proves the refresh
 // decision end-to-end, and asserts the OPPOSITE of what it did before
-// CAP-IDN-027 (when it was named ..._AuthCodeSuppressesRefreshToken).
+// the resource ceiling (when it was named ..._AuthCodeSuppressesRefreshToken).
 //
 // The suppression it used to pin was the fail-closed answer to a real problem:
 // the refresh path re-mints from state on the refresh-token row, the RFC 8707
 // binding lived only in the access token's CustomClaims, and rotation did not
 // carry it — so a rotated token came back unbound with no error anywhere, and
-// "bind to X, refresh, use anywhere" worked silently while INV-IDN-006
-// enforcement went quiet.
+// "bind to X, refresh, use anywhere" worked silently while resource-binding
+// enforcement enforcement went quiet.
 //
 // The ceiling is now on the refresh row and copied across every rotation, so
 // the reason for suppressing is gone — and suppression had a real cost: a
@@ -322,7 +322,7 @@ func TestResourceIndicator_AuthCodeIssuesRefreshTokenWhenBound(t *testing.T) {
 		assert.NotEmpty(t, token["access_token"], "the access token is issued")
 		assert.NotEmpty(t, token["refresh_token"],
 			"a resource-bound exchange must now receive a refresh token — the binding is "+
-				"carried on the refresh row and re-stamped on every rotation (CAP-IDN-027)")
+				"carried on the refresh row and re-stamped on every rotation")
 
 		claims := decodeJWTPayload(t, token["access_token"].(string))
 		assert.Equal(t, []string{mcpGithub}, resourceClaimOf(t, claims),

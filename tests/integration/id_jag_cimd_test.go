@@ -1,4 +1,4 @@
-// ID-JAG redemption by a Client ID Metadata Document client (firehog#701).
+// ID-JAG redemption by a Client ID Metadata Document client.
 //
 // MCP Enterprise-Managed Authorization §5: "If the MCP Client is not
 // pre-registered with the Resource Authorization Server, then it can use its
@@ -9,7 +9,7 @@
 // is held to private_key_jwt against its document's key, must not contradict an
 // ID-JAG profile claim (draft §8), and is bound to the ID-JAG's client_id claim.
 // It need not list jwt-bearer: the grant list is its own unauthenticated claim. It then stops at the tenant:
-// ADR 0042 D5 derives the project from the identity the credential maps to
+// ZeroID derives the project from the identity the credential maps to
 // (D6), and no (issuer, client_id) → identity binding exists yet. So the best
 // a CIMD client can reach today is a clean invalid_grant naming the missing
 // binding, which is what the acceptance subtest pins. Each refusal below

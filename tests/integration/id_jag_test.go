@@ -17,7 +17,7 @@ import (
 // service package) so the integration test pins the exact wire value.
 const idJAGTyp = "oauth-id-jag+jwt"
 
-// TestIDJAG_EndToEnd exercises the ADR 0010 MCP Authorization Server leg: an
+// TestIDJAG_EndToEnd exercises the MCP Authorization Server leg: an
 // MCP ID-JAG (typ oauth-id-jag+jwt) presented at POST /oauth2/token via
 // grant_type=jwt-bearer is validated against the corporate IdP's JWKS (the #88
 // substrate), mapped to a Highflame principal, and minted into a ZeroID access
@@ -28,7 +28,7 @@ const idJAGTyp = "oauth-id-jag+jwt"
 // the only difference on the wire is grant_type=jwt-bearer + subject=<ID-JAG>
 // instead of token-exchange + subject_token=<id_token>.
 //
-// Per ADR 0010 D2a/D2b, redemption now also REQUIRES an authenticated
+// Redemption now also REQUIRES an authenticated
 // confidential client whose client_id equals the ID-JAG's client_id claim, and
 // a single-use jti. The harness registers a confidential client (visible to the
 // federation server via the shared DB, since OAuth-client lookup is global) and
@@ -50,7 +50,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 			"user_id": "sub",
 			"email":   "email",
 			// A static issuer's mapping is not validated against reserved
-			// keys; the grant ignores role all the same (ADR 0044 D16).
+			// keys; the grant ignores role all the same.
 			"role": "idp_role",
 		},
 		AllowedAccounts: []string{"acct-fed-001"},
@@ -58,11 +58,11 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 	defer fedHTTPSrv.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	// Confidential client the ID-JAG is bound to (ADR 0010 D2b). Registered on
+	// Confidential client the ID-JAG is bound to. Registered on
 	// the shared testServer; OAuth-client lookup is global, so the federation
 	// server's VerifyClientSecret resolves it from the same DB.
 	//
-	// The client's registration carries the tenant (ADR 0042 D5): it links an
+	// The client's registration carries the tenant: it links an
 	// identity in acct-fed-001/proj-fed-001, and that is where every token from
 	// this harness lands, whether or not the request also names it.
 	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"data:read"})
@@ -120,7 +120,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 			"minted token aud must equal the ID-JAG resource claim")
 
 		// D3 — identity mapping: sub mapped from the ID-JAG sub; email mapped.
-		// The IdP's role claim is never copied (ADR 0044 D16).
+		// The IdP's role claim is never copied.
 		require.Equal(t, "00uMCPAGENT01", claims["sub"])
 		require.Equal(t, "agent@corp.example.com", claims["user_email"])
 		require.NotContains(t, claims, "role")
@@ -166,7 +166,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 			"minted aud must contain every resource in the ID-JAG resource array")
 	})
 
-	// ── RFC 8707 `resource` request parameter (CAP-IDN-026) ──────────────────
+	// ── RFC 8707 `resource` request parameter ──────────────────
 	//
 	// Where an ID-JAG authorizes several servers, the CLIENT — which knows which
 	// one it is about to call — selects at redemption time. Without the
@@ -198,7 +198,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 
 		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
 		// Both claims, not just aud: `aud` is RFC 8707 conformance, but the
-		// `resource` claim is what Shield enforces INV-IDN-006 on. A narrowing
+		// `resource` claim is what Shield enforces resource binding on. A narrowing
 		// that reached only one of them would leave enforcement disagreeing with
 		// the audience.
 		require.ElementsMatch(t, []any{mcpResource2}, claims["aud"],
@@ -263,7 +263,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 	})
 
 	t.Run("omitting the parameter still binds to the whole authorized set", func(t *testing.T) {
-		// The pre-CAP-IDN-026 behaviour every existing ID-JAG caller depends on.
+		// The pre-resource-indicator behaviour every existing ID-JAG caller depends on.
 		now := time.Now()
 		const mcpResource2 = "https://mcp-server-2.idjag.test"
 		idjag := signIDJAG(t, map[string]any{
@@ -363,7 +363,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 		require.Empty(t, resp.AccessToken)
 	})
 
-	// ── ADR 0010 D2a — single-use jti replay rejection ───────────────────────
+	// ── Single-use jti replay rejection ───────────────────────
 
 	t.Run("replay: same jti redeemed twice → 2nd is invalid_grant", func(t *testing.T) {
 		now := time.Now()
@@ -416,7 +416,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 		require.Empty(t, resp.AccessToken)
 	})
 
-	// ── ADR 0010 D2b — confidential client auth + client_id binding ──────────
+	// ── Confidential client auth + client_id binding ──────────
 
 	t.Run("no client auth → invalid_client", func(t *testing.T) {
 		now := time.Now()
@@ -492,7 +492,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 		require.Empty(t, resp.AccessToken)
 	})
 
-	// ── ADR 0042 D5 — the tenant is derived, never supplied (firehog#630) ────
+	// ── The tenant is derived, never supplied ────
 
 	freshIDJAG := func(t *testing.T, c oauthClientResp) string {
 		t.Helper()
@@ -592,7 +592,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 // registerTenantBoundClient registers a confidential OAuth client whose
 // registration carries a tenant: it links (identity_id) an identity created in
 // account/project. oauth_clients has no tenant columns; the linked identity is
-// where the ID-JAG grant derives the tenant from (ADR 0042 D5). The admin API
+// where the ID-JAG grant derives the tenant from. The admin API
 // refuses an identity_id outside the caller's tenant headers, so the link can
 // only be written by that tenant.
 func registerTenantBoundClient(t *testing.T, account, project string, scopes []string) oauthClientResp {
@@ -646,7 +646,7 @@ func TestIDJAG_NHISelfSignedRegression(t *testing.T) {
 // TestIDJAG_ConfigurableScopeClaim proves the ID-JAG path sources scopes from
 // the claim NAME configured in ClaimMapping["scope"] (defaulting to "scope"),
 // so IdPs that emit scopes under a non-standard name — e.g. Microsoft Entra's
-// `scp` — work without code changes (ADR 0010 D3).
+// `scp` — work without code changes.
 func TestIDJAG_ConfigurableScopeClaim(t *testing.T) {
 	upstreamIss := "https://corp-idp-scp.idjag.test"
 	federationAud := "https://zeroid.idjag.test"

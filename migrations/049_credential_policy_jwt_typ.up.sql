@@ -1,6 +1,6 @@
 -- 049_credential_policy_jwt_typ.up.sql
--- Per-policy choice of the access token's JOSE `typ` header (D9 of
--- human-rooted delegation, highflame-authn#239).
+-- Per-policy choice of the access token's JOSE `typ` header (human-rooted
+-- delegation).
 --
 -- Two specs ZeroID follows disagree on this one header, and a token cannot
 -- satisfy both:

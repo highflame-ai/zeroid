@@ -1,5 +1,5 @@
 // Package mockidp is a fake upstream IdP for local end-to-end runs and
-// integration tests of trusted issuers (ADR 0042): an Entra-shaped tenant,
+// integration tests of trusted issuers: an Entra-shaped tenant,
 // an Okta-shaped org and a Kubernetes-shaped cluster issuer, each with its
 // own signing key, plus a mint endpoint for the token shapes ZeroID must
 // accept or refuse. It is a test fixture: it signs whatever it is asked to.

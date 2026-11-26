@@ -257,7 +257,7 @@ zeroid ciba approve ari_... \
   --subject-name "Alice User"
 
 # Highflame AuthN-style deployments with admin routes mounted at the base URL:
-ZID_INTERNAL_SERVICE=highflame-admin \
+ZID_INTERNAL_SERVICE=admin-console \
 ZID_INTERNAL_SERVICE_SECRET=... \
 zeroid ciba approve ari_... --subject-id user@example.com --admin-prefix ""
 ```
@@ -285,7 +285,7 @@ Admin-side helper to deny a pending CIBA request.
 ```bash
 zeroid ciba deny ari_... --reason "user rejected"
 
-ZID_INTERNAL_SERVICE=highflame-admin \
+ZID_INTERNAL_SERVICE=admin-console \
 ZID_INTERNAL_SERVICE_SECRET=... \
 zeroid ciba deny ari_... --reason "user rejected" --admin-prefix ""
 ```

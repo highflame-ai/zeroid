@@ -57,7 +57,7 @@ func exchangeKey(t *testing.T, key, scope string) (int, map[string]any) {
 	return resp.StatusCode, decode(t, resp)
 }
 
-// TestAPIKeyGrant_CarriesKeyID: ADR 0051 D2. The api_key grant names the key
+// TestAPIKeyGrant_CarriesKeyID: the api_key grant names the key
 // it was minted from, for audit.
 func TestAPIKeyGrant_CarriesKeyID(t *testing.T) {
 	status, keyID, key := createProductKey(t, "test-user", nil, false)

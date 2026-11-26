@@ -46,7 +46,8 @@ func signWithTyp(t *testing.T, priv *ecdsa.PrivateKey, kid, typ string, claims m
 // TestIsIDJAGAssertion verifies the typ-branch discriminator: only an assertion
 // whose JWS typ header is exactly oauth-id-jag+jwt routes to the ID-JAG path.
 // Everything else (a JWT typ, no typ, a malformed token) stays on the NHI
-// self-signed path. This is the gate the whole ADR 0010 D2 branch hinges on.
+// self-signed path. This is the gate the whole confidential-client branch
+// hinges on.
 func TestIsIDJAGAssertion(t *testing.T) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -231,7 +232,7 @@ func requireInvalidClient(t *testing.T, err error) {
 // any token mint — so they need only a registry, no DB / CredentialService.
 //
 // Gate order (idJAGBearer): external-issuers configured → issuer lookup → D2b
-// confidential client auth → derived tenant (ADR 0042 D5, deriveIDJAGTenant)
+// confidential client auth → derived tenant (deriveIDJAGTenant)
 // → ID-JAG signature/claim validation → D2b client_id binding → identity
 // mapping → resource (D4) → … → D2a single-use jti (consumed LAST). The
 // UnknownIssuer gate fires BEFORE client auth, so it needs no client; the
@@ -336,7 +337,7 @@ func TestIDJAGBearer_NoTenantFieldsRequired(t *testing.T) {
 // real DB authenticates the client first and then reaches each deeper gate.
 
 // TestRequireCIMDClientFitForIDJAG pins the document-level gates a CIMD
-// client must pass to redeem an ID-JAG (firehog#701).
+// client must pass to redeem an ID-JAG.
 func TestRequireCIMDClientFitForIDJAG(t *testing.T) {
 	fit := func() *domain.OAuthClient {
 		return &domain.OAuthClient{
@@ -352,7 +353,7 @@ func TestRequireCIMDClientFitForIDJAG(t *testing.T) {
 		t.Fatalf("a private_key_jwt document listing jwt-bearer must pass: %v", err)
 	}
 
-	t.Run("auth method none is refused (draft §9.1, ADR 0010 D2b)", func(t *testing.T) {
+	t.Run("auth method none is refused (draft §9.1)", func(t *testing.T) {
 		c := fit()
 		c.TokenEndpointAuthMethod = "none"
 		requireInvalidClient(t, requireCIMDClientFitForIDJAG(c))

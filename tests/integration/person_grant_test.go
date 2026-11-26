@@ -18,7 +18,7 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 )
 
-// The person-grant ceiling (ADR 0041 D15): every grant that mints for a person
+// The person-grant ceiling: every grant that mints for a person
 // issues request ∩ the deployer's ceiling for that person and refuses a
 // request that leaves nothing; token exchange and a CIBA step-up do not
 // consult it. See docs/scope-ceilings.md, "A person's ceiling".

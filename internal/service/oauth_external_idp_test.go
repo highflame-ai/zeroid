@@ -192,7 +192,7 @@ func TestResolvePersonIssuer_OneGenericRefusal(t *testing.T) {
 	}
 }
 
-// TestRequireIDToken is ADR 0042 D3a rule 2: a token from a trusted issuer is
+// TestRequireIDToken is rule 2: a token from a trusted issuer is
 // accepted on the ID-token exchange only when it is positively an ID token.
 func TestRequireIDToken(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

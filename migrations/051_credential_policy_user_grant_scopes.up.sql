@@ -1,5 +1,5 @@
 -- 051_credential_policy_user_grant_scopes.up.sql
--- Split scope ceilings (D10 of human-rooted delegation, highflame-authn#240).
+-- Split scope ceilings (D10 of human-rooted delegation).
 --
 -- One list, allowed_scopes, capped both an agent's own tokens and every token
 -- it held for a person, so an agent registered with [nhi:manage] that asked for

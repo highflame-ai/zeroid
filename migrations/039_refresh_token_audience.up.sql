@@ -5,7 +5,7 @@
 -- The external-principal exchange (used by the trusted `user_session` grant)
 -- can now issue a rotating refresh token for a PROFILED audience (e.g.
 -- "codeoid") so an embedded harness UI keeps its session alive on its own,
--- without the broker (Forge/Studio) re-minting on a timer. When that refresh
+-- without the broker re-minting on a timer. When that refresh
 -- token is later rotated at /oauth2/token, the refreshed access token MUST
 -- carry the same `aud` (and therefore the same server-defined scope profile)
 -- as the original — otherwise codeoid's daemon, which validates `aud=codeoid`

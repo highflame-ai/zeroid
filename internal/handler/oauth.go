@@ -104,12 +104,12 @@ type TokenInput struct {
 		// only on that path AND only for a profiled Audience; ignored otherwise.
 		IssueRefreshToken bool `json:"issue_refresh_token,omitempty" doc:"Also mint a rotating refresh token (trusted external-principal exchange with a profiled audience only)"`
 		// Resource is the RFC 8707 §2 resource indicator: the protected
-		// resource(s) the minted token is bound to (CAP-IDN-026). Accepts a
+		// resource(s) the minted token is bound to. Accepts a
 		// single URI string or an array of them; a form-encoded request may
 		// repeat the parameter. Mutually exclusive with Audience.
 		//
 		// A binding may be established at EITHER the authorization request or
-		// the token request (CAP-IDN-027). `/oauth2/authorize` now validates
+		// the token request. `/oauth2/authorize` now validates
 		// `resource` and records the consented value as the authorization
 		// code's ceiling, so:
 		//
@@ -397,7 +397,7 @@ func isJWTBearerGrant(grantType string) bool {
 // resolved. Silently preferring one would mean accepting a request that
 // presented two different assertions and picking a winner the caller did not
 // choose — the same "two meanings on one channel with no discriminator" shape
-// that produced the resource-binding bug in INV-IDN-006. Identical values are
+// that produced the resource-binding bug. Identical values are
 // allowed: a client migrating from `subject` to `assertion` may reasonably send
 // both during the transition, and that is unambiguous.
 //
@@ -466,7 +466,7 @@ func resolveAssertion(assertion, subject string) (string, error) {
 // lists client_id as an OPTIONAL token-request parameter separate from client
 // authentication. The reference MCP SDK sends exactly this shape — Basic plus a
 // body client_id — so refusing it broke every partner on that SDK before the
-// grant was even read (highflame-firehog#700). When the two identifiers agree
+// grant was even read. When the two identifiers agree
 // there is one credential and one client, so nothing is ambiguous and the
 // request is accepted. When they disagree the request names two clients; that
 // is refused rather than resolved by a precedence rule, for the same reason as
@@ -721,15 +721,15 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 	// exactly the reason this telemetry exists. Warn is also the conventional
 	// level for deprecated-API use.
 	//
-	// KNOWN DOMINANT CALLER: highflame-cerberus MintAgentToken
-	// (internal/admin/token.go) sends `subject` on every code-agent root
-	// session-token mint. Until that migrates, this Warn reads "the alias is
-	// heavily used" when it actually means "cerberus hasn't been migrated yet",
-	// and it will be loud. Migrate cerberus in the window between this shipping
-	// and authn bumping to a release containing it — after that, remaining
-	// volume is genuinely external clients, which is the signal this exists for.
-	// Note the ordering: cerberus MUST NOT switch to `assertion` until the authn
-	// deployment it talks to accepts it, or every agent session mint breaks.
+	// KNOWN CALLER: an embedding service's agent-token mint sends `subject` on
+	// every code-agent root session-token mint. Until that migrates, this Warn
+	// reads "the alias is heavily used" when it actually means "that caller hasn't
+	// been migrated yet", and it will be loud. Migrate that caller in the window
+	// between this shipping and the embedder bumping to a release containing
+	// it — after that, remaining volume is genuinely external clients, which is
+	// the signal this exists for. Note the ordering: that caller MUST NOT switch to
+	// `assertion` until the deployment it talks to accepts it, or every
+	// agent session mint breaks.
 	//
 	// Gated on the jwt-bearer grant for two reasons. It is the only grant that
 	// reads the field, so `subject` on client_credentials is noise, not a legacy

@@ -10,7 +10,7 @@ import (
 
 // ErrIDJAGReplay is returned by IDJAGReplayStore.Insert when the jti is already
 // present (SQLSTATE 23505 on the primary key). An MCP ID-JAG is a single-use
-// authorization grant (ADR 0010 D2a); a second redemption of the same jti is a
+// authorization grant; a second redemption of the same jti is a
 // replay and the caller MUST reject the grant (OAuth invalid_grant).
 //
 // Defined as a package sentinel (not reusing dpop.ErrReplay) so the ID-JAG
@@ -29,7 +29,7 @@ type idJAGJTIRow struct {
 }
 
 // IDJAGReplayStore is the Postgres-backed single-use ledger for redeemed ID-JAG
-// jti values (ADR 0010 D2a). One row per redeemed jti, primary-keyed; a
+// jti values. One row per redeemed jti, primary-keyed; a
 // unique-constraint violation on INSERT is the atomic replay signal.
 //
 // Mirrors DPoPReplayStore verbatim — same single-use replay-table shape. Expired

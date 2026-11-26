@@ -1,7 +1,7 @@
 -- 038: source + source_key on credential_policies (auto-derived policy dedup).
 --
 -- A policy auto-derived at adoption (e.g. the least-privilege scope ceiling admin
--- creates from a discovered agent's IdP-granted scopes, highflame-admin#1257)
+-- creates from a discovered agent's IdP-granted scopes)
 -- needs a stable dedup identity that is NOT its human-facing name, so re-deriving
 -- the same posture reuses one row while the display name stays readable:
 --   source     — provenance, e.g. 'discovery'  (NULL = user-authored policy)

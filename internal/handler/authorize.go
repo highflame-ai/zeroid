@@ -323,7 +323,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The RFC 8707 resource ceiling (CAP-IDN-027). Validated HERE, alongside
+	// The RFC 8707 resource ceiling. Validated HERE, alongside
 	// the other parameters a request can doom itself on, rather than only at
 	// step 6: reaching IssueAuthCode means having passed through the resolver
 	// chain, so a client that sent a malformed identifier would first send its
@@ -602,15 +602,15 @@ func (a *API) redirectToInteractiveLogin(
 		returnTo.Set("scope", req.Scope)
 	}
 
-	// The RFC 8707 consented ceiling MUST survive the login round trip
-	// (CAP-IDN-027). Omitting it was a silent-unbinding bug of exactly the kind
+	// The RFC 8707 consented ceiling MUST survive the login round trip.
+	// Omitting it was a silent-unbinding bug of exactly the kind
 	// this capability exists to close: the pre-login pass validates `resource`
 	// and the resumed pass then sees it absent, so the code is minted with no
 	// `rsc` claim, the access token carries no `resource` claim, and Shield —
-	// which keys INV-IDN-006 on that claim's PRESENCE — honours the token at
-	// every MCP server in the tenant. No error at any step. And because it is
-	// the FIRST browser visit that bounces through login, that was the common
-	// path, not an edge case.
+	// which keys resource-binding enforcement on that claim's PRESENCE — honours
+	// the token at every MCP server in the tenant. No error at any step. And
+	// because it is the FIRST browser visit that bounces through login, that was
+	// the common path, not an edge case.
 	//
 	// Added with Add rather than Set: RFC 8707 §2 permits the parameter to
 	// repeat, and req.Resource holds the validated, de-duplicated ceiling

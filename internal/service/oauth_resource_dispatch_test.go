@@ -48,7 +48,7 @@ func TestTokenGate_SupportedGrantsPassTheGate(t *testing.T) {
 		"urn:ietf:params:oauth:grant-type:token-exchange",
 		"authorization_code",
 		// refresh_token moved here from the unsupported list above with
-		// CAP-IDN-027. It now SELECTS from the ceiling recorded on the refresh
+		// the resource ceiling. It now SELECTS from the ceiling recorded on the refresh
 		// family rather than being refused outright; the narrows-only property
 		// that used to be enforced by exclusion is enforced by
 		// resolveRefreshResources instead, and pinned in

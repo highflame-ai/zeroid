@@ -176,7 +176,7 @@ describe("zeroid ciba approve", () => {
       "--admin-prefix",
       "",
       "--internal-service",
-      "highflame-admin",
+      "admin-console",
       "--internal-service-secret",
       "dev-secret",
     ]);
@@ -184,7 +184,7 @@ describe("zeroid ciba approve", () => {
     expect(exitCode).toBeUndefined();
     expect(accountHeader).toBe("acct_test");
     expect(projectHeader).toBe("proj_test");
-    expect(internalServiceHeader).toBe("highflame-admin");
+    expect(internalServiceHeader).toBe("admin-console");
     expect(internalSecretHeader).toBe("dev-secret");
     expect(captured["subject_id"]).toBe("user@example.com");
     expect(stdout.join("")).toMatch(/approved/i);
@@ -244,7 +244,7 @@ describe("zeroid ciba deny", () => {
       ],
       {
         ZID_ADMIN_PREFIX: "",
-        ZID_INTERNAL_SERVICE: "highflame-admin",
+        ZID_INTERNAL_SERVICE: "admin-console",
         ZID_INTERNAL_SERVICE_SECRET: "dev-secret",
       },
     );
@@ -252,7 +252,7 @@ describe("zeroid ciba deny", () => {
     expect(exitCode).toBeUndefined();
     expect(accountHeader).toBe("acct_test");
     expect(projectHeader).toBe("proj_test");
-    expect(internalServiceHeader).toBe("highflame-admin");
+    expect(internalServiceHeader).toBe("admin-console");
     expect(internalSecretHeader).toBe("dev-secret");
     expect(stdout.join("")).toMatch(/denied/i);
   });

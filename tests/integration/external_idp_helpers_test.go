@@ -73,7 +73,7 @@ func jwsHeadersForKID(kid string) (jws.Headers, error) {
 
 // jwsHeadersForKIDTyp is jwsHeadersForKID with an explicit typ — used to mint
 // MCP ID-JAG assertions (typ: oauth-id-jag+jwt) whose protected header drives
-// the ZeroID jwt-bearer typ-branch (ADR 0010 D2).
+// the ZeroID jwt-bearer typ-branch.
 func jwsHeadersForKIDTyp(kid, typ string) (jws.Headers, error) {
 	hdr := jws.NewHeaders()
 	if err := hdr.Set(jws.KeyIDKey, kid); err != nil {
@@ -136,7 +136,7 @@ var rpClients sync.Map
 // with this aud was issued to. Since D13 only that client, authenticated, may
 // redeem the token. Its client_id is the audience, as at a real IdP, where an ID
 // token's aud is the relying party's client_id. It authenticates with
-// private_key_jwt, the only method the exchange accepts (ADR 0042 D3a).
+// private_key_jwt, the only method the exchange accepts.
 // Registered once per audience; safe across tests because no integration test
 // calls t.Parallel().
 func rpClient(t *testing.T, aud string) oauthClientResp {

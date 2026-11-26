@@ -472,8 +472,8 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// fail on an unreachable issuer, to survive transient IdP outages during
 	// deploy); an issuer that never loads fails closed at token-exchange time.
 	//
-	// federation.issuer_store=db reads per-account rows live instead (ADR 0042
-	// D4); Validate() has already refused it alongside static entries.
+	// federation.issuer_store=db reads per-account rows live instead;
+	// Validate() has already refused it alongside static entries.
 	externalIssuerRepo := postgres.NewExternalIssuerRepository(db)
 	issuerStore := service.IssuerStore(cfg.Federation.IssuerStore)
 	if issuerStore == "" {
@@ -506,7 +506,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		log.Info().Int("count", len(cfg.ExternalIssuers)).Msg("Direct OIDC IdP federation enabled")
 	}
 
-	// ID-JAG single-use replay store (ADR 0010 D2a). Wired unconditionally — the
+	// ID-JAG single-use replay store. Wired unconditionally — the
 	// idJAGBearer path consumes the ID-JAG jti against this store as its final
 	// gate, and ID-JAG redemption is only reachable when external issuers are
 	// configured anyway. Wiring it always (not only when ExternalIssuers is
@@ -592,7 +592,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// Verifier logic lives in pkg/dpop (the public OSS primitive); the
 	// Postgres-backed ReplayStore impl lives in internal/store/postgres so
 	// pkg/dpop stays bun-free for downstream consumers that bring their own
-	// storage (Cerberus, Shield, Firehog).
+	// storage (downstream services).
 	dpopVerifier, err := dpop.NewVerifier(dpop.Config{
 		Store: postgres.NewDPoPReplayStore(db),
 	})
@@ -849,7 +849,7 @@ func (s *Server) Start() error {
 		// moved from /api/v1 to the router root (PR #318) a network rule that
 		// matched /api/v1/* no longer covers it. Say so loudly on every start
 		// of a root-mounted deployment that has NOT installed an AdminAuth
-		// hook — embedders such as highflame-authn mount at the root by
+		// hook — embedders that mount at the root by
 		// design and gate the admin group themselves, so for them the warning
 		// would be noise. (Config loading materializes the default into
 		// AdminPathPrefix, so test the effective value; the hook is checked
@@ -1137,8 +1137,8 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // Rendering and CSRF-protecting the consent screen itself remains yours.
 // Server.Use middleware is the other option if you want to own the whole
 // interaction, including the 302, before the handler runs; it chains, so
-// it composes with whatever you already registered. See docs/cimd.md and
-// highflame-authn#157 for a worked example.
+// it composes with whatever you already registered. See docs/cimd.md for a
+// worked example.
 //
 // Header-based resolvers (api_key, mTLS, a signed assertion) do not have
 // this exposure: a browser cannot set a custom header on a top-level
@@ -1582,19 +1582,19 @@ func (s *Server) RegisterAuthorizationDetailValidator(typ string, fn Authorizati
 
 // SetFederatedPersonResolver installs the hook that resolves the person in
 // an IdP token to the deployer's user on ID-JAG redemption and the ID-token
-// exchange (ADR 0042 D5a). It runs before any single-use credential is
+// exchange. It runs before any single-use credential is
 // consumed. nil removes it: static issuers then keep the IdP subject as sub,
 // and issuer rows refuse to mint. Safe to call at any time.
 func (s *Server) SetFederatedPersonResolver(fn FederatedPersonResolver) {
 	s.oauthSvc.SetFederatedPersonResolver(fn)
 }
 
-// SetPersonGrantResolver installs the deployer's person-grant hook (ADR 0041
-// D15 in Highflame's deployment). Every token minted for a person is then
-// bounded by the ceiling fn returns: in enforce mode the issued scope is the
-// request (or its default) ∩ the ceiling and a request that leaves nothing is
-// refused; in shadow mode issuance is unchanged and each narrowing, refusal or
-// resolver failure is logged as person_scope_ceiling_violation and counted in
+// SetPersonGrantResolver installs the deployer's person-grant hook. Every token
+// minted for a person is then bounded by the ceiling fn returns: in enforce
+// mode the issued scope is the request (or its default) ∩ the ceiling and a
+// request that leaves nothing is refused; in shadow mode issuance is unchanged
+// and each narrowing, refusal or resolver failure is logged as
+// person_scope_ceiling_violation and counted in
 // zeroid_person_scope_ceiling_total. In both modes the returned roles are
 // stamped as the `roles` claim on the person's own token. PersonGrantModeOff
 // removes the hook (fn is ignored). A nil fn with shadow or enforce, an empty

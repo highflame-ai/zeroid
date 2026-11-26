@@ -29,7 +29,7 @@ const MaxExternalIssuersPerAccount = 20
 const maxJWKSProbeBytes = 1 << 20
 
 // IssuerStore says where trusted issuers come from: static configuration
-// (standalone) or account rows (ADR 0042 D4).
+// (standalone) or account rows.
 type IssuerStore string
 
 const (
@@ -93,7 +93,7 @@ type ExternalIssuerServiceConfig struct {
 }
 
 // ExternalIssuerService manages trusted issuers and bindings for the admin
-// API (ADR 0042 D4, D4a, D6).
+// API.
 type ExternalIssuerService struct {
 	repo           *postgres.ExternalIssuerRepository
 	identityLookup linkedIdentityLookup
@@ -184,7 +184,7 @@ type IssuerPatch struct {
 }
 
 // Create adds a trusted issuer to accountID. The JWKS must be reachable and
-// non-empty. Uniqueness (ADR 0042 D4) is checked under a per-issuer lock.
+// non-empty. Uniqueness is checked under a per-issuer lock.
 func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor string, in IssuerInput) (*domain.ExternalIssuer, *JWKSCheck, error) {
 	if err := s.requireDB(); err != nil {
 		return nil, nil, err
@@ -243,7 +243,7 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 
 	// The keys come from the issuer's own discovery document, never from the
 	// caller: a caller-chosen key set would let an admin sign tokens for any
-	// person their IdP's issuer names (ADR 0042 D4).
+	// person their IdP's issuer names.
 	doc, err := s.discover(ctx, row.Issuer)
 	if err != nil {
 		return nil, nil, err
@@ -295,7 +295,7 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 
 // warnWorkloadIssuerConflict logs a refused workload issuer: the first
 // account to add an issuer holds it, so a 409 here can be a rightful customer
-// blocked by a squatter's row (ADR 0042 open question 8), which an operator
+// blocked by a squatter's row, which an operator
 // resolves. The other account is not named; operators find it by issuer.
 func warnWorkloadIssuerConflict(row *domain.ExternalIssuer, accountID, actor string) {
 	if row.Kind != domain.IssuerKindWorkload {
@@ -305,8 +305,8 @@ func warnWorkloadIssuerConflict(row *domain.ExternalIssuer, accountID, actor str
 		Str("reason", "issuer_already_trusted").Msg("workload issuer refused: already trusted by an account")
 }
 
-// uniquenessConflict applies ADR 0042 D4 to a candidate row against the rows
-// already stored for its issuer, compared canonically (other than itself).
+// uniquenessConflict applies the one-source rule to a candidate row against the
+// rows already stored for its issuer, compared canonically (other than itself).
 // pin is the shared-issuer list's pinning claim, "" for a customer-unique
 // issuer.
 //
@@ -546,7 +546,7 @@ func applyIssuerPatch(r *domain.ExternalIssuer, p IssuerPatch) {
 }
 
 // Delete removes an issuer and its bindings. New mints stop at once; tokens
-// already issued live out their 15 minutes (ADR 0042 open question 6).
+// already issued live out their 15 minutes.
 func (s *ExternalIssuerService) Delete(ctx context.Context, accountID, id, actor string) error {
 	if err := s.requireDB(); err != nil {
 		return err
@@ -759,7 +759,7 @@ func signingKey(key jwk.Key) bool {
 
 // ── Bindings ─────────────────────────────────────────────────────────────────
 
-// BindingInput is a create request for a credential binding (ADR 0042 D6).
+// BindingInput is a create request for a credential binding.
 type BindingInput struct {
 	SubjectKey string
 	IdentityID string

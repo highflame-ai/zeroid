@@ -85,7 +85,7 @@ type RefreshTokenParams struct {
 	// (non-audience) refresh token whose rotation carries no `aud`.
 	Audience string
 	// Resources is the RFC 8707 resource CEILING this refresh token was issued
-	// for (CAP-IDN-027). Persisted on the family so every rotation re-stamps
+	// for. Persisted on the family so every rotation re-stamps
 	// the same binding on the successor access token. Empty ⇒ an unbound
 	// refresh token whose rotation carries no `resource` claim.
 	Resources []string
@@ -291,14 +291,14 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 			// the second rotation, and the harness daemon would reject the token.
 			Audience: c.Audience,
 			// Carry the RFC 8707 resource ceiling forward, for the same reason and
-			// with a worse failure mode (CAP-IDN-027). Lose it here and the
+			// with a worse failure mode. Lose it here and the
 			// binding survives the first refresh but vanishes on the second — and
 			// an access token with no `resource` claim is not rejected, it is
-			// honoured EVERYWHERE: INV-IDN-006 keys on the claim's presence and
-			// passes the request through untouched when it is absent. So the
-			// symptom of dropping this line is not a broken session but a silent
-			// loss of enforcement. TestResourceCeiling_SurvivesTwoRotations
-			// rotates twice to pin exactly this.
+			// honoured EVERYWHERE: resource-binding enforcement keys on the claim's
+			// presence and passes the request through untouched when it is absent. So
+			// the symptom of dropping this line is not a broken session but a silent
+			// loss of enforcement. TestResourceCeiling_SurvivesTwoRotations rotates
+			// twice to pin exactly this.
 			Resources: c.Resources,
 			// Carry the principal's issuer forward. Lose it and the family
 			// drops out of per-user revocation after its first rotation,

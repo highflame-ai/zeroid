@@ -13,7 +13,7 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 )
 
-// Issuer ownership proof (ADR 0042 open question 8, for person issuers): the
+// Issuer ownership proof (for person issuers): the
 // deployer has the account's owner sign in through a person issuer and asks
 // ZeroID to verify the resulting ID token under the row. These two routes
 // are the ZeroID half; the deployer decides what a verified sign-in proves.

@@ -189,7 +189,7 @@ var cimdAllowedAuthMethods = map[string]bool{
 // spend it, and there it also needs an assertion the enterprise IdP signed
 // naming this exact client_id, private_key_jwt client authentication against
 // the document's own key, and a tenant derived from an (issuer, client_id) →
-// identity binding (ADR 0042 D6). That binding does not exist yet, so today the
+// identity binding. That binding does not exist yet, so today the
 // tenant derivation refuses every CIMD client outright (cimdClientTenant). The
 // NHI self-signed jwt-bearer path never reads a client at all.
 //

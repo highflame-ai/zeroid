@@ -144,7 +144,7 @@ func TestDBRegistry_SharedIssuerConstraints(t *testing.T) {
 	}
 }
 
-// ResolveWorkload is the federated client assertion's lookup (ADR 0042 D8):
+// ResolveWorkload is the federated client assertion's lookup:
 // workload rows only, enabled, database mode only.
 func TestDBRegistry_ResolveWorkload(t *testing.T) {
 	jwksSrv := newFakeJWKSServer(t, "k1")

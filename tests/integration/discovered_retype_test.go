@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestDiscoveredRetype_ApplicationToMCPServer pins the CAP-DSC-003 fix: a
+// TestDiscoveredRetype_ApplicationToMCPServer pins the discovered-retype fix: a
 // still-discovered application is re-typed to mcp_server on a later sync (its
 // identity_type was previously frozen at first ingestion), and the WIMSE URI —
 // which embeds identity_type as a path segment — is rebuilt in lockstep so

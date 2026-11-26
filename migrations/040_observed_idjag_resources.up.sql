@@ -3,7 +3,7 @@
 --
 -- Every successful ID-JAG exchange carries an RFC 8707 `resource` claim naming
 -- the MCP server the corporate IdP authorized, and we mint a token
--- audience-restricted to exactly that value (ADR 0010 D4). Until now we parsed
+-- audience-restricted to exactly that value. Until now we parsed
 -- it, used it, and discarded it — so the one authoritative record of which MCP
 -- servers an organization's agents actually reach existed only in flight.
 --

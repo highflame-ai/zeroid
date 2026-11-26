@@ -138,11 +138,12 @@ func TestGetIdentitySchema_DiscoveryAdditions(t *testing.T) {
 }
 
 // TestCanRetypeDiscovered pins the re-typing rule: a connector re-sync may
-// re-classify a still-`discovered` row to (newType, newSub) — the CAP-DSC-003
-// fix for identities imported before the classifier could type them — but must
-// never touch an adopted row or accept an invalid (identity_type, sub_type) pair.
-// The 4th arg is the connector's INCOMING sub_type (adopted alongside the type),
-// not the stored one — see the agent→mcp_server case.
+// re-classify a still-`discovered` row to (newType, newSub) — the
+// discovered-retype fix for identities imported before the classifier could
+// type them — but must never touch an adopted row or accept an invalid
+// (identity_type, sub_type) pair. The 4th arg is the connector's INCOMING
+// sub_type (adopted alongside the type), not the stored one — see the
+// agent→mcp_server case.
 func TestCanRetypeDiscovered(t *testing.T) {
 	tests := []struct {
 		name    string

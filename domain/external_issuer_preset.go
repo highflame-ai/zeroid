@@ -93,7 +93,7 @@ func applyOktaPreset(e *ExternalIssuer) error {
 
 // IdentityMappingKeys decide who a token's person is: the user key, and the
 // email and its verification that first-sight linking trusts. They are
-// fixed at create (ADR 0042 D5a).
+// fixed at create.
 var IdentityMappingKeys = []string{"user_id", "email", "email_verified"}
 
 // pinMapping sets keys a preset fixes, refusing a request that names

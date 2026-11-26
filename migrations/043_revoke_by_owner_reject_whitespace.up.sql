@@ -3,10 +3,10 @@
 -- padded p_owner_user_id passes 042's `= ''` check but matches NO stored row
 -- (ownerless identities store exactly ''; VARCHAR equality is exact, no
 -- CHAR-style pad semantics), so the cascade "succeeds" with zero revocations.
--- For the intended caller — the SCIM offboarding fan-out (INV-IDN-010 /
--- ADR 0028) — that is the worst failure mode: the worker records a successful
--- offboarding while the departing human's agents keep running with live
--- credentials. A malformed owner must fail loudly, not read as healthy.
+-- For the intended caller — the SCIM offboarding fan-out — that is the worst
+-- failure mode: the worker records a successful offboarding while the departing
+-- human's agents keep running with live credentials. A malformed owner must
+-- fail loudly, not read as healthy.
 --
 -- Mirrors the trim-aware service guards (OffboardOwner,
 -- RevokeAllActiveForOwner) in SQL so the guarantee survives a caller that goes

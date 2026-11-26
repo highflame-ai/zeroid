@@ -159,7 +159,7 @@ func credentialIDForJTI(t *testing.T, identityID, jti string) string {
 // TestRevocationNotifier_FiresOnCredentialRevokeCascade verifies the admin
 // POST /credentials/{id}/revoke path fires exactly one RevocationEvent per
 // revoked JTI across a delegation tree. This is the exact path in
-// highflame-authn#138: revoking a ROOT credential must cascade to its
+// Revoking a ROOT credential must cascade to its
 // token-exchange descendant and emit an event for BOTH jtis, so Shield's
 // deny-set drops the whole subtree rather than just the root. The sibling
 // TestRevocationNotifier_FiresOncePerJTIOnCascade covers the CAE-signal
@@ -203,7 +203,7 @@ func TestRevocationNotifier_FiresOnCredentialRevokeCascade(t *testing.T) {
 	// issued_credentials id, not the jti.
 	rootCredID := credentialIDForJTI(t, rootIdentityID, rootJTI)
 
-	// The exact call in authn#138: operator revokes the root credential.
+	// The exact call: operator revokes the root credential.
 	revokeResp := post(t, adminPath("/credentials/"+rootCredID+"/revoke"),
 		map[string]any{"reason": "cred_revoke_cascade_test"}, adminHeaders())
 	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
@@ -213,7 +213,7 @@ func TestRevocationNotifier_FiresOnCredentialRevokeCascade(t *testing.T) {
 	rootEvents := revocationCapture.forJTI(rootJTI)
 	subEvents := revocationCapture.forJTI(subJTI)
 	require.Len(t, rootEvents, 1, "root JTI must fire exactly one event on admin credential-revoke")
-	require.Len(t, subEvents, 1, "cascaded descendant JTI must fire — the deny-set must drop the whole subtree (authn#138)")
+	require.Len(t, subEvents, 1, "cascaded descendant JTI must fire — the deny-set must drop the whole subtree")
 
 	for _, e := range append(rootEvents, subEvents...) {
 		assert.Equal(t, testAccountID, e.AccountID)

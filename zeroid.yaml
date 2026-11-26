@@ -346,7 +346,7 @@ cimd:
 #     propagate_claims: ["auth_time", "acr", "amr"]
 #     allow_private_endpoints: false  # true ONLY for an internal/VPN IdP or localhost dev — relaxes the SSRF guard on the jwks_uri fetch
 
-# Where trusted issuers come from (ADR 0042 D4). "config" reads the static
+# Where trusted issuers come from. "config" reads the static
 # external_issuers list above (standalone ZeroID). "db" reads per-account rows
 # managed through the admin API (/external-issuers); it refuses to start when
 # external_issuers is also set. See docs/external-issuers.md.
