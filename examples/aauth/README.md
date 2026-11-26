@@ -265,10 +265,41 @@ cd examples/aauth
 GOWORK=off go test ./interop -v
 ```
 
-It checks that aauth-go's client can enroll at ZeroID, that an aauth-go
-resource accepts ZeroID's agent tokens, that the bridged OAuth token works
-only with the agent's key and stops working when the agent is revoked, and
-that a stolen platform token is refused.
+It checks, using aauth-go's own code on the other side of every exchange:
+
+- **Enrollment:** aauth-go's client enrolls at ZeroID, and an aauth-go
+  resource accepts the agent token.
+- **The OAuth bridge:** the bridged token works only with the agent's key,
+  and stops working when the agent is revoked.
+- **Sub-agents:** aauth-go's client gets a sub-agent token, and an aauth-go
+  resource accepts the sub-agent.
+- **Refresh:** aauth-go's two-key refresh gets a token for a fresh key.
+- **Revocation:** revoking an agent at ZeroID revokes it at aauth-go's
+  person server.
+- **Theft:** a stolen platform token is refused.
+
+## The full Agent Provider
+
+The demo uses enrollment and the OAuth bridge. ZeroID implements the rest of
+the AAuth Agent Provider role too. Each feature is switched on per agent, in
+the agent's credential policy.
+
+| Feature | Endpoint | Turn it on by | What it does |
+| --- | --- | --- | --- |
+| Enrollment | `POST /ap/token` | listing `aauth_agent` in `allowed_grant_types` | Trades a platform token, in a request signed by the agent's key, for an agent token bound to that key |
+| Refresh | `POST /ap/refresh` | also listing `aauth_refresh` | Lets an enrolled key move its identity to a fresh key without a new platform token, for up to 8 hours. Every refresh re-checks the issuer, the binding and the agent's status |
+| Sub-agents | `POST /ap/subagent` | also listing `aauth_subagent` | Lets an agent get tokens for helper agents with keys of their own. They never outlive the parent, can't have sub-agents of their own, and are revoked with it |
+| Person server | none | setting `aauth_person_server` | Puts the agent's person server in its tokens (the `ps` claim), and revokes the agent there whenever ZeroID revokes it |
+| OAuth bridge | `POST /oauth2/token` | also listing `aauth_bridge` | Exchanges an agent token for a DPoP-bound OAuth token for one resource |
+
+ZeroID publishes `/.well-known/aauth-agent.json` and its signing keys. It
+answers every error in the AAuth format, signature failures included, and
+limits each agent's requests (`aauth.requests_per_minute`, default 60).
+
+It implements the Agent Provider requirements of the AAuth protocol
+(`draft-hardt-oauth-aauth-protocol-11`) and works with aauth-go, the
+reference implementation. AAuth events and deferred (`202`) responses from
+the Agent Provider are not supported.
 
 ## What's running
 
