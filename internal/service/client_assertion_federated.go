@@ -216,13 +216,13 @@ func (s *OAuthService) mintFederatedClientCredentials(
 	// the same reason, and grantScopes would otherwise grant whatever the
 	// request names, nhi:manage included (highflame-authn#317).
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
-	if len(policyScopes) == 0 && len(rowScopes) == 0 {
+	if len(policyScopes) == 0 && !identity.ScopeCeilingRestricts() {
 		return nil, oauthBadRequest(oautherror.InvalidScope,
 			"the agent has no scope limit: set allowed_scopes on its identity or credential policy")
 	}
 	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
-	trace.ceiling(ceilingIdentityScopes, rowScopes)
-	scopes, err := grantScopes(req.Scope, policyScopes, rowScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
+	scopes, err := grantIdentityScopes(req.Scope, identity, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err
 	}

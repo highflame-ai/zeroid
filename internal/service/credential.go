@@ -556,7 +556,7 @@ func (s *CredentialService) recordUnboundedScope(ctx context.Context, req IssueR
 		root = "workload"
 	case req.RequestBoundedRoot && principal.Type == domain.PrincipalUser:
 		// An enforced person-grant ceiling bounds the root (ADR 0041 D15).
-		bounded := len(req.Identity.AllowedScopes) > 0 || (req.personGrant != nil && req.personGrant.enforced)
+		bounded := req.Identity.ScopeCeilingRestricts() || (req.personGrant != nil && req.personGrant.enforced)
 		if identityPolicy != nil {
 			bounded = bounded || len(identityPolicy.AllowedScopes) > 0 || len(identityPolicy.UserGrantScopes) > 0
 		}
@@ -855,15 +855,17 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// chain acting for a person) only narrow within it. The grants narrow to it
 	// first (grantScopes); this re-check is the chokepoint, and covers the
 	// grants that take their scopes from a person's grant rather than computing
-	// them. See docs/scope-ceilings.md.
-	if len(req.Identity.AllowedScopes) > 0 && len(req.Scopes) > 0 {
+	// them. See docs/scope-ceilings.md. An identity registered by another
+	// identity is restricted by its list even when the list is empty, which
+	// then admits no scope (domain.Identity.ScopeCeilingRestricts).
+	if req.Identity.ScopeCeilingRestricts() && len(req.Scopes) > 0 {
 		allowed := make(map[string]bool, len(req.Identity.AllowedScopes))
 		for _, s := range req.Identity.AllowedScopes {
 			allowed[s] = true
 		}
 		for _, requested := range req.Scopes {
 			if !allowed[requested] {
-				trace.ceiling(ceilingIdentityScopes, req.Identity.AllowedScopes)
+				trace.identityCeiling(ceilingIdentityScopes, req.Identity)
 				return nil, nil, fmt.Errorf("%w: %q not in allowed_scopes", ErrScopesNotAllowed, requested)
 			}
 		}

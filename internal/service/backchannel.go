@@ -1085,14 +1085,16 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 				}
 			}
 		}
-		if len(bound.AllowedScopes) > 0 {
+		// The bound identity's own list restricts even when empty on an
+		// identity registered by another identity, admitting no scope.
+		if bound.ScopeCeilingRestricts() {
 			allowed := make(map[string]bool, len(bound.AllowedScopes))
 			for _, sc := range bound.AllowedScopes {
 				allowed[sc] = true
 			}
 			for _, sc := range requested {
 				if !allowed[sc] {
-					trace.ceiling(ceilingBoundScopes, bound.AllowedScopes)
+					trace.identityCeiling(ceilingBoundScopes, bound)
 					return nil, oauthBadRequest(oautherror.InvalidScope,
 						fmt.Sprintf("scope %q is not in the bound identity's allowed_scopes", sc))
 				}

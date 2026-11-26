@@ -235,7 +235,7 @@ func (b *treeBound) layers() ceilingLayers {
 	if b.policy != nil && b.policy != b.identityPolicy {
 		policies = append(policies, b.policy)
 	}
-	return ceilingLayers{rowScopes: b.identity.AllowedScopes, policies: policies}
+	return ceilingLayers{rowScopes: b.identity.AllowedScopes, rowNone: b.identity.ListsNoScope(), policies: policies}
 }
 
 // policies returns the distinct credential policies a child is held to.
@@ -538,7 +538,8 @@ func childCreatedBy(parent *domain.Identity) string {
 
 // inheritedScopes is the allowed_scopes of a child that names none: the
 // scopes the bound's own ceiling and the token both allow, without reserved
-// scopes, sorted. Empty means the child could hold no scope.
+// scopes, sorted. Empty means the child holds no scope, which a child's empty
+// allowed_scopes says (domain.Identity.ListsNoScope).
 func (s *IdentityService) inheritedScopes(b *treeBound) []string {
 	own := b.layers().own()
 	out := make([]string, 0, len(b.tokenScopes))
@@ -832,13 +833,21 @@ func (b scopeBound) excess(child scopeBound) (scope string, open bool) {
 // key's, when that names a narrower one).
 type ceilingLayers struct {
 	rowScopes []string
-	policies  []*domain.CredentialPolicy
+	// rowNone says rowScopes is empty on an identity registered by another
+	// identity, where it lists no scope rather than placing no restriction
+	// (domain.Identity.ListsNoScope): the layers then allow nothing.
+	rowNone  bool
+	policies []*domain.CredentialPolicy
 }
 
-// childLayers is the layers of an identity on one policy.
+// childLayers is the layers of an identity registered by another identity,
+// on one policy. Its empty rowScopes lists no scope.
 func childLayers(rowScopes []string, policy *domain.CredentialPolicy) ceilingLayers {
-	return ceilingLayers{rowScopes: rowScopes, policies: []*domain.CredentialPolicy{policy}}
+	return ceilingLayers{rowScopes: rowScopes, rowNone: len(rowScopes) == 0, policies: []*domain.CredentialPolicy{policy}}
 }
+
+// noScopeBound is the bound of layers that allow no scope.
+var noScopeBound = scopeBound{restricted: true, scopes: map[string]bool{}}
 
 // policy is the first policy, the one a child is on.
 func (l ceilingLayers) policy() *domain.CredentialPolicy {
@@ -851,6 +860,9 @@ func (l ceilingLayers) policy() *domain.CredentialPolicy {
 // own is the ceiling on the identity's own authority: allowed_scopes and each
 // policy's allowed_scopes.
 func (l ceilingLayers) own() scopeBound {
+	if l.rowNone {
+		return noScopeBound
+	}
 	layers := [][]string{l.rowScopes}
 	for _, p := range l.policies {
 		if p != nil {
@@ -864,6 +876,9 @@ func (l ceilingLayers) own() scopeBound {
 // each policy's user_grant_scopes takes the place of its allowed_scopes and
 // allowed_scopes still binds (docs/scope-ceilings.md).
 func (l ceilingLayers) forPerson() scopeBound {
+	if l.rowNone {
+		return noScopeBound
+	}
 	layers := [][]string{l.rowScopes}
 	for _, p := range l.policies {
 		if p != nil {
@@ -897,7 +912,9 @@ func ceilingError(format string, args ...any) error {
 // restricting layers, so the decisive check compares those intersections,
 // in both forms: the identity's own authority, and what it may hold for a
 // person. A child left open while its parent is restricted fails it, which is
-// how an empty layer (no restriction) is kept from letting a child escape.
+// how an empty layer (no restriction) is kept from letting a child escape. A
+// child's own empty allowed_scopes is not such a layer: it lists no scope, so
+// a child with one is within any parent.
 //
 // A layer the request named is also checked on its own, so the error names
 // what the caller asked for: every scope on a named allowed_scopes, and on a

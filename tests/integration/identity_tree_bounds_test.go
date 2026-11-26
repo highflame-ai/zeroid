@@ -97,8 +97,8 @@ func TestIdentityTree_BoundByPresentedCredential(t *testing.T) {
 	assert.Contains(t, treeDetail(t, raw), "data:write")
 	assert.Equal(t, []string{"data:read"}, mustTreeIdentity(t, narrow, map[string]any{}).AllowedScopes,
 		"a child naming none takes what the parent and its token both hold")
-	status, raw = postTreeIdentity(t, tn.asWith(parent.ID), map[string]any{})
-	assert.Equal(t, http.StatusBadRequest, status, "a token with no scopes lets the child hold none: %s", raw)
+	assert.Empty(t, mustTreeIdentity(t, tn.asWith(parent.ID), map[string]any{}).AllowedScopes,
+		"a token with no scopes registers a child that holds none")
 
 	reserved := tn.asWith(parent.ID, "data:read", testReservedPrefix+"admin")
 	open := mustTreeIdentity(t, tn.headers(), map[string]any{})

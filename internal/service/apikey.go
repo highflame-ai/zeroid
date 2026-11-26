@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -34,6 +35,12 @@ var ErrIdentityLinkRequired = errors.New("identity_id or product is required")
 // checked as one string here but read as two wherever the space-delimited
 // `scope` claim is split. Handlers map it to 400.
 var ErrScopeHasWhitespace = errors.New("a scope must not contain whitespace")
+
+// ErrKeyScopeOutsideIdentityCeiling is returned by CreateKey for a scope that
+// the key's identity, registered by another identity, does not list in its
+// allowed_scopes. Such an identity's empty list lists no scope, so a key for
+// it can carry none. Handlers map it to 400.
+var ErrKeyScopeOutsideIdentityCeiling = errors.New("the identity's allowed_scopes does not list the key's scope")
 
 // APIKeyService handles CRUD operations for API keys (zid_sk_* keys).
 type APIKeyService struct {
@@ -143,6 +150,17 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	// channel's ceiling, needs a trusted caller (approval_channel_write.go).
 	if err := s.identitySvc.RequireTrustedCredentialWrite(ctx, identity); err != nil {
 		return nil, err
+	}
+	// A key for an identity registered by another identity carries only
+	// scopes that identity lists: its allowed_scopes always restricts, and
+	// when empty lists none (domain.Identity.ScopeCeilingRestricts). Any
+	// other identity's keys are checked at issuance only, as before.
+	if identity.ParentIdentityID != "" {
+		for _, sc := range req.Scopes {
+			if !slices.Contains(identity.AllowedScopes, sc) {
+				return nil, fmt.Errorf("%w: %q", ErrKeyScopeOutsideIdentityCeiling, sc)
+			}
+		}
 	}
 
 	// Ensure the key has a credential policy.

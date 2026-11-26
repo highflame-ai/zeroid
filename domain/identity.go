@@ -509,8 +509,10 @@ type Identity struct {
 	// AllowedScopes is the identity's absolute scope ceiling, the equivalent
 	// of RFC 7591 client `scope` metadata: no token for this identity carries
 	// a scope outside it. Credential policies are reusable bundles that narrow
-	// within it. Empty means no ceiling from this layer. See
-	// docs/scope-ceilings.md.
+	// within it. Empty means no ceiling from this layer, except on an identity
+	// registered by another identity (ParentIdentityID set), where empty means
+	// it holds no scope (ScopeCeilingRestricts). See docs/scope-ceilings.md and
+	// docs/identity-tree.md.
 	OwnerUserID        string   `bun:"owner_user_id,type:varchar(255)" json:"owner_user_id"`
 	CredentialPolicyID string   `bun:"credential_policy_id,type:uuid,nullzero" json:"credential_policy_id,omitempty"`
 	AllowedScopes      []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // The identity's absolute scope ceiling; see above.
@@ -569,6 +571,23 @@ type Identity struct {
 	ModifiedBy string    `bun:"modified_by,type:varchar(255)"  json:"modified_by,omitempty"`
 	CreatedAt  time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
 	UpdatedAt  time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+}
+
+// ScopeCeilingRestricts reports whether AllowedScopes restricts the scopes a
+// token for the identity may carry. A non-empty list always does. An empty
+// list restricts to nothing on an identity registered by another identity
+// (ParentIdentityID set): such an identity holds no scope until one is listed,
+// so a parent whose token holds no scope can still register it. On any other
+// identity an empty list places no restriction.
+func (i *Identity) ScopeCeilingRestricts() bool {
+	return i != nil && (len(i.AllowedScopes) > 0 || i.ParentIdentityID != "")
+}
+
+// ListsNoScope reports whether the identity's own ceiling restricts it to no
+// scope at all: an identity registered by another identity whose
+// AllowedScopes is empty.
+func (i *Identity) ListsNoScope() bool {
+	return i != nil && i.ParentIdentityID != "" && len(i.AllowedScopes) == 0
 }
 
 // IsExpired reports whether the identity's authority has aged out. A nil

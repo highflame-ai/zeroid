@@ -4,7 +4,9 @@
 registered identity acting as itself, every identity that request registers is
 that identity's child. The child records its parent, takes the parent's owner
 and, unless the request names its own, the parent's scope ceilings, narrowed
-to what the token the parent presented holds. It can hold no scope, credential
+to what the token the parent presented holds. A child whose `allowed_scopes`
+is empty holds no scope, so a parent whose token holds none can still
+register children. It can hold no scope, credential
 policy, trust level or lifetime beyond its parent's and that token's, it
 receives no token while any identity above it is not active, no token that
 speaks for it is exchanged or reported active while that lasts, and it is
@@ -51,7 +53,7 @@ token held on someone else's behalf, or a person's session, must not be marked.
 | `CallerIdentity` field | Fill it from | What ZeroID does with it |
 |---|---|---|
 | `IdentityID` / `WIMSEURI` | `sub` (the WIMSE URI), or the id it names; both must then agree | Resolves the caller in the request's tenant |
-| `Scopes` | the verified `scopes` claim | A child, and any identity the request changes, can hold no scope outside them. Empty means the token holds none, so the child could hold none and is refused |
+| `Scopes` | the verified `scopes` claim | A child, and any identity the request changes, can hold no scope outside them. Empty means the token holds none: a child it registers holds none too (see [Empty means no scope](#empty-means-no-scope)) |
 | `APIKeyID` | the verified `api_key_id` claim, set on `api_key`-grant tokens; empty otherwise | Loads the key, which must be an active, unexpired key of the caller in the same tenant (403 otherwise); the child cannot outlive it, and when the key names a credential policy the child is held to that policy as well as the caller's own (see [Credential policy](#credential-policy)) |
 
 Fill nothing else, and never from the request. The token's own `exp` is not a
@@ -81,7 +83,7 @@ provisions for a product never record a parent.
 | `owner_user_id` | The caller's owner. A value in the request is ignored |
 | `created_by` | The caller's WIMSE URI: the creation is attributed to the identity that made it. Its id when the URI is longer than the column (255 characters) |
 | `trust_level` | As the request names it, which may not be above the caller's; otherwise the registration default (`unverified`), capped at the caller's |
-| `allowed_scopes` | As the request names it (every scope in the token, none reserved); otherwise the scopes both the caller's ceiling and its token hold, without reserved scopes. If that is nothing, the registration is refused |
+| `allowed_scopes` | As the request names it (every scope in the token, none reserved); otherwise the scopes both the caller's ceiling and its token hold, without reserved scopes. If that is nothing, it is empty, and the child holds no scope |
 | `credential_policy_id` | As the request names it (a subset, on every axis, of the caller's own policy and of its presented API key's policy when that names one); otherwise the caller's own policy (the tenant default when the caller is on it) or, when the key names a policy, whichever of the two is within the other. When neither is, the request must name one within both (`400`) |
 | `expires_at` | As the request names it, which may not be later than the earliest `expires_at` of the caller, any identity above it, and the presented API key; naming none takes that earliest one (or none, when none is set) |
 | API key from `POST /agents/register` | `created_by` is the inherited owner, the human the key's tokens are attributed to |
@@ -100,14 +102,16 @@ A token never carries a scope outside the intersection of its identity's
 restricting layers: its `allowed_scopes` and its credential policy's
 `allowed_scopes`, or, for a chain acting for a person, the policy's
 `user_grant_scopes` in place of its `allowed_scopes`
-([scope-ceilings.md](scope-ceilings.md)). An empty layer restricts nothing.
-A child is held inside its parent by comparing those intersections:
+([scope-ceilings.md](scope-ceilings.md)). An empty layer restricts nothing,
+with one exception, below: a child's own `allowed_scopes`. A child is held
+inside its parent by comparing those intersections:
 
 - The child's ceiling, in both forms (its own authority, and what it may hold
-  for a person), must be within its parent's. A child left with no restricting
-  layer under a parent that has one is refused: that is the escape an empty
-  layer would otherwise open, a child of a restricted parent placed on a
-  policy with no ceiling and then free to request any scope.
+  for a person), must be within its parent's. A child's own `allowed_scopes`
+  always restricts it (see [Empty means no scope](#empty-means-no-scope)), so
+  no child is left with no restricting layer, the escape an empty layer would
+  otherwise open: a child of a restricted parent placed on a policy with no
+  ceiling and then free to request any scope.
 - Every scope the request names, on `allowed_scopes` or on a named credential
   policy's `allowed_scopes` or `user_grant_scopes`, must be within the
   parent's ceiling.
@@ -124,6 +128,43 @@ A child is held inside its parent by comparing those intersections:
 So a child that names nothing has its parent's ceiling narrowed to the token,
 and a parent with no ceiling places none beyond the token's.
 
+### Empty means no scope
+
+On an identity that has a parent, an empty `allowed_scopes` means the
+identity holds no scope. It never means no restriction, in any
+`token.scope_rules` mode. Identities with no parent are unchanged: their empty
+list places no restriction. No identity registered before the tree has a
+parent, so no existing row changes meaning.
+
+- **Registration.** A caller whose token holds no scope registers a child
+  (`201`) whose `allowed_scopes` is empty. That child registers its own
+  children the same way, and they too hold none.
+- **Issuance.** Wherever ZeroID applies an identity's `allowed_scopes` as a
+  ceiling, a child's empty list admits nothing. A request that names a scope
+  is refused as a scope the ceiling does not list is refused: `invalid_scope`
+  where the grant computes its scopes (`api_key`, `client_credentials`,
+  `jwt_bearer`, token exchange, the CIBA pre-checks), and the issuance
+  chokepoint's `insufficient_scope` on the grants that take their scopes from
+  a person's grant. A request that names no scope is issued a token with no
+  `scopes` claim, instead of the first restricting layer's scopes: the
+  credential policy the child inherited lists scopes it does not hold.
+- **Delegation.** A child that holds no scope delegates none (its token
+  carries none), and as the actor of a token exchange it is delegated none;
+  the refusal says the actor identity is not registered for the scopes.
+- **API keys.** A key for a child carries only scopes the child lists, so a
+  child with an empty list gets keys with no scope; a key naming any is
+  refused with `400`. Keys for identities with no parent are created as
+  before and checked at issuance.
+- **Changes.** Setting a child's `allowed_scopes` to empty narrows it to no
+  scope and is accepted, from an admin or from the parent itself. Giving such
+  a child a scope again is a widening, held to the rules above.
+- **Shadow.** The stricter rules' shadow count judges what issuance did, and
+  issuance already applies a child's empty list, so the count never records
+  that change as one the rules would make. A refusal is recorded exactly as
+  the same refusal of an unlisted scope is (rule D, where its code is not
+  `invalid_scope`).
+- **Reserved scopes** never pass to a child, whatever its list.
+
 A refusal is a `400` whose message names the scope (or the policy that places
 no ceiling), for example
 `invalid identity field: exceeds the parent identity's scope ceiling: allowed_scopes lists "admin:all"`.
@@ -134,7 +175,8 @@ is changed (`PATCH /identities/{id}`), whoever makes the change. An empty
 tenant default. A change that leaves the identity no wider than it was (scopes
 within the stored ones, and a policy that is the stored one or a subset of it)
 is always accepted, so re-sending an unchanged value after a parent was
-narrowed is not refused.
+narrowed is not refused. An empty `allowed_scopes` is within any stored list,
+so clearing a child's list is always accepted.
 
 A request marked with `WithCallerIdentity` changes only the caller's children
 (see [Writes by a calling identity](#writes-by-a-calling-identity)), and is
@@ -241,6 +283,12 @@ a marked request is treated as any other admin request. The embedder must not
 let an identity's own token reach those routes. Mark only the routes an
 identity may use to manage its children, and send everything else through the
 embedder's own authorization.
+
+An identity needs no scope to register children: mark its requests whether
+or not its token holds any, and fill `Scopes` with what it holds (nothing,
+when the token has no `scopes` claim). Its children then hold no scope until
+one is listed for them. A resource server reads a token with no `scopes`
+claim as holding none.
 
 The embedder must not set `CallerIdentity` on requests from its own internal
 services, for example discovery ingest or owner offboarding: a marked request
@@ -467,6 +515,20 @@ apply 071 and 072 by hand first:
 
 Rolling back past 071 keeps both columns, so roll back only to a release that
 tolerates columns it does not know (v1.31.0 or later).
+
+A release from before [Empty means no scope](#empty-means-no-scope) reads a
+child's empty `allowed_scopes` as no restriction, so a child registered with
+none would be issued any scope its policy allows. Finish rolling out a
+release with the rule before any identity registers children with a
+scopeless token, and before rolling back to a release without it, find such
+children and deactivate them or list their scopes:
+
+```sql
+SELECT id, account_id, project_id FROM identities
+WHERE parent_identity_id IS NOT NULL
+  AND COALESCE(cardinality(allowed_scopes), 0) = 0
+  AND status <> 'deactivated';
+```
 
 A release without the tree, whether the rollback target or an old pod still
 serving during a rollout, deactivates one identity and sets no mark, so

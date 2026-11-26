@@ -195,10 +195,10 @@ const defaultExternalPrincipalRefreshTokenTTL = 12 * 3600
 var reservedClaims = map[string]bool{
 	// RFC 7519 registered claims
 	"iss": true, "sub": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
-	// RFC 8707 resource binding. Shield reads `resource` as proof that ZeroID
-	// recorded a resource restriction AT THE MINT and enforces INV-IDN-006 on
-	// it — so the claim only means that if ZeroID is the only party who can set
-	// it. Reserving it keeps the presence of the claim load-bearing: a caller
+	// RFC 8707 resource binding. A resource server reads `resource` as proof
+	// that ZeroID recorded a resource restriction AT THE MINT and enforces the
+	// binding on it — so the claim only means that if ZeroID is the only party
+	// who can set it. Reserving it keeps the presence of the claim load-bearing: a caller
 	// must never be able to make a token look resource-bound when it isn't, or
 	// to widen a real binding by overriding it through additional_claims.
 	"resource": true,
@@ -252,9 +252,9 @@ var reservedClaims = map[string]bool{
 	// trusted-service caller that legitimately sets it. That pre-existing gap
 	// is worth its own change rather than being smuggled into this one.
 	"client_id": true,
-	// Step-up approvals (RFC 9396). Shield honours a `highflame_tool_call`
-	// entry in `authorization_details` only on a CIBA-minted token, and only
-	// when its `approval_id` names a challenge Shield raised — but the claim
+	// Step-up approvals (RFC 9396). A policy decision point may honour an
+	// `authorization_details` entry only on a CIBA-minted token, and only
+	// when its `approval_id` names a challenge it raised — but the claim
 	// must still never be writable through additional_claims, or a token
 	// from another grant could carry an approval nobody gave. ZeroID writes
 	// it only on the CIBA path, from the approved request row
@@ -263,9 +263,9 @@ var reservedClaims = map[string]bool{
 	// caller can mint a look-alike.
 	"authorization_details": true,
 	"approval_id":           true,
-	// Agent provenance. Shield projects `origin`, `agent_idp_iss` and
-	// `agent_idp_parent` into context.principal / context.actor, where
-	// policies use them to tell native agents from IdP-registered ones
+	// Agent provenance. A policy decision point may project `origin`,
+	// `agent_idp_iss` and `agent_idp_parent` into its principal and actor
+	// context, where policies use them to tell native agents from IdP-registered ones
 	// (e.g. "forbid unless origin == native", or trusting one IdP tenant).
 	// ZeroID does not mint them yet; until it does from the identity row,
 	// nothing may set them, or a caller with an id_token exchange could
@@ -796,7 +796,7 @@ type TokenRequest struct {
 	// form-encoded request may repeat the parameter (RFC 8707 §2).
 	//
 	// It only ever NARROWS. The values are stamped as the token's `aud` AND as
-	// the reserved `resource` claim that Shield enforces INV-IDN-006 on, and
+	// the reserved `resource` claim that a resource server enforces the binding on, and
 	// grant no authority the grant did not already carry — which is why an
 	// arbitrary caller-supplied identifier is safe to accept without a registry
 	// of known resource servers.
@@ -1069,12 +1069,14 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// Narrow against the client's own scopes first (checked above: a
 	// client with none can mint nothing), then against the identity's
 	// policy and row ceilings. client.Scopes is non-empty, so grantScopes
-	// always sees a restricting ceiling and never returns an empty grant.
+	// always sees a restricting ceiling and never returns an empty grant,
+	// except for an identity whose own ceiling lists no scope, which gets
+	// none (grantIdentityScopes).
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
 	trace.strictCeiling(clientCeilingName(client), client.Scopes)
 	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
-	trace.ceiling(ceilingIdentityScopes, rowScopes)
-	scopes, err := grantScopes(req.Scope, client.Scopes, policyScopes, rowScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
+	scopes, err := grantIdentityScopes(req.Scope, identity, client.Scopes, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err
 	}
@@ -1217,15 +1219,15 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	trace.ask(parseScopeString(req.Scope), true)
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
 	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
-	trace.ceiling(ceilingIdentityScopes, rowScopes)
-	scopes, err := grantScopes(req.Scope, policyScopes, rowScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
+	scopes, err := grantIdentityScopes(req.Scope, identity, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		// The ceiling rule (P1) counts a workload that named a scope no layer capped.
-		ScopeCeilingUnbounded: len(policyScopes) == 0 && len(rowScopes) == 0,
+		ScopeCeilingUnbounded: len(policyScopes) == 0 && !identity.ScopeCeilingRestricts(),
 		Identity:              identity,
 		IdentityPolicyID:      policy.ID,
 		Scopes:                scopes,
@@ -1462,7 +1464,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// ceiling.
 	trace.strictCeiling(ceilingSubjectToken, subjectCred.Scopes)
 	trace.ceiling(policyCeilingName(ownerActor, userGrantCeiling), actorPolicyScopes)
-	trace.ceiling(ceilingActorScopes, actorRowScopes)
+	trace.identityCeiling(ceilingActorScopes, actorIdentity)
 	// The orchestrator term is filtered explicitly rather than through
 	// narrowScopes: an orchestrator holding no scopes can delegate nothing,
 	// whereas narrowScopes reads an empty ceiling as "no restriction".
@@ -1473,8 +1475,13 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		}
 	}
 	scopes = narrowScopes(narrowScopes(scopes, actorPolicyScopes), actorRowScopes)
+	if actorIdentity.ListsNoScope() {
+		// An actor whose own ceiling lists no scope can be delegated none:
+		// narrowScopes would read its empty list as no restriction.
+		scopes = nil
+	}
 	if len(scopes) == 0 {
-		denial := delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes, userGrantCeiling)
+		denial := delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes, actorIdentity.ListsNoScope(), userGrantCeiling)
 		// With token.scope_rules=enforce, rule C issues a delegation that
 		// names no scope with none, where today's rules refuse it. Every
 		// other empty result stays refused.
@@ -2349,8 +2356,8 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	trace.ceiling(ceilingAPIKeyScopes, sk.Scopes)
 	trace.ceiling(policyCeilingName(ownerAPIKey, false), keyPolicyScopes)
 	trace.ceiling(policyCeilingName(identityPolicyOwner(identity), false), identityPolicyScopes)
-	trace.ceiling(ceilingIdentityScopes, rowScopes)
-	scopes, err := grantScopes(req.Scope, sk.Scopes, keyPolicyScopes, identityPolicyScopes, rowScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
+	scopes, err := grantIdentityScopes(req.Scope, identity, sk.Scopes, keyPolicyScopes, identityPolicyScopes, rowScopes)
 	if err != nil {
 		return nil, err
 	}
@@ -2370,7 +2377,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// must never mint a 30-day token even if the identity policy allows.
 		CredentialExpiresAt:   sk.ExpiresAt,
 		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
-		ScopeCeilingUnbounded: len(sk.Scopes) == 0 && len(keyPolicyScopes) == 0 && len(identityPolicyScopes) == 0 && len(rowScopes) == 0,
+		ScopeCeilingUnbounded: len(sk.Scopes) == 0 && len(keyPolicyScopes) == 0 && len(identityPolicyScopes) == 0 && !identity.ScopeCeilingRestricts(),
 
 		ChannelTrustedCredential: sk.ChannelTrusted,
 		APIKeyID:                 sk.ID,
@@ -2856,7 +2863,7 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 	// same posture checkAuthorizeClientPolicy takes above: a programmatic
 	// caller supplying a pre-resolved Client cannot skip a gate, and a
 	// ceiling is a security claim — a value that reaches the "rsc" claim
-	// unvalidated is one Shield will later enforce on.
+	// unvalidated is one a resource server will later enforce on.
 	resources, err := ValidateAuthorizeResource(req.Resources)
 	if err != nil {
 		return "", err
@@ -4501,7 +4508,10 @@ func parseScopeString(scope string) []string {
 // Either may be nil (no restriction from that layer). Pass both to
 // grantScopes as separate ceilings rather than pre-intersecting them: a
 // disjoint pair intersects to an empty list, which every scope helper reads
-// as "unrestricted".
+// as "unrestricted". For the same reason an identity whose own empty list
+// restricts it to nothing (domain.Identity.ListsNoScope) cannot be expressed
+// through rowScopes: grantIdentityScopes and the token exchange check it
+// separately.
 func identityScopeCeilings(policy *domain.CredentialPolicy, identity *domain.Identity) (policyScopes, rowScopes []string) {
 	if policy != nil {
 		policyScopes = policy.AllowedScopes
@@ -4526,11 +4536,10 @@ func identityScopeCeilings(policy *domain.CredentialPolicy, identity *domain.Ide
 // When any ceiling restricts and nothing survives, the grant is refused with
 // invalid_scope whether or not the caller named a scope. Minting anyway would
 // produce a token with no `scopes` claim, because IssueCredential omits the
-// claim and skips its own scope checks when the set is empty. Downstream
-// (Shield's checkScopeCeiling) reads an absent claim as "no ceiling to
-// check", so a disjoint pair of ceilings would otherwise mint an
-// unrestricted token. Only an identity with no ceiling anywhere still gets
-// the legacy scopeless token on an omitted request.
+// claim and skips its own scope checks when the set is empty, so a request
+// whose ceilings excluded everything would succeed as if it had asked for
+// nothing. Only an identity with no ceiling anywhere still gets the legacy
+// scopeless token on an omitted request.
 func grantScopes(requestedRaw string, ceilings ...[]string) ([]string, error) {
 	scopes := parseScopeString(requestedRaw)
 	seeded := len(scopes) > 0
@@ -4553,15 +4562,31 @@ func grantScopes(requestedRaw string, ceilings ...[]string) ([]string, error) {
 	return scopes, nil
 }
 
+// grantIdentityScopes is grantScopes for a grant to identity, whose own
+// allowed_scopes is one of the ceilings. An identity registered by another
+// identity whose allowed_scopes is empty lists no scope
+// (domain.Identity.ListsNoScope), which no []string ceiling can say, since an
+// empty one places no restriction. For it, a request that names a scope is
+// refused exactly as grantScopes refuses one that every ceiling excluded, and
+// an omitted request gets no scopes: the token carries no scopes claim, which
+// is what the identity holds. Any other identity is grantScopes unchanged.
+func grantIdentityScopes(requestedRaw string, identity *domain.Identity, ceilings ...[]string) ([]string, error) {
+	if !identity.ListsNoScope() {
+		return grantScopes(requestedRaw, ceilings...)
+	}
+	if len(parseScopeString(requestedRaw)) > 0 {
+		return nil, oauthBadRequest(oautherror.InvalidScope, "requested scopes are not permitted for this identity")
+	}
+	return nil, nil
+}
+
 // requireGrantableScope closes the gap between intersectScopes' silent
 // narrowing and IssueCredential's "if len(req.Scopes) > 0" claim-omission
 // (credential.go): when a caller explicitly names a scope and every named
 // scope gets intersected away, minting anyway produces a token with no
-// `scopes` claim at all — indistinguishable downstream from a legacy token
-// that predates the scopes feature. Shield's checkScopeCeiling deliberately
-// treats an absent claim as "check not applicable" for that legacy case (see
-// its own comment), so a caller could otherwise escalate past its ceiling
-// simply by naming a scope it does not hold.
+// `scopes` claim at all — indistinguishable to a resource server from a
+// legacy token that predates the scopes feature, and a request that named a
+// scope it does not hold would succeed instead of being refused.
 //
 // Mirrors tokenExchange's existing "len(scopes) == 0 -> invalid_scope"
 // safety net (this file, tokenExchange). Used by IssueAuthCode's single
@@ -4605,10 +4630,12 @@ func requireGrantableScope(requestedRaw string, granted []string) error {
 // means "no restriction from this layer", so an unrestricted layer is never
 // blamed. They are kept apart because widening a credential policy and
 // widening a registration are different repairs — naming the wrong one is the
-// mistake this whole function exists to prevent. userGrant says actorPolicy is
+// mistake this whole function exists to prevent. actorRowNone says the actor's
+// empty allowed_scopes lists no scope (domain.Identity.ListsNoScope), so it
+// excludes every scope rather than none. userGrant says actorPolicy is
 // the policy's user_grant_scopes, the ceiling on what the actor may hold for a
 // person (D10), so the denial names that field rather than allowed_scopes.
-func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorPolicy, actorRow []string, userGrant bool) error {
+func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorPolicy, actorRow []string, actorRowNone, userGrant bool) error {
 	const base = "requested scopes are not available for delegation"
 
 	// token_exchange is the one grant with no RFC 6749 §3.3 default, so an
@@ -4635,7 +4662,7 @@ func delegationScopeDenial(requested []string, subjectHolds map[string]bool, act
 			notHeld = append(notHeld, s)
 		case excludes(actorPolicy, s):
 			notPermitted = append(notPermitted, s)
-		case excludes(actorRow, s):
+		case actorRowNone || excludes(actorRow, s):
 			notRegistered = append(notRegistered, s)
 		}
 	}
