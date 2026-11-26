@@ -38,8 +38,8 @@ func TestTrustedIssuers_OwnershipProof_Discovery(t *testing.T) {
 		delete(body, "$schema") // huma's link on every body
 		assert.Equal(t, map[string]any{
 			"issuer":                 f.idp.EntraIssuer(tid),
-			"authorization_endpoint": f.idpSrv.URL + "/entra/" + tid + "/oauth2/v2.0/authorize",
-			"token_endpoint":         f.idpSrv.URL + "/entra/" + tid + "/oauth2/v2.0/token",
+			"authorization_endpoint": f.idpURL + "/entra/" + tid + "/oauth2/v2.0/authorize",
+			"token_endpoint":         f.idpURL + "/entra/" + tid + "/oauth2/v2.0/token",
 		}, body)
 	})
 	t.Run("an Okta row's sign-in endpoints", func(t *testing.T) {

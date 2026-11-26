@@ -44,6 +44,7 @@ type dbFederation struct {
 	http   *httptest.Server
 	idp    *mockidp.IdP
 	idpSrv *httptest.Server
+	idpURL string // idpSrv.URL plus the per-instance path the issuers live under
 
 	mu            sync.Mutex
 	members       map[string]string // IdP subject -> Highflame user id
@@ -62,11 +63,16 @@ func newDBFederationWith(t *testing.T, configure func(*zeroid.Config), opts ...z
 	t.Helper()
 	idp, err := mockidp.New("https://placeholder")
 	require.NoError(t, err)
-	idpSrv := httptest.NewTLSServer(idp.Handler())
+	// Issuer rows are unique across accounts and these tests share one
+	// database that outlives each test, while httptest reuses loopback ports.
+	// A per-instance path keeps every mock issuer URL distinct, so a row left
+	// by an earlier test can never collide with this one.
+	prefix := "/" + uid("idp")
+	idpSrv := httptest.NewTLSServer(http.StripPrefix(prefix, idp.Handler()))
 	t.Cleanup(idpSrv.Close)
-	idp.SetBaseURL(idpSrv.URL)
+	idp.SetBaseURL(idpSrv.URL + prefix)
 
-	f := &dbFederation{idp: idp, idpSrv: idpSrv, members: map[string]string{}}
+	f := &dbFederation{idp: idp, idpSrv: idpSrv, idpURL: idpSrv.URL + prefix, members: map[string]string{}}
 	// One mock Entra tenant stands in for a shared issuer (like
 	// accounts.google.com), beside the built-in list.
 	f.srv, f.http = newDBFederationServerWith(t, configure, opts,
