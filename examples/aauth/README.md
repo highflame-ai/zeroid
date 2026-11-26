@@ -27,6 +27,52 @@ to call both AAuth-native resources and ordinary OAuth-protected MCP servers.
   [aauth-go](https://github.com/aauth-dev/aauth-go), the AAuth reference
   implementation, so ZeroID is checked against independent code, not its own.
 
+## From workload identity to the AAuth ecosystem
+
+Your workloads already have strong identities: an IAM role on AWS, a service
+account in Kubernetes, a SPIFFE ID in a service mesh. AAuth needs something
+different: an **Agent Provider** that vouches for each agent, so any AAuth
+resource can trust it. ZeroID connects the two.
+
+```text
+  Where your code runs          Who vouches for the agent      Where the agent can go
+  ────────────────────          ─────────────────────────      ──────────────────────
+
+  AWS IAM role (STS)       ──┐                              ┌──▶  AAuth resources
+                             │                              │
+  Kubernetes service       ──┼──▶   ZeroID                ──┤
+  account                    │      (AAuth Agent Provider)  │
+                             │                              └──▶  OAuth and MCP servers,
+  SPIFFE / WIMSE (coming)  ──┘                                    through ZeroID's bridge
+```
+
+- **No new root of trust.** You don't hand out credentials to agents. ZeroID
+  trusts what your cloud or cluster already asserts, and you decide which
+  roles or service accounts count as which agent.
+- **Resources trust one issuer, not every cloud.** An AAuth resource never has
+  to understand AWS STS tokens, Kubernetes tokens or SPIFFE. It checks one
+  thing: an agent token signed by ZeroID. Adding a new platform or a new
+  resource doesn't change anything on the other side.
+- **The platform says where the code runs; ZeroID decides what it may do.**
+  A platform token proves where code is running. ZeroID maps it to a named
+  agent, applies that agent's policy (which credentials, for which resources,
+  for how long), records every credential it issues, and revokes them all at
+  once when needed.
+- **SPIFFE and WIMSE are built in.** Every agent ZeroID vouches for also has a
+  SPIFFE ID (a WIMSE workload URI). It's the `sub` of the bridged token in the
+  demo's step 5, so the same agent fits zero-trust and service-mesh tooling
+  that speaks SPIFFE.
+- **AAuth today, OAuth and MCP too.** AAuth is new, and most APIs and MCP
+  servers speak OAuth. The bridge lets an agent use one identity everywhere
+  while the ecosystem catches up.
+
+| Platform | Token the agent starts with | Status |
+| --- | --- | --- |
+| AWS | STS web identity token for the agent's IAM role | Works; tested with real AWS tokens |
+| Kubernetes (EKS, GKE, AKS, self-managed) | Projected service account token | Works; this demo uses a mock cluster |
+| SPIFFE / SPIRE | JWT-SVID | Coming |
+| Google Cloud, Azure | Workload identity token | Coming |
+
 ## How it works
 
 ```text
