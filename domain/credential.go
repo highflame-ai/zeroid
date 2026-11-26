@@ -68,6 +68,12 @@ const (
 	// (parent_jti), so revoking the parent revokes it. A tenant opts in
 	// separately, by listing it beside aauth_agent.
 	GrantTypeAAuthSubagent GrantType = "aauth_subagent"
+	// GrantTypeAAuthRefresh is a credential policy opt-in, never a stored
+	// grant: listed beside aauth_agent, it lets an enrolled agent key refresh
+	// its agent token at POST /ap/refresh without a fresh platform token
+	// (the bootstrap draft's two-key refresh). Refreshed tokens are stored as
+	// aauth_agent, children of the enrollment's first token.
+	GrantTypeAAuthRefresh GrantType = "aauth_refresh"
 )
 
 // GrantTypeAAuthBridgeURN is the grant_type a client sends to exchange an
@@ -78,7 +84,7 @@ const GrantTypeAAuthBridgeURN = "urn:highflame:params:oauth:grant-type:aauth-age
 // AAuth endpoints.
 func (g GrantType) IsAAuth() bool {
 	n := NormalizeGrantType(string(g))
-	return n == GrantTypeAAuthAgent || n == GrantTypeAAuthBridge || n == GrantTypeAAuthSubagent
+	return n == GrantTypeAAuthAgent || n == GrantTypeAAuthBridge || n == GrantTypeAAuthSubagent || n == GrantTypeAAuthRefresh
 }
 
 // IsAAuthAgentToken reports whether g is stored for an aa-agent+jwt: an
@@ -111,6 +117,7 @@ var allValidGrantTypes = map[GrantType]bool{
 	GrantTypeAAuthAgent:        true,
 	GrantTypeAAuthBridge:       true,
 	GrantTypeAAuthSubagent:     true,
+	GrantTypeAAuthRefresh:      true,
 }
 
 // NormalizeGrantType converts a grant type string to its canonical short form.

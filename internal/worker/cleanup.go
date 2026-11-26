@@ -199,6 +199,17 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired aauth bootstrap redemptions")
 	}
 
+	// AAuth enrollments may refresh only until they expire.
+	enrRes, err := w.db.NewDelete().
+		TableExpr("aauth_enrollments").
+		Where("expires_at < ?", now).
+		Exec(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("Cleanup: failed to delete expired aauth enrollments")
+	} else if n, err := enrRes.RowsAffected(); err == nil && n > 0 {
+		log.Info().Int64("count", n).Msg("Cleanup: deleted expired aauth enrollments")
+	}
+
 	// AAuth person-server revocations matter only until the token expires:
 	// past that, the person server no longer honours it anyway.
 	psRes, err := w.db.NewDelete().

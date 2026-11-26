@@ -168,6 +168,45 @@ func TestAAuthInteropSubagent(t *testing.T) {
 	assert.Contains(t, err.Error(), "status 403")
 }
 
+// TestAAuthInteropRefresh: aauth-go's client performs the two-key refresh
+// against ZeroID: the enrolled (durable) key names a fresh ephemeral key in a
+// jkt-jwt naming JWT, and the new agent token binds the ephemeral key.
+func TestAAuthInteropRefresh(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	durable, err := demo.LoadOrCreateKey(filepath.Join(t.TempDir(), "pod", "agent.key"))
+	require.NoError(t, err)
+	ap := &agentprovider.Client{BaseURL: issuer, HTTPClient: e.client}
+	_, err = ap.Issue(ctx, durable, map[string]string{"attestation": e.platformToken(t)})
+	require.NoError(t, err)
+
+	_, ephemeral, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	refreshed, err := ap.Refresh(ctx, durable, ephemeral, nil)
+	require.NoError(t, err, "aauth-go's two-key refresh at ZeroID's /ap/refresh")
+
+	var claims aauth.AgentClaims
+	_, _, err = jwt.NewParser().ParseUnverified(refreshed.AgentToken, &claims)
+	require.NoError(t, err)
+	assert.Equal(t, "aauth:"+e.agentID+"@"+zeroidHost, claims.Subject)
+	want, err := aauth.NewJWK(ephemeral.Public())
+	require.NoError(t, err)
+	assert.Equal(t, want.Thumbprint(), claims.Cnf.JWK.Thumbprint(), "the new token binds the ephemeral key")
+
+	// The refreshed agent works at an aauth-go guard.
+	id, err := aauth.ParseAgentIdentifier(claims.Subject)
+	require.NoError(t, err)
+	agent, err := aauth.NewAgent(id, aauth.WithKey(ephemeral), aauth.WithIssuer(issuer),
+		aauth.WithTokenSource(func() (string, error) { return refreshed.AgentToken, nil }))
+	require.NoError(t, err)
+	transport := aauth.NewTransport(agent, nil)
+	transport.Base = e.client.Transport
+	resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get(resource + "/whoami")
+	require.NoError(t, err)
+	body := readJSON(t, resp)
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "%v", body)
+}
+
 // TestAAuthInteropRevocationAtPersonServer: an agent with a person server
 // carries ps, and revoking its agent token at ZeroID revokes it at aauth-go's
 // person server, which verifies ZeroID's jwks_uri signature by discovering
@@ -308,7 +347,7 @@ func newEnv(t *testing.T) *env {
 func (e *env) seed(t *testing.T) {
 	t.Helper()
 	policy := e.admin(t, http.MethodPost, "/credential-policies", map[string]any{
-		"name": "aauth", "allowed_grant_types": []string{"aauth_agent", "aauth_bridge", "aauth_subagent"},
+		"name": "aauth", "allowed_grant_types": []string{"aauth_agent", "aauth_bridge", "aauth_subagent", "aauth_refresh"},
 		"allowed_scopes": []string{"tools:read"}, "max_ttl_seconds": 3600,
 	}, http.StatusCreated)
 	e.policyID = policy["id"].(string)

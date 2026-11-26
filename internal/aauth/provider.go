@@ -68,6 +68,10 @@ type Config struct {
 	// MaxLiveSubagents bounds one parent agent token's live sub-agent
 	// tokens. Zero means DefaultMaxLiveSubagents.
 	MaxLiveSubagents int
+	// EnrollmentTTL is how long a key that enrolled at /ap/token may refresh
+	// at /ap/refresh before it must enroll again. Zero means
+	// DefaultEnrollmentTTL.
+	EnrollmentTTL time.Duration
 	// RequestsPerMinute bounds one workload subject's /ap/token requests and
 	// one parent's /ap/subagent requests. Zero means
 	// DefaultRequestsPerMinute.
@@ -125,6 +129,9 @@ func New(cfg Config, deps Deps) (*Provider, error) {
 	if cfg.AgentTokenTTL <= 0 {
 		cfg.AgentTokenTTL = DefaultAgentTokenTTL
 	}
+	if cfg.EnrollmentTTL <= 0 {
+		cfg.EnrollmentTTL = DefaultEnrollmentTTL
+	}
 	if cfg.MaxLiveSubagents <= 0 {
 		cfg.MaxLiveSubagents = DefaultMaxLiveSubagents
 	}
@@ -157,6 +164,7 @@ func ServerIdentifierHost(s string) (string, error) {
 func (p *Provider) Mount(r chi.Router) {
 	r.Post(PathToken, p.handleToken)
 	r.Post(PathSubagent, p.handleSubagent)
+	r.Post(PathRefresh, p.handleRefresh)
 	r.Get(PathJWKS, p.handleJWKS)
 	r.Get(PathMetadata, p.handleMetadata)
 }
@@ -477,6 +485,7 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		cleanup()
 		return "", 0, err
 	}
+	p.enroll(ictx, jkt, wa, identity, policy, issuedRow)
 	if issued.ExpiresIn <= minAgentTokenTTL {
 		// Clamped further inside issuance (token.max_ttl, or an identity near
 		// its expiry). The token is valid; the agent will refresh at once.

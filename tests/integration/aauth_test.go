@@ -1162,3 +1162,133 @@ func TestAAuthRateLimits(t *testing.T) {
 		assert.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
 	})
 }
+
+// namingJWT is a jkt-jwt naming JWT: durable delegates to ephemeral until
+// exp (bootstrap draft, two-key refresh).
+func namingJWT(t *testing.T, durable, ephemeral agentKey, exp time.Time) string {
+	t.Helper()
+	enc := func(v any) string {
+		b, err := json.Marshal(v)
+		require.NoError(t, err)
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	jwkOf := func(k agentKey) map[string]string {
+		return map[string]string{"kty": "OKP", "crv": "Ed25519", "x": k.x, "alg": "Ed25519"}
+	}
+	signing := enc(map[string]any{"typ": "jkt-s256+jwt", "alg": "Ed25519", "jwk": jwkOf(durable)}) + "." +
+		enc(map[string]any{"iss": "urn:jkt:sha-256:" + durable.thumbprint(), "iat": time.Now().Unix(), "exp": exp.Unix(),
+			"jti": uid("naming"), "cnf": map[string]any{"jwk": jwkOf(ephemeral)}})
+	return signing + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(durable.priv, []byte(signing)))
+}
+
+// refresh posts to /ap/refresh signed by ephemeral under jkt-jwt with naming.
+func (a *aauthFed) refresh(t *testing.T, ephemeral agentKey, naming string) apResponse {
+	t.Helper()
+	return a.do(t, a.signedAP(t, ephemeral, "/ap/refresh", `sig=jkt-jwt;jwt="`+naming+`"`, `{}`, aauthHost, time.Now()))
+}
+
+func TestAAuthRefresh(t *testing.T) {
+	a := newAAuthFed(t, "aauth_agent", "aauth_refresh", "aauth_bridge")
+	enroll := func(t *testing.T, a *aauthFed, sub string) (agentKey, string) {
+		t.Helper()
+		durable := newAgentKey(t)
+		var extra map[string]any
+		if sub != "" {
+			extra = map[string]any{"sub": sub}
+		}
+		res := a.bootstrap(t, durable, a.assertion(t, extra))
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		return durable, res.body["agent_token"].(string)
+	}
+
+	t.Run("an enrolled key refreshes to a token bound to a fresh ephemeral key", func(t *testing.T) {
+		durable, root := enroll(t, a, "")
+		eph := newAgentKey(t)
+		res := a.refresh(t, eph, namingJWT(t, durable, eph, time.Now().Add(5*time.Minute)))
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		claims := decodeJWTPayload(t, res.body["agent_token"].(string))
+		assert.Equal(t, decodeJWTPayload(t, root)["sub"], claims["sub"], "the agent identifier is stable across refreshes")
+		assert.Equal(t, eph.x, claims["cnf"].(map[string]any)["jwk"].(map[string]any)["x"])
+		assert.Equal(t, "aauth_agent", a.credential(t, claims["jti"].(string))["grant_type"])
+
+		// The refreshed token is a full agent token: it bridges, with the
+		// ephemeral key as its DPoP key.
+		bridged := a.bridge(t, res.body["agent_token"].(string), &eph, nil)
+		assert.Equal(t, http.StatusOK, bridged.status, "body=%v", bridged.body)
+
+		// And the durable key refreshes again to another ephemeral key.
+		eph2 := newAgentKey(t)
+		again := a.refresh(t, eph2, namingJWT(t, durable, eph2, time.Now().Add(5*time.Minute)))
+		assert.Equal(t, http.StatusOK, again.status, "body=%v", again.body)
+	})
+
+	t.Run("a naming JWT is single use", func(t *testing.T) {
+		durable, _ := enroll(t, a, "")
+		eph := newAgentKey(t)
+		naming := namingJWT(t, durable, eph, time.Now().Add(5*time.Minute))
+		require.Equal(t, http.StatusOK, a.refresh(t, eph, naming).status)
+		replay := a.refresh(t, eph, naming)
+		assert.Equal(t, http.StatusUnauthorized, replay.status)
+		assert.Contains(t, replay.headers.Get("Signature-Error"), "invalid_jwt")
+	})
+
+	t.Run("bad naming JWTs and unenrolled keys are refused", func(t *testing.T) {
+		durable, _ := enroll(t, a, "")
+		eph := newAgentKey(t)
+		long := a.refresh(t, eph, namingJWT(t, durable, eph, time.Now().Add(time.Hour)))
+		assert.Equal(t, http.StatusUnauthorized, long.status, "a naming JWT living an hour")
+
+		thief := newAgentKey(t)
+		wrongSigner := a.refresh(t, thief, namingJWT(t, durable, eph, time.Now().Add(5*time.Minute)))
+		assert.Equal(t, http.StatusUnauthorized, wrongSigner.status, "signed by a key the naming JWT does not name")
+
+		stranger := newAgentKey(t)
+		eph2 := newAgentKey(t)
+		unknown := a.refresh(t, eph2, namingJWT(t, stranger, eph2, time.Now().Add(5*time.Minute)))
+		assert.Equal(t, http.StatusForbidden, unknown.status)
+		assert.Equal(t, "denied", unknown.body["error"])
+	})
+
+	t.Run("revoking the enrollment's first token stops refresh and revokes every refreshed token", func(t *testing.T) {
+		durable, root := enroll(t, a, "")
+		eph := newAgentKey(t)
+		res := a.refresh(t, eph, namingJWT(t, durable, eph, time.Now().Add(5*time.Minute)))
+		require.Equal(t, http.StatusOK, res.status)
+		refreshedJTI := decodeJWTPayload(t, res.body["agent_token"].(string))["jti"].(string)
+
+		rootRow := a.credential(t, decodeJWTPayload(t, root)["jti"].(string))
+		status, body := a.f.call(t, http.MethodPost, "/credentials/"+rootRow["id"].(string)+"/revoke",
+			map[string]any{"reason": "test"}, a.tn.headers)
+		require.Contains(t, []int{http.StatusOK, http.StatusNoContent}, status, "revoke: %v", body)
+		assert.Equal(t, true, a.credential(t, refreshedJTI)["is_revoked"], "cascade from the root")
+
+		eph2 := newAgentKey(t)
+		again := a.refresh(t, eph2, namingJWT(t, durable, eph2, time.Now().Add(5*time.Minute)))
+		assert.Equal(t, http.StatusForbidden, again.status)
+	})
+
+	t.Run("disabling the binding stops refresh", func(t *testing.T) {
+		sub := "system:serviceaccount:agents:" + uid("sa")
+		status, b := a.f.bind(t, a.tn, a.rowID, sub, a.agent, false)
+		require.Equal(t, http.StatusCreated, status, "%v", b)
+		durable, _ := enroll(t, a, sub)
+		first := newAgentKey(t)
+		require.Equal(t, http.StatusOK, a.refresh(t, first, namingJWT(t, durable, first, time.Now().Add(5*time.Minute))).status,
+			"refresh works while the binding is enabled")
+		status, body := a.f.call(t, http.MethodPatch, "/external-issuers/"+a.rowID+"/bindings/"+b["id"].(string),
+			map[string]any{"enabled": false}, a.tn.headers)
+		require.Equal(t, http.StatusOK, status, "%v", body)
+		eph := newAgentKey(t)
+		res := a.refresh(t, eph, namingJWT(t, durable, eph, time.Now().Add(5*time.Minute)))
+		assert.Equal(t, http.StatusForbidden, res.status, "a refresh re-checks what the platform token proved")
+	})
+
+	t.Run("a policy that does not list aauth_refresh enrolls no key", func(t *testing.T) {
+		off := newAAuthFed(t, "aauth_agent")
+		durable, _ := enroll(t, off, "")
+		eph := newAgentKey(t)
+		res := off.refresh(t, eph, namingJWT(t, durable, eph, time.Now().Add(5*time.Minute)))
+		assert.Equal(t, http.StatusForbidden, res.status)
+		assert.Equal(t, "denied", res.body["error"])
+	})
+}

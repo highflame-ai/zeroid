@@ -258,3 +258,24 @@ func (s *OAuthService) ResolveWorkloadPolicy(ctx context.Context, identity *doma
 	}
 	return policy, nil
 }
+
+// ResolveBoundWorkloadAgent returns the active identity an enabled binding
+// maps subject to under row, as ResolveWorkloadAgent does for a verified
+// assertion, but with no first contact: it re-checks an enrollment made
+// earlier with a platform token (the AAuth two-key refresh), which must not
+// register anything. A disabled row refuses.
+func (s *OAuthService) ResolveBoundWorkloadAgent(ctx context.Context, row *domain.ExternalIssuer, subject, grant string) (*domain.Identity, error) {
+	if row == nil || !row.Enabled {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "the agent's workload issuer is no longer enabled")
+	}
+	return s.bindFederatedAgent(ctx, row, subject, nil, grant, nil)
+}
+
+// SpendSingleUse records key as used until expiresAt in the shared
+// single-use store. A second spend returns dpop.ErrReplay.
+func (s *OAuthService) SpendSingleUse(ctx context.Context, key string, expiresAt time.Time) error {
+	if s.clientAssertionReplay == nil {
+		return oauthServerError("client assertion replay store is not configured", nil)
+	}
+	return s.clientAssertionReplay.Insert(ctx, key, expiresAt.Add(clientAssertionClockSkew))
+}

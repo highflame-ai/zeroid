@@ -673,6 +673,8 @@ func checkAAuthIssuance(req IssueRequest) error {
 			domain.GrantTypeAAuthAgent, domain.GrantTypeAAuthSubagent)
 	case g.IsAAuthAgentToken() && req.AgentTokenSigner == nil:
 		return fmt.Errorf("%w: %s is minted only at the AAuth Agent Provider", ErrGrantTypeNotIssuable, req.GrantType)
+	case g == domain.GrantTypeAAuthRefresh:
+		return fmt.Errorf("%w: %s is a credential policy opt-in, never issued", ErrGrantTypeNotIssuable, req.GrantType)
 	case (g == domain.GrantTypeAAuthBridge || g == domain.GrantTypeAAuthSubagent) && req.ParentJTI == "":
 		return fmt.Errorf("%w: %s needs its parent agent token", ErrGrantTypeNotIssuable, req.GrantType)
 	}
