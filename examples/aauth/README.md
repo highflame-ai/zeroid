@@ -1,93 +1,253 @@
-# ZeroID as an AAuth Agent Provider: interop and demo
+# Secretless agents with ZeroID and AAuth
 
-A workload with no secrets gets an [AAuth](https://aauth.dev) agent identity
-from ZeroID, calls an AAuth resource with it, and bridges to an OAuth-only
-MCP resource. Everything runs on one machine; nothing is sent anywhere else.
+AI agents need to call APIs and MCP servers. Today that usually means an API
+key or client secret in an environment variable: something to store, rotate,
+and eventually leak.
 
-The agent signing and the resource-side agent-token verification are
-[aauth-go](https://github.com/aauth-dev/aauth-go)'s, the reference
-implementation, so both the test and the demo check ZeroID against an
-independent implementation.
+This demo shows another way. An agent running in Kubernetes or on AWS proves
+who it is with the identity its platform **already gives it**. ZeroID turns
+that into an [AAuth](https://aauth.dev) agent identity, and the agent uses it
+to call both AAuth-native resources and ordinary OAuth-protected MCP servers.
+**No secret is created, stored or shipped at any point.**
 
-This is its own Go module so ZeroID's module never depends on aauth-go. It is
-not in `go.work`: run Go commands here with `GOWORK=off`.
+## Why it matters
 
-## Interop test
+- **Nothing to leak.** The agent starts from a short-lived token minted by its
+  cloud or cluster. There's no API key to put in a vault, and none to rotate.
+- **Stolen tokens are useless.** Every credential ZeroID issues is bound to a
+  key that never leaves the agent. A copied token, on its own, gets an attacker
+  nothing, and the demo shows this.
+- **Works with what you already run.** Resources that speak AAuth verify the
+  agent directly. Resources that only speak OAuth, like most MCP servers today,
+  get a standard OAuth access token through ZeroID's bridge.
+- **One identity across both worlds.** Every call traces back to one agent
+  identity in ZeroID, so revoking it cuts off everything at once.
+- **Built on open standards.** AAuth, HTTP Message Signatures (RFC 9421) and
+  DPoP (RFC 9449). The agent and resource sides of this demo use
+  [aauth-go](https://github.com/aauth-dev/aauth-go), the AAuth reference
+  implementation, so ZeroID is checked against independent code, not its own.
+
+## How it works
+
+```text
+  ┌───────────────┐  1. platform identity token   ┌──────────────┐
+  │  Kubernetes   │ ────────────────────────────▶ │              │
+  │  or AWS       │                               │    Agent     │  holds one private key,
+  └───────────────┘                               │  (workload)  │  and nothing else
+                                                  └──────┬───────┘
+                       2. "here's my platform token,     │
+                           signed with my key"           ▼
+                                                  ┌──────────────┐
+                       3. AAuth agent token,      │    ZeroID    │
+                          bound to that key  ◀─── │ (Agent       │
+                                                  │  Provider)   │
+                                                  └──────┬───────┘
+                                                         │
+             ┌───────────────────────────────────────────┴───────────────┐
+             ▼                                                           ▼
+  4. AAuth resource                                  5. OAuth-only MCP server
+     verifies the agent token against                   gets a DPoP-bound OAuth token
+     ZeroID's published keys                            from ZeroID's bridge
+```
+
+1. The platform hands the agent a short-lived identity token: a Kubernetes
+   service account token, or an AWS STS web identity token.
+2. The agent generates a key pair, then sends that token to ZeroID in a request
+   signed with the key.
+3. ZeroID checks the token against the issuer and binding an administrator set
+   up, then returns an AAuth agent token tied to the agent's key.
+4. The agent calls an AAuth resource, signing each request with its key. The
+   resource checks the agent token against ZeroID's public keys.
+5. For a resource that only understands OAuth, the agent swaps its agent token
+   for an OAuth access token scoped to that one resource, and proves it holds
+   the key on every call.
+
+## Try it in three minutes
+
+You need [Docker](https://docs.docker.com/get-docker/) (Docker Desktop is
+fine). Nothing else is installed, and nothing leaves your machine.
+
+```bash
+git clone https://github.com/highflame-ai/zeroid.git
+cd zeroid/examples/aauth
+docker compose up --build --abort-on-container-exit --exit-code-from demo-agent demo-agent
+```
+
+The first run builds ZeroID and the demo, which takes a couple of minutes.
+Then the agent tells you what it's doing at each step:
+
+```text
+[1] Platform identity token (no secret anywhere)
+    iss http://mockidp:8080/k8s
+    sub system:serviceaccount:agents:planner
+    aud [https://auth.zeroid.test]
+```
+
+The agent starts with a Kubernetes service account token. That's its only
+credential. A small mock stands in for the cluster here, so you can run the
+demo on a laptop.
+
+```text
+[2] Agent key, one per pod
+    Ed25519 key at /pod/agent.key
+```
+
+The agent creates its own key. The private half never leaves the pod.
+
+```text
+[3] Enroll at ZeroID's Agent Provider (aauth-go client, hwk-signed)
+    agent aauth:dbea2cd6-b084-4d63-a52b-762bd3b93314@auth.zeroid.test
+    iss   https://auth.zeroid.test
+    cnf   bound to this pod's key
+    exp   in 900s
+```
+
+ZeroID accepts the platform token and issues an AAuth agent identity. The
+token lasts 15 minutes and works only together with the agent's key.
+
+```text
+[4] Call an AAuth resource (aauth-go signs; the resource verifies via ZeroID's JWKS)
+    200 map[agent:aauth:dbea2cd6-…@auth.zeroid.test agent_issuer:https://auth.zeroid.test agent_jkt:xOmGL_… token_type:aa-agent+jwt]
+```
+
+An AAuth resource recognizes the agent. It verified the signature and the
+agent token itself, with no call back to ZeroID beyond fetching its public
+keys.
+
+```text
+[5] Bridge to OAuth for an MCP server (DPoP-bound, one resource)
+    sub spiffe://zeroid.test/acme/prod/agent/planner
+    aauth_agent aauth:dbea2cd6-b084-4d63-a52b-762bd3b93314@auth.zeroid.test
+    aud [https://resource.zeroid.test]
+
+[6] Call the MCP tool
+    map[content:[map[text:ran search for spiffe://zeroid.test/acme/prod/agent/planner type:text]]]
+
+Done: no secret was stored, shipped or exchanged.
+```
+
+For an MCP server that only accepts OAuth, the agent gets an access token
+limited to that one server and bound to its key, then calls a tool. The token
+carries both the agent's ZeroID identity and its AAuth identity, so the call
+can be audited back to the workload that made it.
+
+## Try it with your own AWS identity
+
+The same flow works with a real AWS identity in place of the mock cluster.
+You'll need the [AWS CLI](https://aws.amazon.com/cli/) v2.32 or later, `jq`,
+and an AWS account you can sign in to.
+
+### 1. Let your account issue identity tokens
+
+AWS can mint signed identity tokens for your IAM roles, for use with services
+outside AWS. Turn it on once per account (this needs an administrator):
+
+```bash
+aws sso login                                       # or however you sign in
+aws iam enable-outbound-web-identity-federation
+```
+
+The role you sign in with also needs permission for `sts:GetWebIdentityToken`.
+
+### 2. See who AWS says you are
+
+Mint a token and read its issuer (`iss`) and subject (`sub`):
+
+```bash
+aws sts get-web-identity-token --audience https://auth.zeroid.test --signing-algorithm RS256 \
+  --output json | jq -r .WebIdentityToken | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{iss, sub}'
+```
+
+`iss` is your account's token issuer, and `sub` is the ARN of the IAM role
+you're signed in as. In production, give each agent its own role, since every
+caller using a role gets the same agent identity.
+
+### 3. Tell ZeroID to trust that role
+
+Start ZeroID and the demo resource, then register your account as a trusted
+issuer and bind your role to the demo agent:
+
+```bash
+cd examples/aauth
+export AWS_ISSUER='https://<id>.tokens.sts.global.api.aws'    # iss from step 2
+export AWS_ROLE_ARN='arn:aws:iam::<account>:role/<role>'      # sub from step 2
+
+docker compose up -d --build postgres keygen zeroid caddy demo-resource
+docker compose run --rm -e CLUSTER_ISSUER="$AWS_ISSUER" -e SA_SUBJECT="$AWS_ROLE_ARN" demo-setup
+```
+
+### 4. Run the agent
+
+AWS tokens are valid for five minutes, so mint one right before you run:
+
+```bash
+aws sts get-web-identity-token --audience https://auth.zeroid.test --signing-algorithm RS256 \
+  --output json | jq -r .WebIdentityToken > aws-token
+
+docker compose run --rm --no-deps -e PLATFORM=k8s -e TOKEN_FILE=/aws/token \
+  -v "$PWD/aws-token:/aws/token:ro" demo-agent
+```
+
+Step `[1]` now shows your AWS account and role, and the agent runs through to
+`Done` as before.
+
+### 5. Try to steal the token
+
+Now act as an attacker who copied that AWS token and presents it with a
+different key:
+
+```bash
+docker compose run --rm --no-deps -e PLATFORM=k8s -e TOKEN_FILE=/aws/token -e KEY_FILE=/tmp/thief.key \
+  -v "$PWD/aws-token:/aws/token:ro" demo-agent
+```
+
+ZeroID refuses:
+
+```text
+agentprovider: status 403: {"error":"invalid_grant","error_description":"the attestation was already redeemed by another key"}
+```
+
+The first key to present a platform token owns it. A copy is worthless.
+
+## Verify against the AAuth reference implementation
+
+If you have Go 1.27 and Docker, you can run the interop test. It points
+aauth-go's own client and resource code at ZeroID, all in one process:
 
 ```bash
 cd examples/aauth
 GOWORK=off go test ./interop -v
 ```
 
-Needs Docker for Postgres (set `TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1` if
-testcontainers can't reach it over IPv6). It checks that:
+It checks that aauth-go's client can enroll at ZeroID, that an aauth-go
+resource accepts ZeroID's agent tokens, that the bridged OAuth token works
+only with the agent's key and stops working when the agent is revoked, and
+that a stolen platform token is refused.
 
-1. aauth-go's `agentprovider.Client` enrolls at ZeroID's `POST /ap/token`,
-   signing with aauth-go's RFC 9421 signer, and the same pod key redeems the
-   pod's platform token again;
-2. aauth-go's agent transport presents the ZeroID agent token to an aauth-go
-   `ResourceGuard`, which verifies it from ZeroID's
-   `/.well-known/aauth-agent.json` and `/ap/jwks.json`;
-3. the bridged, DPoP-bound OAuth token works at the OAuth-only resource, is
-   useless without the agent key, and dies when the agent token is revoked;
-4. another key presenting the same platform token is refused.
+## What's running
 
-## Demo
-
-```bash
-cd examples/aauth
-docker compose up --build --abort-on-container-exit --exit-code-from demo-agent demo-agent
-docker compose down -v
-```
-
-| Service | Role |
+| Service | What it does |
 | --- | --- |
-| `zeroid` | ZeroID with `aauth.enabled`, behind Caddy as `https://auth.zeroid.test` |
-| `caddy` | TLS for `auth.zeroid.test` and `resource.zeroid.test` from its local CA (AAuth issuers are https, host only) |
-| `mockidp` | Stands in for a Kubernetes cluster's service-account issuer |
-| `demo-setup` | The one-time admin setup, through ZeroID's admin API: a policy listing `aauth_agent` and `aauth_bridge`, the agent identity, the cluster's issuer row and the service account binding |
-| `demo-resource` | `/whoami`, an AAuth resource guarded by aauth-go; `/mcp`, an OAuth-only tool that takes the bridged DPoP token and introspects it |
-| `demo-agent` | The workload, narrating each step |
+| `zeroid` | ZeroID, acting as the AAuth Agent Provider at `https://auth.zeroid.test` |
+| `caddy` | Serves ZeroID and the resource over HTTPS, as AAuth requires |
+| `keygen` | Creates ZeroID's signing keys on first start |
+| `mockidp` | Stands in for a Kubernetes cluster's token issuer |
+| `demo-setup` | The administrator's one-time setup: which issuer to trust, which service account (or AWS role) maps to which agent, and which credentials that agent may receive |
+| `demo-resource` | Two endpoints: `/whoami`, an AAuth resource, and `/mcp`, an OAuth-only MCP-style tool |
+| `demo-agent` | The workload: no secrets, one key |
 
-### Use a throwaway database
+## Taking it further
 
-This branch adds migration 073 but not main's 069–072. A persistent database
-migrated by it is recorded at version 73, and later builds of main would then
-skip 069–072. The compose demo uses its own Postgres volume
-(`docker compose down -v` removes it); don't point this branch at a shared or
-long-lived database until it is rebased onto main.
+This demo trades some safety for convenience, so it runs anywhere with no
+setup. A production deployment would:
 
-### Dev-only settings
+- keep ZeroID's admin API private (here it's reachable for the setup step);
+- verify an issuer is genuine before trusting it (here it's trusted directly);
+- turn off the demo's `ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS` and
+  `ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION` settings.
 
-The compose file turns on settings that must stay off in production:
-`ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS` (the mock issuer is plain http),
-`ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION` (the demo resource introspects
-without client credentials), and the issuer row is written enabled directly,
-skipping the proof of control Highflame Admin runs before enabling one. ZeroID's
-admin API is reachable through Caddy too; a real deployment keeps it private.
-
-## On a real cluster or cloud
-
-`demo-agent` also takes `PLATFORM=k8s` (a projected service account token file
-with audience ZeroID's issuer and `expirationSeconds: 600`; `TOKEN_FILE`) and
-`PLATFORM=aws` (an STS web identity token from the AWS CLI). The Kubernetes
-path is written but not yet run on a real cluster.
-
-### With a real AWS token
-
-Verified on 2026-11-26 against a real account. The account needs outbound
-identity federation (`aws iam enable-outbound-web-identity-federation`, which
-prints its issuer) and the principal `sts:GetWebIdentityToken`. The token's
-`sub` is the role ARN, so bind that.
-
-```bash
-docker compose up -d --build postgres keygen zeroid caddy demo-resource
-docker compose run --rm -e CLUSTER_ISSUER=<account issuer> -e SA_SUBJECT=<role ARN> demo-setup
-aws sts get-web-identity-token --audience https://auth.zeroid.test --signing-algorithm RS256 \
-  --output json | jq -r .WebIdentityToken > aws-token        # valid 5 minutes
-docker compose run --rm --no-deps -e PLATFORM=k8s -e TOKEN_FILE=/aws/token \
-  -v "$PWD/aws-token:/aws/token:ro" demo-agent
-docker compose down -v && rm -f aws-token
-``` Keep `KEY_FILE` on a volume
-every container of the pod shares (an `emptyDir`): the pod keeps one agent key,
-which is what lets a restarted container redeem the pod's platform token again.
+On a real Kubernetes cluster, project a service account token into the pod
+with its `audience` set to your ZeroID URL and `expirationSeconds: 600`. Point
+the agent at it with `PLATFORM=k8s` and `TOKEN_FILE`. Keep the agent's key
+(`KEY_FILE`) on a volume shared by the pod's containers, so the pod keeps one
+identity for its whole life.
