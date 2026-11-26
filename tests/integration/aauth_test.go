@@ -123,7 +123,7 @@ func newAAuthServer(t *testing.T) (*zeroid.Server, *httptest.Server) {
 		Logging:     zeroid.LoggingConfig{Level: "warn"},
 		WIMSEDomain: testWIMSE,
 		Federation:  zeroid.FederationConfig{IssuerStore: "db", AllowPrivateEndpoints: true},
-		AAuth:       zeroid.AAuthConfig{Enabled: true, SigningKeyPath: keyPath, Name: "ZeroID test AP"},
+		AAuth:       zeroid.AAuthConfig{Enabled: true, SigningKeyPath: keyPath, Name: "ZeroID test AP", LogoURI: "https://zeroid.test/logo.svg"},
 	}
 	insecure := &http.Client{
 		Timeout:   5 * time.Second,
@@ -243,6 +243,9 @@ func TestAAuthAgentProvider(t *testing.T) {
 		meta := a.getJSON(t, "/.well-known/aauth-agent.json")
 		assert.Equal(t, federationIssuer, meta["issuer"], "issuer byte-matches the URL it is served from")
 		assert.Equal(t, federationIssuer+"/ap/jwks.json", meta["jwks_uri"])
+		assert.Equal(t, "ZeroID test AP", meta["name"])
+		assert.Equal(t, "https://zeroid.test/logo.svg", meta["logo_uri"])
+		assert.NotContains(t, meta, "tos_uri", "unset display members are left out")
 
 		set, err := jwk.Parse(a.getRaw(t, "/ap/jwks.json"))
 		require.NoError(t, err)
@@ -318,7 +321,7 @@ func TestAAuthAgentProvider(t *testing.T) {
 			res := a.bootstrap(t, newAgentKey(t), platform)
 			assert.Equal(t, http.StatusForbidden, res.status, name)
 			assert.Equal(t, "access_denied", res.body["error"], name)
-			assert.Equal(t, "the attestation was not accepted", res.body["error_description"], name)
+			assert.Equal(t, "the attestation was not accepted", res.body["detail"], name)
 		}
 	})
 
@@ -338,6 +341,8 @@ func TestAAuthAgentProvider(t *testing.T) {
 		res := a.do(t, unsigned)
 		assert.Equal(t, http.StatusUnauthorized, res.status)
 		assert.Equal(t, "error=invalid_signature", res.headers.Get("Signature-Error"))
+		assert.Equal(t, "application/problem+json", res.headers.Get("Content-Type"))
+		assert.Equal(t, "invalid_signature", res.body["error"], "the AAuth error body repeats the code")
 
 		stale := a.do(t, a.signedBootstrap(t, newAgentKey(t), body, aauthHost, time.Now().Add(-2*time.Minute)))
 		assert.Equal(t, http.StatusUnauthorized, stale.status)
@@ -360,7 +365,7 @@ func TestAAuthAgentProvider(t *testing.T) {
 		retry := off.bootstrap(t, k, platform)
 		assert.Equal(t, http.StatusForbidden, retry.status, "body=%v", retry.body)
 		assert.Equal(t, "invalid_grant", retry.body["error"])
-		assert.Contains(t, retry.body["error_description"], "was refused")
+		assert.Contains(t, retry.body["detail"], "was refused")
 		assert.Empty(t, retry.headers.Get("Retry-After"))
 	})
 
@@ -372,7 +377,7 @@ func TestAAuthAgentProvider(t *testing.T) {
 		res := short.bootstrap(t, newAgentKey(t), short.assertion(t, nil))
 		assert.Equal(t, http.StatusForbidden, res.status)
 		assert.Equal(t, "access_denied", res.body["error"])
-		assert.Contains(t, res.body["error_description"], "over 300s")
+		assert.Contains(t, res.body["detail"], "over 300s")
 	})
 }
 

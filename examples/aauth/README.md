@@ -250,7 +250,7 @@ docker compose run --rm --no-deps -e PLATFORM=k8s -e TOKEN_FILE=/aws/token -e KE
 ZeroID refuses:
 
 ```text
-agentprovider: status 403: {"error":"invalid_grant","error_description":"the attestation was already redeemed by another key"}
+agentprovider: status 403: {"error":"invalid_grant","detail":"the attestation was already redeemed by another key"}
 ```
 
 The first key to present a platform token owns it. A copy is worthless.

@@ -444,8 +444,8 @@ func ResolveHWK(params map[string]any) (JWK, error) {
 }
 
 // WriteSigError answers a signature failure: 401, the Signature-Error
-// header, the Accept-Signature-* header the code calls for, and an RFC 9457
-// problem body whose type is the error's URN.
+// header, the Accept-Signature-* header the code calls for, and the AAuth
+// error body.
 func WriteSigError(w http.ResponseWriter, e *SigError) {
 	errDict := httpsfv.NewDictionary()
 	errDict.Add("error", httpsfv.NewItem(httpsfv.Token(e.Code)))
@@ -465,5 +465,7 @@ func WriteSigError(w http.ResponseWriter, e *SigError) {
 	case ErrCodeUnsupportedAlgorithm:
 		w.Header().Set(HeaderAcceptSignatureAlg, strings.Join(SupportedAlgs, ", "))
 	}
-	writeProblem(w, http.StatusUnauthorized, "urn:ietf:params:sig-error:"+e.Code, "Signature verification failed", e.Detail)
+	// The Signature-Error header is what agents act on; the body only
+	// repeats it in the AAuth error format.
+	writeError(w, http.StatusUnauthorized, e.Code, e.Detail)
 }

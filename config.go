@@ -118,6 +118,15 @@ type AAuthConfig struct {
 	AgentTokenTTLSeconds int `koanf:"agent_token_ttl_seconds"`
 	// Name is the display name in /.well-known/aauth-agent.json. Optional.
 	Name string `koanf:"name"`
+	// Optional display members of /.well-known/aauth-agent.json. A person
+	// server shows the name and logo when a person approves an agent. URLs
+	// must be https.
+	Description      string `koanf:"description"` // Markdown
+	LogoURI          string `koanf:"logo_uri"`
+	LogoDarkURI      string `koanf:"logo_dark_uri"`
+	DocumentationURI string `koanf:"documentation_uri"`
+	TOSURI           string `koanf:"tos_uri"`
+	PolicyURI        string `koanf:"policy_uri"`
 }
 
 // IdentityTreeConfig bounds registration trees: the identities an identity
@@ -1064,6 +1073,14 @@ func (c *Config) Validate() error {
 		if t := c.AAuth.AgentTokenTTLSeconds; t != 0 && (t <= 300 || t > 3600) {
 			return fmt.Errorf("aauth.agent_token_ttl_seconds must be over 300 and at most 3600, got %d", t)
 		}
+		for name, v := range map[string]string{
+			"logo_uri": c.AAuth.LogoURI, "logo_dark_uri": c.AAuth.LogoDarkURI,
+			"documentation_uri": c.AAuth.DocumentationURI, "tos_uri": c.AAuth.TOSURI, "policy_uri": c.AAuth.PolicyURI,
+		} {
+			if u, err := url.Parse(v); v != "" && (err != nil || u.Scheme != "https" || u.Host == "") {
+				return fmt.Errorf("aauth.%s must be an https URL, got %q", name, v)
+			}
+		}
 	}
 
 	seen := make(map[string]struct{}, len(c.ExternalIssuers))
@@ -1557,6 +1574,12 @@ var envMapping = map[string]string{
 	"ZEROID_AAUTH_SIGNING_KEY_ID":               "aauth.signing_key_id",
 	"ZEROID_AAUTH_AGENT_TOKEN_TTL_SECONDS":      "aauth.agent_token_ttl_seconds",
 	"ZEROID_AAUTH_NAME":                         "aauth.name",
+	"ZEROID_AAUTH_DESCRIPTION":                  "aauth.description",
+	"ZEROID_AAUTH_LOGO_URI":                     "aauth.logo_uri",
+	"ZEROID_AAUTH_LOGO_DARK_URI":                "aauth.logo_dark_uri",
+	"ZEROID_AAUTH_DOCUMENTATION_URI":            "aauth.documentation_uri",
+	"ZEROID_AAUTH_TOS_URI":                      "aauth.tos_uri",
+	"ZEROID_AAUTH_POLICY_URI":                   "aauth.policy_uri",
 	"ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS": "federation.allow_private_endpoints",
 	// First-contact bounds.
 	"ZEROID_FEDERATION_FIRST_CONTACT_RATE_PER_MINUTE":            "federation.first_contact.rate_per_minute",

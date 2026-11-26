@@ -1250,3 +1250,27 @@ func TestLoadServiceTokensFromYAML(t *testing.T) {
 		t.Fatal("service_tokens must be off by default")
 	}
 }
+
+func TestValidateAAuthMetadataURLs(t *testing.T) {
+	base := func(t *testing.T) Config {
+		cfg := baseValidConfig(t)
+		cfg.Federation.IssuerStore = "db"
+		cfg.AAuth = AAuthConfig{Enabled: true, SigningKeyPath: "/keys/aauth.pem"}
+		return cfg
+	}
+	cfg := base(t)
+	cfg.AAuth.LogoURI = "https://example.com/logo.svg"
+	cfg.AAuth.Description = "not a URL, and not checked as one"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid metadata refused: %v", err)
+	}
+
+	for _, bad := range []string{"http://example.com/logo.svg", "logo.svg", "https://"} {
+		cfg := base(t)
+		cfg.AAuth.TOSURI = bad
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "aauth.tos_uri must be an https URL") {
+			t.Errorf("tos_uri %q: got %v, want the https refusal", bad, err)
+		}
+	}
+}

@@ -14,17 +14,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// writeProblem writes an RFC 9457 problem body.
-func writeProblem(w http.ResponseWriter, status int, typ, title, detail string) {
+// writeError writes an AAuth error response (protocol draft, "Error Response
+// Format"): an RFC 9457 problem body whose REQUIRED error member is the code,
+// with the explanation in detail. Every /ap/* error uses it. (The bridge
+// grant is an OAuth token endpoint and keeps RFC 6749 errors.)
+func writeError(w http.ResponseWriter, status int, code, detail string) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"type": typ, "title": title, "status": status, "detail": detail})
-}
-
-// writeOAuthError writes an OAuth-style error body (RFC 6749 §5.2 shape),
-// which the Agent Provider's token endpoint uses for refusals after the
-// signature verified.
-func writeOAuthError(w http.ResponseWriter, status int, code, description string) {
-	writeJSON(w, status, map[string]string{"error": code, "error_description": description})
+	body := map[string]any{"error": code}
+	if detail != "" {
+		body["detail"] = detail
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }

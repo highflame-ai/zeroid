@@ -65,6 +65,10 @@ type Config struct {
 	AgentTokenTTL time.Duration
 	// Name is the display name in the metadata document. Optional.
 	Name string
+	// Metadata are optional display members of the metadata document
+	// (description, logo_uri, logo_dark_uri, documentation_uri, tos_uri,
+	// policy_uri), validated by the caller. Empty values are left out.
+	Metadata map[string]string
 }
 
 // Deps are the ZeroID services the Agent Provider builds on.
@@ -159,6 +163,11 @@ func (p *Provider) handleMetadata(w http.ResponseWriter, _ *http.Request) {
 	if p.cfg.Name != "" {
 		doc["name"] = p.cfg.Name
 	}
+	for k, v := range p.cfg.Metadata {
+		if v != "" {
+			doc[k] = v
+		}
+	}
 	writeCacheableJSON(w, doc)
 }
 
@@ -204,7 +213,7 @@ type bootstrapRequest struct {
 func (p *Provider) handleToken(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBootstrapBody+1))
 	if err != nil || len(body) > maxBootstrapBody {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "the request body is unreadable or too large")
+		writeError(w, http.StatusBadRequest, "invalid_request", "the request body is unreadable or too large")
 		return
 	}
 
@@ -233,7 +242,7 @@ func (p *Provider) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	var req bootstrapRequest
 	if err := json.Unmarshal(body, &req); err != nil || req.Attestation == "" {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", `the body must be {"attestation": "<platform token>"}`)
+		writeError(w, http.StatusBadRequest, "invalid_request", `the body must be {"attestation": "<platform token>"}`)
 		return
 	}
 
@@ -249,11 +258,11 @@ func (p *Provider) handleToken(w http.ResponseWriter, r *http.Request) {
 			if refusal.retryAfter > 0 {
 				w.Header().Set("Retry-After", fmt.Sprint(refusal.retryAfter))
 			}
-			writeOAuthError(w, status, refusal.code, refusal.description)
+			writeError(w, status, refusal.code, refusal.description)
 			return
 		}
 		log.Error().Err(err).Msg("aauth: bootstrap failed")
-		writeOAuthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "agent token issuance is temporarily unavailable")
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "agent token issuance is temporarily unavailable")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agent_token": agentToken, "expires_in": ttl})
