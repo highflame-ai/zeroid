@@ -635,3 +635,75 @@ func TestAAuthTokenConfusion(t *testing.T) {
 		}
 	})
 }
+
+// newAAuthFirstContactFed is a db-mode ZeroID with the Agent Provider on and
+// a mock cluster row whose first_contact is settings(tn), with no binding.
+// The mapped project's default policy, which first contact's identities
+// take, lists defaultGrants.
+func newAAuthFirstContactFed(t *testing.T, settings func(fcTenant) map[string]any, defaultGrants ...string) (*aauthFed, fcTenant) {
+	t.Helper()
+	idp, err := mockidp.New("https://placeholder")
+	require.NoError(t, err)
+	idpSrv := httptest.NewTLSServer(idp.Handler())
+	t.Cleanup(idpSrv.Close)
+	idp.SetBaseURL(idpSrv.URL)
+	f := &dbFederation{idp: idp, idpSrv: idpSrv, members: map[string]string{}}
+	f.srv, f.http = newAAuthServer(t)
+
+	tn := newFCTenant(t)
+	createRichCredentialPolicy(t, map[string]any{
+		"name":                "default",
+		"allowed_grant_types": defaultGrants,
+		"allowed_scopes":      []string{"tools:read"},
+		"max_ttl_seconds":     3600,
+	}, tn.mappedHeaders)
+	body := map[string]any{
+		"kind": "workload", "display_name": "Mock cluster", "issuer": idp.K8sIssuer(),
+		"audiences": []string{federationIssuer},
+	}
+	for k, v := range settings(tn) {
+		body[k] = v
+	}
+	status, got := f.call(t, http.MethodPost, "/external-issuers", body, tn.headers)
+	require.Equal(t, http.StatusCreated, status, "create workload row: %v", got)
+	w := &workloadFed{f: f, tn: tn.tiTenant, rowID: got["id"].(string), sub: newSA()}
+	return &aauthFed{workloadFed: w}, tn
+}
+
+// First contact applies at /ap/token as at the federated client_credentials
+// grant: a platform token means the same thing at both endpoints. The
+// credential policy's aauth_agent opt-in still applies to the agent it
+// registers.
+func TestAAuthFirstContact(t *testing.T) {
+	t.Run("discover registers the agent unadopted and refuses it", func(t *testing.T) {
+		a, tn := newAAuthFirstContactFed(t, discoverSettings, "aauth_agent")
+		res := a.bootstrap(t, newAgentKey(t), a.assertion(t, nil))
+		assert.Equal(t, http.StatusForbidden, res.status, "body=%v", res.body)
+		assert.Equal(t, "invalid_grant", res.body["error"])
+
+		ids := tn.firstContactIdentities(t)
+		require.Len(t, ids, 1, "registered for an admin to adopt")
+		assert.Equal(t, "discovered", ids[0]["status"])
+	})
+
+	t.Run("adopt registers the agent and serves it when its policy lists aauth_agent", func(t *testing.T) {
+		a, tn := newAAuthFirstContactFed(t, adoptSettings, "aauth_agent")
+		k := newAgentKey(t)
+		res := a.bootstrap(t, k, a.assertion(t, nil))
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+
+		ids := tn.firstContactIdentities(t)
+		require.Len(t, ids, 1)
+		claims := decodeJWTPayload(t, res.body["agent_token"].(string))
+		assert.Equal(t, "aauth:"+ids[0]["id"].(string)+"@"+aauthHost, claims["sub"])
+		assert.Equal(t, k.x, claims["cnf"].(map[string]any)["jwk"].(map[string]any)["x"])
+	})
+
+	t.Run("adopt does not opt the agent in to AAuth: its policy must list aauth_agent", func(t *testing.T) {
+		a, tn := newAAuthFirstContactFed(t, adoptSettings, "client_credentials")
+		res := a.bootstrap(t, newAgentKey(t), a.assertion(t, nil))
+		assert.Equal(t, http.StatusForbidden, res.status, "body=%v", res.body)
+		assert.Equal(t, "access_denied", res.body["error"])
+		assert.Len(t, tn.firstContactIdentities(t), 1, "registered, but issued nothing")
+	})
+}
