@@ -691,11 +691,12 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// RequestURLMiddleware, which records the authority a signature covers.
 	if cfg.AAuth.Enabled {
 		provider, err := aauth.New(aauth.Config{
-			Issuer:         cfg.Token.Issuer,
-			SigningKeyPath: cfg.AAuth.SigningKeyPath,
-			SigningKeyID:   cfg.AAuth.SigningKeyID,
-			AgentTokenTTL:  time.Duration(cfg.AAuth.AgentTokenTTLSeconds) * time.Second,
-			Name:           cfg.AAuth.Name,
+			Issuer:           cfg.Token.Issuer,
+			SigningKeyPath:   cfg.AAuth.SigningKeyPath,
+			SigningKeyID:     cfg.AAuth.SigningKeyID,
+			AgentTokenTTL:    time.Duration(cfg.AAuth.AgentTokenTTLSeconds) * time.Second,
+			Name:             cfg.AAuth.Name,
+			MaxLiveSubagents: cfg.AAuth.MaxLiveSubagents,
 			Metadata: map[string]string{
 				"description": cfg.AAuth.Description, "logo_uri": cfg.AAuth.LogoURI, "logo_dark_uri": cfg.AAuth.LogoDarkURI,
 				"documentation_uri": cfg.AAuth.DocumentationURI, "tos_uri": cfg.AAuth.TOSURI, "policy_uri": cfg.AAuth.PolicyURI,

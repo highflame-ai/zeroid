@@ -62,6 +62,12 @@ const (
 	// (parent_jti), so revoking the agent token revokes it. A tenant opts in
 	// separately, by listing it beside aauth_agent.
 	GrantTypeAAuthBridge GrantType = "aauth_bridge"
+	// GrantTypeAAuthSubagent is the stored form of an AAuth sub-agent token
+	// (an aa-agent+jwt with parent_agent) minted at POST /ap/subagent for a
+	// parent agent token. It is always the child of that agent token
+	// (parent_jti), so revoking the parent revokes it. A tenant opts in
+	// separately, by listing it beside aauth_agent.
+	GrantTypeAAuthSubagent GrantType = "aauth_subagent"
 )
 
 // GrantTypeAAuthBridgeURN is the grant_type a client sends to exchange an
@@ -72,7 +78,14 @@ const GrantTypeAAuthBridgeURN = "urn:highflame:params:oauth:grant-type:aauth-age
 // AAuth endpoints.
 func (g GrantType) IsAAuth() bool {
 	n := NormalizeGrantType(string(g))
-	return n == GrantTypeAAuthAgent || n == GrantTypeAAuthBridge
+	return n == GrantTypeAAuthAgent || n == GrantTypeAAuthBridge || n == GrantTypeAAuthSubagent
+}
+
+// IsAAuthAgentToken reports whether g is stored for an aa-agent+jwt: an
+// agent token or a sub-agent token.
+func (g GrantType) IsAAuthAgentToken() bool {
+	n := NormalizeGrantType(string(g))
+	return n == GrantTypeAAuthAgent || n == GrantTypeAAuthSubagent
 }
 
 // GrantTypeAssertedTenantURN is the grant_type a client sends for the
@@ -97,6 +110,7 @@ var allValidGrantTypes = map[GrantType]bool{
 	GrantTypeCIBA:              true,
 	GrantTypeAAuthAgent:        true,
 	GrantTypeAAuthBridge:       true,
+	GrantTypeAAuthSubagent:     true,
 }
 
 // NormalizeGrantType converts a grant type string to its canonical short form.

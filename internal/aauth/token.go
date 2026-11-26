@@ -64,19 +64,34 @@ func (k *signingKey) jwks() map[string]any {
 	return map[string]any{"keys": []JWK{k.jwk}}
 }
 
+// errAgentTokenExpired is verify's error for an agent token past its exp.
+var errAgentTokenExpired = errors.New("expired")
+
 // agentClaims are the claims of an agent token ZeroID issues.
 type agentClaims struct {
 	Subject   string
 	JTI       string
 	ExpiresAt time.Time
 	Cnf       JWK
+	// PS is the agent's person server (the ps claim), if it has one.
+	PS string
+	// ParentAgent, set only on a sub-agent token, is its parent's agent
+	// identifier: the authoritative marker of a sub-agent.
+	ParentAgent string
+}
+
+// tokenExtras are an agent token's optional claims.
+type tokenExtras struct {
+	PS          string // ps
+	ParentAgent string // parent_agent
 }
 
 // sign returns the signed agent token: typ aa-agent+jwt, alg Ed25519, the
-// common claims (iss, dwk, jti, iat, exp, cnf) and sub, the agent identifier.
-func (k *signingKey) sign(issuer, sub string, cnf JWK, jti string, iat, exp time.Time) (string, error) {
+// common claims (iss, dwk, jti, iat, exp, cnf), sub, the agent identifier,
+// and the optional ps and parent_agent.
+func (k *signingKey) sign(issuer, sub string, cnf JWK, jti string, iat, exp time.Time, extra tokenExtras) (string, error) {
 	tok := jwt.New()
-	for name, v := range map[string]any{
+	claims := map[string]any{
 		jwt.IssuerKey:     issuer,
 		"dwk":             AgentMetadataDWK,
 		jwt.SubjectKey:    sub,
@@ -84,7 +99,14 @@ func (k *signingKey) sign(issuer, sub string, cnf JWK, jti string, iat, exp time
 		jwt.IssuedAtKey:   iat,
 		jwt.ExpirationKey: exp,
 		"cnf":             map[string]any{"jwk": cnf.PublicJWK()},
-	} {
+	}
+	if extra.PS != "" {
+		claims["ps"] = extra.PS
+	}
+	if extra.ParentAgent != "" {
+		claims["parent_agent"] = extra.ParentAgent
+	}
+	for name, v := range claims {
 		if err := tok.Set(name, v); err != nil {
 			return "", fmt.Errorf("agent token claim %s: %w", name, err)
 		}
@@ -125,8 +147,11 @@ func (k *signingKey) verify(raw, issuer string, now time.Time) (*agentClaims, er
 		return nil, errors.New("dwk is not " + AgentMetadataDWK)
 	}
 	exp, ok := tok.Expiration()
-	if !ok || !now.Before(exp) {
-		return nil, errors.New("expired")
+	if !ok {
+		return nil, errors.New("no exp")
+	}
+	if !now.Before(exp) {
+		return nil, errAgentTokenExpired
 	}
 	sub, _ := tok.Subject()
 	jti, _ := tok.JwtID()
@@ -146,5 +171,16 @@ func (k *signingKey) verify(raw, issuer string, now time.Time) (*agentClaims, er
 	if err := json.Unmarshal(b, &key); err != nil || key.Kty == "" {
 		return nil, errors.New("no cnf.jwk")
 	}
-	return &agentClaims{Subject: sub, JTI: jti, ExpiresAt: exp, Cnf: key}, nil
+	out := &agentClaims{Subject: sub, JTI: jti, ExpiresAt: exp, Cnf: key}
+	if v, ok := tok.Field("ps"); ok {
+		if out.PS, ok = v.(string); !ok {
+			return nil, errors.New("ps is not a string")
+		}
+	}
+	if v, ok := tok.Field("parent_agent"); ok {
+		if out.ParentAgent, ok = v.(string); !ok || !strings.HasPrefix(out.ParentAgent, "aauth:") {
+			return nil, errors.New("parent_agent is not an agent identifier")
+		}
+	}
+	return out, nil
 }

@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -162,20 +163,34 @@ func (k agentKey) thumbprint() string {
 // for authority (RFC 9421, AAuth profile), created at created.
 func (a *aauthFed) signedBootstrap(t *testing.T, k agentKey, body, authority string, created time.Time) *http.Request {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, a.f.http.URL+"/ap/token", strings.NewReader(body))
+	sigKey := fmt.Sprintf(`sig=hwk;kty="OKP";crv="Ed25519";x="%s";alg="Ed25519"`, k.x)
+	return a.signedAP(t, k, "/ap/token", sigKey, body, authority, created)
+}
+
+// signedSubagent builds POST /ap/subagent with body, signed with k under the
+// jwt scheme presenting agentToken.
+func (a *aauthFed) signedSubagent(t *testing.T, k agentKey, agentToken, body string) *http.Request {
+	t.Helper()
+	return a.signedAP(t, k, "/ap/subagent", `sig=jwt;jwt="`+agentToken+`"`, body, aauthHost, time.Now())
+}
+
+// signedAP builds a POST to path with body, signed with k under sigKey for
+// authority (RFC 9421, AAuth profile), created at created.
+func (a *aauthFed) signedAP(t *testing.T, k agentKey, path, sigKey, body, authority string, created time.Time) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, a.f.http.URL+path, strings.NewReader(body))
 	require.NoError(t, err)
 	req.Host = authority
 	req.Header.Set("Content-Type", "application/json")
 	sum := sha256.Sum256([]byte(body))
 	digest := "sha-256=:" + base64.StdEncoding.EncodeToString(sum[:]) + ":"
 	req.Header.Set("Content-Digest", digest)
-	sigKey := fmt.Sprintf(`sig=hwk;kty="OKP";crv="Ed25519";x="%s";alg="Ed25519"`, k.x)
 	req.Header.Set("Signature-Key", sigKey)
 	params := fmt.Sprintf(`("@method" "@authority" "@path" "signature-key" "content-digest" "content-type");created=%d`, created.Unix())
 	base := strings.Join([]string{
 		`"@method": POST`,
 		`"@authority": ` + authority,
-		`"@path": /ap/token`,
+		`"@path": ` + path,
 		`"signature-key": ` + sigKey,
 		`"content-digest": ` + digest,
 		`"content-type": application/json`,
@@ -710,5 +725,138 @@ func TestAAuthFirstContact(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, res.status, "body=%v", res.body)
 		assert.Equal(t, "access_denied", res.body["error"])
 		assert.Len(t, tn.firstContactIdentities(t), 1, "registered, but issued nothing")
+	})
+}
+
+// subagent asks for a sub-agent token for child, signed by parentKey with
+// parentToken; disc may be empty.
+func (a *aauthFed) subagent(t *testing.T, parentKey agentKey, parentToken string, child agentKey, disc string) apResponse {
+	t.Helper()
+	body := map[string]any{"jwk": map[string]string{"kty": "OKP", "crv": "Ed25519", "x": child.x, "alg": "Ed25519"}}
+	if disc != "" {
+		body["discriminator"] = disc
+	}
+	b, err := json.Marshal(body)
+	require.NoError(t, err)
+	return a.do(t, a.signedSubagent(t, parentKey, parentToken, string(b)))
+}
+
+func TestAAuthSubagents(t *testing.T) {
+	a := newAAuthFed(t, "aauth_agent", "aauth_subagent", "aauth_bridge")
+	enroll := func(t *testing.T) (agentKey, string) {
+		t.Helper()
+		k := newAgentKey(t)
+		res := a.bootstrap(t, k, a.assertion(t, nil))
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		return k, res.body["agent_token"].(string)
+	}
+
+	t.Run("a parent gets a sub-agent token for the sub-agent's own key", func(t *testing.T) {
+		pk, parent := enroll(t)
+		child := newAgentKey(t)
+		res := a.subagent(t, pk, parent, child, "search1")
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+
+		pc := decodeJWTPayload(t, parent)
+		sc := decodeJWTPayload(t, res.body["agent_token"].(string))
+		assert.Equal(t, "aa-agent+jwt", decodeJWTHeader(t, res.body["agent_token"].(string))["typ"])
+		assert.Equal(t, pc["iss"], sc["iss"], "a sub-agent's iss is its parent's")
+		assert.Equal(t, "aauth:"+a.agent+"+search1@"+aauthHost, sc["sub"])
+		assert.Equal(t, pc["sub"], sc["parent_agent"])
+		assert.Equal(t, child.x, sc["cnf"].(map[string]any)["jwk"].(map[string]any)["x"])
+		assert.LessOrEqual(t, sc["exp"].(float64), pc["exp"].(float64), "never outlives its parent")
+
+		row := a.credential(t, sc["jti"].(string))
+		require.NotNil(t, row)
+		assert.Equal(t, "aauth_subagent", row["grant_type"])
+	})
+
+	t.Run("without a discriminator, the Agent Provider picks one", func(t *testing.T) {
+		pk, parent := enroll(t)
+		res := a.subagent(t, pk, parent, newAgentKey(t), "")
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		sub := decodeJWTPayload(t, res.body["agent_token"].(string))["sub"].(string)
+		assert.Regexp(t, `^aauth:`+a.agent+`\+[A-Za-z0-9_-]{8}@`+regexp.QuoteMeta(aauthHost)+`$`, sub)
+	})
+
+	t.Run("a sub-agent may not have sub-agents", func(t *testing.T) {
+		pk, parent := enroll(t)
+		child := newAgentKey(t)
+		res := a.subagent(t, pk, parent, child, "c1")
+		require.Equal(t, http.StatusOK, res.status)
+		grand := a.subagent(t, child, res.body["agent_token"].(string), newAgentKey(t), "c2")
+		assert.Equal(t, http.StatusForbidden, grand.status, "body=%v", grand.body)
+		assert.Equal(t, "denied", grand.body["error"])
+	})
+
+	t.Run("bad requests are refused", func(t *testing.T) {
+		pk, parent := enroll(t)
+		same := a.subagent(t, pk, parent, pk, "self")
+		assert.Equal(t, http.StatusBadRequest, same.status, "a sub-agent never holds its parent's key")
+		plus := a.subagent(t, pk, parent, newAgentKey(t), "a+b")
+		assert.Equal(t, http.StatusBadRequest, plus.status, "+ delimits the discriminator")
+		assert.Equal(t, "application/problem+json", plus.headers.Get("Content-Type"))
+		assert.Equal(t, "invalid_request", plus.body["error"])
+	})
+
+	t.Run("only the parent's own key, under the jwt scheme, may ask", func(t *testing.T) {
+		pk, parent := enroll(t)
+		_ = pk
+		thief := newAgentKey(t)
+		res := a.subagent(t, thief, parent, newAgentKey(t), "x")
+		assert.Equal(t, http.StatusUnauthorized, res.status, "signed by a key the token does not bind")
+		assert.NotEmpty(t, res.headers.Get("Signature-Error"))
+
+		hwk := a.do(t, a.signedAP(t, pk, "/ap/subagent",
+			fmt.Sprintf(`sig=hwk;kty="OKP";crv="Ed25519";x="%s";alg="Ed25519"`, pk.x), `{}`, aauthHost, time.Now()))
+		assert.Equal(t, http.StatusUnauthorized, hwk.status)
+		assert.Contains(t, hwk.headers.Get("Signature-Error"), "unsupported_scheme")
+	})
+
+	t.Run("revoking the parent revokes its sub-agents, and it can spawn no more", func(t *testing.T) {
+		pk, parent := enroll(t)
+		res := a.subagent(t, pk, parent, newAgentKey(t), "r1")
+		require.Equal(t, http.StatusOK, res.status)
+		childJTI := decodeJWTPayload(t, res.body["agent_token"].(string))["jti"].(string)
+		parentRow := a.credential(t, decodeJWTPayload(t, parent)["jti"].(string))
+		status, body := a.f.call(t, http.MethodPost, "/credentials/"+parentRow["id"].(string)+"/revoke",
+			map[string]any{"reason": "test"}, a.tn.headers)
+		require.Contains(t, []int{http.StatusOK, http.StatusNoContent}, status, "revoke: %v", body)
+		assert.Equal(t, true, a.credential(t, childJTI)["is_revoked"], "cascade through parent_jti")
+
+		again := a.subagent(t, pk, parent, newAgentKey(t), "r2")
+		assert.Equal(t, http.StatusUnauthorized, again.status)
+		assert.Contains(t, again.headers.Get("Signature-Error"), "revoked_jwt")
+	})
+
+	t.Run("a sub-agent token cannot be bridged to OAuth", func(t *testing.T) {
+		pk, parent := enroll(t)
+		child := newAgentKey(t)
+		res := a.subagent(t, pk, parent, child, "b1")
+		require.Equal(t, http.StatusOK, res.status)
+		bridged := a.bridge(t, res.body["agent_token"].(string), &child, nil)
+		assert.Equal(t, http.StatusBadRequest, bridged.status)
+		assert.Equal(t, "invalid_grant", bridged.body["error"])
+	})
+
+	t.Run("one parent's live sub-agents are bounded", func(t *testing.T) {
+		pk, parent := enroll(t)
+		for i := 0; i < 16; i++ {
+			res := a.subagent(t, pk, parent, newAgentKey(t), fmt.Sprintf("n%d", i))
+			require.Equal(t, http.StatusOK, res.status, "sub-agent %d: %v", i, res.body)
+		}
+		over := a.subagent(t, pk, parent, newAgentKey(t), "n16")
+		assert.Equal(t, http.StatusForbidden, over.status)
+		assert.Equal(t, "denied", over.body["error"])
+	})
+
+	t.Run("a policy that does not list aauth_subagent is not opted in", func(t *testing.T) {
+		off := newAAuthFed(t, "aauth_agent")
+		k := newAgentKey(t)
+		res := off.bootstrap(t, k, off.assertion(t, nil))
+		require.Equal(t, http.StatusOK, res.status)
+		sub := off.subagent(t, k, res.body["agent_token"].(string), newAgentKey(t), "x")
+		assert.Equal(t, http.StatusForbidden, sub.status, "body=%v", sub.body)
+		assert.Equal(t, "denied", sub.body["error"])
 	})
 }

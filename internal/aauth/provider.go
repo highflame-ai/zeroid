@@ -65,6 +65,9 @@ type Config struct {
 	AgentTokenTTL time.Duration
 	// Name is the display name in the metadata document. Optional.
 	Name string
+	// MaxLiveSubagents bounds one parent agent token's live sub-agent
+	// tokens. Zero means DefaultMaxLiveSubagents.
+	MaxLiveSubagents int
 	// Metadata are optional display members of the metadata document
 	// (description, logo_uri, logo_dark_uri, documentation_uri, tos_uri,
 	// policy_uri), validated by the caller. Empty values are left out.
@@ -88,6 +91,7 @@ type Provider struct {
 	creds       *service.CredentialService
 	identities  *service.IdentityService
 	redemptions *redemptions
+	db          *bun.DB
 	now         func() time.Time
 }
 
@@ -112,6 +116,9 @@ func New(cfg Config, deps Deps) (*Provider, error) {
 	if cfg.AgentTokenTTL <= 0 {
 		cfg.AgentTokenTTL = DefaultAgentTokenTTL
 	}
+	if cfg.MaxLiveSubagents <= 0 {
+		cfg.MaxLiveSubagents = DefaultMaxLiveSubagents
+	}
 	p := &Provider{
 		cfg:         cfg,
 		authority:   host,
@@ -120,6 +127,7 @@ func New(cfg Config, deps Deps) (*Provider, error) {
 		creds:       deps.Credentials,
 		identities:  deps.Identities,
 		redemptions: &redemptions{db: deps.DB},
+		db:          deps.DB,
 		now:         time.Now,
 	}
 	p.registerBridge(deps.OAuth)
@@ -150,6 +158,7 @@ func ServerIdentifierHost(s string) (string, error) {
 // registered on the token endpoint by New.)
 func (p *Provider) Mount(r chi.Router) {
 	r.Post(PathToken, p.handleToken)
+	r.Post(PathSubagent, p.handleSubagent)
 	r.Get(PathJWKS, p.handleJWKS)
 	r.Get(PathMetadata, p.handleMetadata)
 }
@@ -445,7 +454,7 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		// Recorded on the row as the key the token is bound to (its cnf.jwk).
 		DPoPKeyThumbprint: jkt,
 		AgentTokenSigner: func(jti string, iat, exp time.Time) (string, error) {
-			return p.key.sign(p.cfg.Issuer, sub, key, jti, iat, exp)
+			return p.key.sign(p.cfg.Issuer, sub, key, jti, iat, exp, tokenExtras{})
 		},
 	})
 	if err != nil {

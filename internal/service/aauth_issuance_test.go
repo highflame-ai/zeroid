@@ -28,6 +28,8 @@ func TestAAuthGrantTypesStayAtTheirEndpoints(t *testing.T) {
 		{"agent token signer under the default grant", IssueRequest{Identity: identity, AgentTokenSigner: signer}},
 		{"bridge grant without its parent agent token", IssueRequest{Identity: identity, GrantType: domain.GrantTypeAAuthBridge}},
 		{"bridge grant by its URN, without its parent", IssueRequest{Identity: identity, GrantType: domain.GrantType(domain.GrantTypeAAuthBridgeURN)}},
+		{"sub-agent grant without the agent token signer", IssueRequest{Identity: identity, GrantType: domain.GrantTypeAAuthSubagent}},
+		{"sub-agent grant without its parent agent token", IssueRequest{Identity: identity, GrantType: domain.GrantTypeAAuthSubagent, AgentTokenSigner: signer}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -40,7 +42,7 @@ func TestAAuthGrantTypesStayAtTheirEndpoints(t *testing.T) {
 }
 
 func TestAAuthGrantTypesAreOptIn(t *testing.T) {
-	for _, g := range []domain.GrantType{domain.GrantTypeAAuthAgent, domain.GrantTypeAAuthBridge} {
+	for _, g := range []domain.GrantType{domain.GrantTypeAAuthAgent, domain.GrantTypeAAuthBridge, domain.GrantTypeAAuthSubagent} {
 		if !domain.IsValidGrantType(string(g)) {
 			t.Errorf("%s must be a valid grant type, so a credential policy can list it", g)
 		}

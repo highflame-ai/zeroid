@@ -53,6 +53,10 @@ const (
 	ErrCodeUnsupportedAlgorithm = "unsupported_algorithm"
 	ErrCodeInvalidKey           = "invalid_key"
 	ErrCodeClockSkew            = "clock_skew"
+	// The jwt scheme's token (an agent token presented to sign with).
+	ErrCodeInvalidJWT = "invalid_jwt"
+	ErrCodeExpiredJWT = "expired_jwt"
+	ErrCodeRevokedJWT = "revoked_jwt"
 )
 
 // SigError is a signature failure, answered 401 with a Signature-Error

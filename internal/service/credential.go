@@ -323,7 +323,7 @@ type IssueRequest struct {
 	// aa-agent+jwt carrying jti, iat and exp as issued here. Everything else
 	// is the same as for any grant: identity checks, policy enforcement, the
 	// issued_credentials row and revocation. Required with, and only with,
-	// GrantTypeAAuthAgent.
+	// GrantTypeAAuthAgent and GrantTypeAAuthSubagent.
 	AgentTokenSigner func(jti string, issuedAt, expiresAt time.Time) (string, error)
 	// CustomClaims allows callers to add arbitrary key-value pairs to the JWT.
 	// This is the extensibility hook for deployment-specific claims.
@@ -668,11 +668,12 @@ var ErrCredentialNotRotatable = errors.New("credential cannot be rotated")
 func checkAAuthIssuance(req IssueRequest) error {
 	g := domain.NormalizeGrantType(string(req.GrantType))
 	switch {
-	case req.AgentTokenSigner != nil && g != domain.GrantTypeAAuthAgent:
-		return fmt.Errorf("%w: an agent token signer is only for %s", ErrGrantTypeNotIssuable, domain.GrantTypeAAuthAgent)
-	case g == domain.GrantTypeAAuthAgent && req.AgentTokenSigner == nil:
+	case req.AgentTokenSigner != nil && !g.IsAAuthAgentToken():
+		return fmt.Errorf("%w: an agent token signer is only for %s and %s", ErrGrantTypeNotIssuable,
+			domain.GrantTypeAAuthAgent, domain.GrantTypeAAuthSubagent)
+	case g.IsAAuthAgentToken() && req.AgentTokenSigner == nil:
 		return fmt.Errorf("%w: %s is minted only at the AAuth Agent Provider", ErrGrantTypeNotIssuable, req.GrantType)
-	case g == domain.GrantTypeAAuthBridge && req.ParentJTI == "":
+	case (g == domain.GrantTypeAAuthBridge || g == domain.GrantTypeAAuthSubagent) && req.ParentJTI == "":
 		return fmt.Errorf("%w: %s needs its parent agent token", ErrGrantTypeNotIssuable, req.GrantType)
 	}
 	return nil

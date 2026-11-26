@@ -118,6 +118,9 @@ type AAuthConfig struct {
 	AgentTokenTTLSeconds int `koanf:"agent_token_ttl_seconds"`
 	// Name is the display name in /.well-known/aauth-agent.json. Optional.
 	Name string `koanf:"name"`
+	// MaxLiveSubagents bounds one agent token's live sub-agent tokens
+	// (POST /ap/subagent). 0 means 16.
+	MaxLiveSubagents int `koanf:"max_live_subagents"`
 	// Optional display members of /.well-known/aauth-agent.json. A person
 	// server shows the name and logo when a person approves an agent. URLs
 	// must be https.
@@ -1073,6 +1076,9 @@ func (c *Config) Validate() error {
 		if t := c.AAuth.AgentTokenTTLSeconds; t != 0 && (t <= 300 || t > 3600) {
 			return fmt.Errorf("aauth.agent_token_ttl_seconds must be over 300 and at most 3600, got %d", t)
 		}
+		if c.AAuth.MaxLiveSubagents < 0 || c.AAuth.MaxLiveSubagents > 1000 {
+			return fmt.Errorf("aauth.max_live_subagents must be 0 (the default, 16) to 1000, got %d", c.AAuth.MaxLiveSubagents)
+		}
 		for name, v := range map[string]string{
 			"logo_uri": c.AAuth.LogoURI, "logo_dark_uri": c.AAuth.LogoDarkURI,
 			"documentation_uri": c.AAuth.DocumentationURI, "tos_uri": c.AAuth.TOSURI, "policy_uri": c.AAuth.PolicyURI,
@@ -1574,6 +1580,7 @@ var envMapping = map[string]string{
 	"ZEROID_AAUTH_SIGNING_KEY_ID":               "aauth.signing_key_id",
 	"ZEROID_AAUTH_AGENT_TOKEN_TTL_SECONDS":      "aauth.agent_token_ttl_seconds",
 	"ZEROID_AAUTH_NAME":                         "aauth.name",
+	"ZEROID_AAUTH_MAX_LIVE_SUBAGENTS":           "aauth.max_live_subagents",
 	"ZEROID_AAUTH_DESCRIPTION":                  "aauth.description",
 	"ZEROID_AAUTH_LOGO_URI":                     "aauth.logo_uri",
 	"ZEROID_AAUTH_LOGO_DARK_URI":                "aauth.logo_dark_uri",

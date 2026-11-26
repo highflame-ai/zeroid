@@ -69,6 +69,13 @@ func (p *Provider) bridgeGrant(ctx context.Context, req service.TokenRequest) (*
 		log.Info().Err(err).Msg("aauth: bridge refused an agent token")
 		return nil, bridgeRefusal(oautherror.InvalidGrant, "the subject_token is not a valid agent token from this Agent Provider")
 	}
+	if agent.ParentAgent != "" {
+		// A sub-agent works under its parent's authority, and the protocol
+		// has the parent obtain tokens for it. Exchanging a sub-agent token
+		// here would hand it OAuth tokens with the parent identity's full
+		// scope.
+		return nil, bridgeRefusal(oautherror.InvalidGrant, "a sub-agent token cannot be exchanged; its parent obtains tokens for it")
+	}
 	jkt, err := agent.Cnf.Thumbprint()
 	if err != nil {
 		return nil, bridgeRefusal(oautherror.InvalidGrant, "the agent token's cnf key has no thumbprint")

@@ -122,6 +122,44 @@ func TestAAuthInterop(t *testing.T) {
 	requireStatus(t, err, http.StatusUnauthorized, "the bridged token died with its agent token")
 }
 
+// TestAAuthInteropSubagent: aauth-go's client asks ZeroID for a sub-agent
+// token, signing with the parent's own agent token, and an aauth-go guard
+// accepts the sub-agent.
+func TestAAuthInteropSubagent(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+
+	key, err := demo.LoadOrCreateKey(filepath.Join(t.TempDir(), "pod", "agent.key"))
+	require.NoError(t, err)
+	ap := &agentprovider.Client{BaseURL: issuer, HTTPClient: e.client}
+	parent, err := ap.Enroll(ctx, key, map[string]string{"attestation": e.platformToken(t)})
+	require.NoError(t, err)
+
+	_, subKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	issued, err := ap.Subagent(ctx, parent, subKey.Public(), "worker1")
+	require.NoError(t, err, "aauth-go's client gets a sub-agent token from ZeroID's /ap/subagent")
+
+	subID, err := aauth.ParseAgentIdentifier("aauth:" + e.agentID + "+worker1@" + zeroidHost)
+	require.NoError(t, err)
+	sub, err := aauth.NewAgent(subID, aauth.WithKey(subKey), aauth.WithIssuer(issuer),
+		aauth.WithTokenSource(func() (string, error) { return issued.AgentToken, nil }))
+	require.NoError(t, err)
+	transport := aauth.NewTransport(sub, nil)
+	transport.Base = e.client.Transport
+	resp, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Get(resource + "/whoami")
+	require.NoError(t, err)
+	body := readJSON(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "an aauth-go guard accepts the sub-agent: %v", body)
+	assert.Equal(t, subID.String(), body["agent"])
+
+	// A sub-agent may not have sub-agents.
+	_, grandKey, _ := ed25519.GenerateKey(rand.Reader)
+	_, err = ap.Subagent(ctx, sub, grandKey.Public(), "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "status 403")
+}
+
 func TestAAuthInteropRefusesAStolenPlatformToken(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
@@ -210,7 +248,7 @@ func newEnv(t *testing.T) *env {
 func (e *env) seed(t *testing.T) {
 	t.Helper()
 	policy := e.admin(t, http.MethodPost, "/credential-policies", map[string]any{
-		"name": "aauth", "allowed_grant_types": []string{"aauth_agent", "aauth_bridge"},
+		"name": "aauth", "allowed_grant_types": []string{"aauth_agent", "aauth_bridge", "aauth_subagent"},
 		"allowed_scopes": []string{"tools:read"}, "max_ttl_seconds": 3600,
 	}, http.StatusCreated)
 	identity := e.admin(t, http.MethodPost, "/identities", map[string]any{
