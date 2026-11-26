@@ -59,6 +59,16 @@ var (
 	// Prometheus as zeroid_person_scope_ceiling_total.
 	PersonScopeCeiling metric.Int64Counter
 
+	// ScopeRuleWouldChange counts token requests whose outcome the stricter
+	// scope issuance rules would change: other scopes issued, a refusal
+	// where a token is issued today or the reverse, or a scope refusal
+	// answered with another error code. Counted with token.scope_rules=shadow;
+	// nothing is enforced. Attributes: mode, rule (omitted_request, listing,
+	// all_or_nothing, one_code), grant_type, account_id, project_id. The
+	// identity is in the log line only. Exported to Prometheus as
+	// zeroid_scope_rule_would_change_total.
+	ScopeRuleWouldChange metric.Int64Counter
+
 	// FederationUnmatchedAgent counts federated person grants refused
 	// because no enabled credential binding maps the agent, or the presenting
 	// client is registered to a different identity (ADR 0042 D6, ADR 0027).
@@ -74,6 +84,11 @@ var (
 	// unknown, a workload issuer, disabled, or matched no single row. The
 	// wire answer is one generic invalid_grant. Attribute: reason.
 	FederationIssuerRefused metric.Int64Counter
+
+	// FederationFirstContact counts first-contact attempts: a verified
+	// credential from an issuer row with first_contact on, naming an agent no
+	// binding mapped. Attributes: account_id, grant_type, mode, outcome.
+	FederationFirstContact metric.Int64Counter
 )
 
 func init() {
@@ -115,6 +130,9 @@ func registerInstruments(m metric.Meter) {
 	PersonScopeCeiling, _ = m.Int64Counter("zeroid.person.scope_ceiling",
 		metric.WithDescription("Person mints the person-grant ceiling narrowed or refused (counted in shadow and enforce), or whose resolver failed"),
 	)
+	ScopeRuleWouldChange, _ = m.Int64Counter("zeroid.scope.rule_would_change",
+		metric.WithDescription("Token requests the stricter scope issuance rules would change (counted in shadow mode, never enforced)"),
+	)
 	FederationUnmatchedAgent, _ = m.Int64Counter("zeroid.federation.unmatched_agent",
 		metric.WithDescription("Federated grants refused because no enabled binding maps the agent, or its client is bound elsewhere"),
 	)
@@ -123,6 +141,9 @@ func registerInstruments(m metric.Meter) {
 	)
 	FederationIssuerRefused, _ = m.Int64Counter("zeroid.federation.issuer_refused",
 		metric.WithDescription("Federated person grants refused at issuer resolution, by reason"),
+	)
+	FederationFirstContact, _ = m.Int64Counter("zeroid.federation.first_contact",
+		metric.WithDescription("First-contact attempts on issuer rows, by mode and outcome"),
 	)
 }
 

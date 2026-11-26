@@ -64,6 +64,10 @@ type Config struct {
 
 	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
 
+	// IdentityTree bounds the trees identities build by registering other
+	// identities. See IdentityTreeConfig and docs/identity-tree.md.
+	IdentityTree IdentityTreeConfig `koanf:"identity_tree"`
+
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
 
@@ -88,6 +92,28 @@ type Config struct {
 	Federation FederationConfig `koanf:"federation"`
 }
 
+// IdentityTreeConfig bounds registration trees: the identities an identity
+// registers while acting as itself, theirs, and so on. A registration that
+// would exceed a limit is refused with 409. Zero takes the default.
+type IdentityTreeConfig struct {
+	// MaxDepth is the most identities that may sit above any identity (an
+	// identity registered by an admin is at depth 0). Default 8, at most 64.
+	MaxDepth int `koanf:"max_depth"`
+	// MaxChildren is the most children, not deactivated, one identity may
+	// have. Default 1000.
+	MaxChildren int `koanf:"max_children"`
+}
+
+func (c IdentityTreeConfig) validate() error {
+	if c.MaxDepth < 0 || c.MaxDepth > postgres.MaxTreeDepth {
+		return fmt.Errorf("identity_tree.max_depth must be between 1 and %d (0 for the default), got %d", postgres.MaxTreeDepth, c.MaxDepth)
+	}
+	if c.MaxChildren < 0 {
+		return fmt.Errorf("identity_tree.max_children must be positive (0 for the default), got %d", c.MaxChildren)
+	}
+	return nil
+}
+
 // FederationConfig governs per-account trusted issuers.
 type FederationConfig struct {
 	// IssuerStore is "config" (default: the static external_issuers list,
@@ -106,6 +132,24 @@ type FederationConfig struct {
 	// every row on it must pin that claim. Empty means the built-in list
 	// (domain.DefaultSharedIssuers).
 	SharedIssuers []domain.SharedIssuer `koanf:"shared_issuers"`
+
+	// FirstContact bounds first-contact registration, which an issuer row
+	// switches on with first_contact (docs/external-issuers.md, "First
+	// contact"). Database rows only.
+	FirstContact FirstContactConfig `koanf:"first_contact"`
+}
+
+// FirstContactConfig bounds first contact. Past either bound a credential
+// that would register or adopt an agent is refused as without first contact
+// instead, and the reason is logged.
+type FirstContactConfig struct {
+	// RatePerMinute caps the agents first contact registers or adopts under
+	// one issuer row in any minute. 0 means the default, 10.
+	RatePerMinute int `koanf:"rate_per_minute"`
+	// MaxDiscoveredPerAccount caps an account's first-contact identities that
+	// are still discovered (unadopted), so a discover row cannot fill an
+	// account's adoption queue without end. 0 means the default, 500.
+	MaxDiscoveredPerAccount int `koanf:"max_discovered_per_account"`
 }
 
 // ClientAuthConfig governs OAuth CLIENT authentication — specifically RFC 7523
@@ -754,6 +798,33 @@ type TokenConfig struct {
 	// isolation should authenticate these endpoints at its own edge
 	// (Server.Use) rather than serving them unauthenticated from ZeroID.
 	AllowUnauthenticatedTokenInspection bool `koanf:"allow_unauthenticated_token_inspection"`
+
+	// ScopeRules is what the stricter scope issuance rules do (see
+	// docs/scope-ceilings.md, "Stricter scope rules"):
+	//
+	//   off     (default) no rule is evaluated, and nothing is logged or
+	//           counted.
+	//   shadow  every grant is evaluated against the stricter rules, and each
+	//           request whose outcome they would change is logged as
+	//           scope_rule_would_change and counted in
+	//           zeroid_scope_rule_would_change_total. Nothing is enforced:
+	//           tokens and responses are exactly as with off.
+	//   enforce the same evaluation decides the outcome. A request that names
+	//           no scope is issued only an API key's own scopes or an
+	//           audience profile's, and otherwise none; a scope no
+	//           deployer-controlled ceiling lists, or a request that would be
+	//           narrowed, is refused whole; a delegation that names no scope
+	//           is issued none; and every scope refusal at the token endpoint
+	//           answers invalid_scope. Any other request refused with off
+	//           stays refused. Each request changed is logged and counted as
+	//           in shadow, with mode=enforce.
+	//
+	// Roll out off, then shadow, then enforce once shadow records nothing
+	// that should keep working.
+	// Empty means off. Any other value is refused at startup. Can also be
+	// changed at runtime with Server.SetScopeRulesMode. Env var:
+	// ZEROID_SCOPE_RULES.
+	ScopeRules string `koanf:"scope_rules"`
 }
 
 // TelemetryConfig holds OpenTelemetry settings.
@@ -831,6 +902,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("reserved_client_ids.prefixes: an empty prefix would reserve every client id")
 		}
 	}
+	if err := c.IdentityTree.validate(); err != nil {
+		return err
+	}
 	if err := c.ServiceTokens.validate(); err != nil {
 		return err
 	}
@@ -888,6 +962,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if _, err := service.ParseScopeRulesMode(c.Token.ScopeRules); err != nil {
+		return fmt.Errorf("token.scope_rules: %w", err)
+	}
+
 	if !service.ValidEnforceHints(c.Backchannel.EnforceHints) {
 		return fmt.Errorf("backchannel.enforce_hints must be one of off, shadow, on (got %q)", c.Backchannel.EnforceHints)
 	}
@@ -929,6 +1007,9 @@ func (c *Config) Validate() error {
 
 	if err := domain.ValidateSharedIssuers(c.Federation.SharedIssuers, c.Federation.AllowPrivateEndpoints); err != nil {
 		return fmt.Errorf("federation.%w", err)
+	}
+	if c.Federation.FirstContact.RatePerMinute < 0 || c.Federation.FirstContact.MaxDiscoveredPerAccount < 0 {
+		return fmt.Errorf("federation.first_contact.rate_per_minute and max_discovered_per_account must not be negative (0 = default)")
 	}
 	switch c.Federation.IssuerStore {
 	case "", "config":
@@ -1262,6 +1343,9 @@ func loadDefaults(k *koanf.Koanf) error {
 		"token.allow_unauthenticated_token_inspection": true,
 		// Refresh-token reuse grace (seconds) after a rotation; 0 = strict.
 		"token.refresh_reuse_grace_seconds": domain.DefaultRefreshTokenReuseGraceSeconds,
+		// The stricter scope rules evaluate nothing until a deployment opts
+		// into counting what they would change.
+		"token.scope_rules": string(service.ScopeRulesModeOff),
 
 		// Telemetry
 		"telemetry.enabled":       false,
@@ -1306,6 +1390,9 @@ func loadDefaults(k *koanf.Koanf) error {
 		// into account rows.
 		"federation.issuer_store":            "config",
 		"federation.allow_private_endpoints": false,
+		// First-contact bounds, per issuer row and per account.
+		"federation.first_contact.rate_per_minute":            10,
+		"federation.first_contact.max_discovered_per_account": 500,
 
 		// Workload-attested signing credentials. Operational signing
 		// window is short (1h, keys are ephemeral + rotated); the public
@@ -1382,6 +1469,9 @@ var envMapping = map[string]string{
 	// Seconds after a rotation in which re-presenting the rotated-out refresh
 	// token is a benign retry, not reuse. 0 = strict RFC 9700; max 300.
 	"ZEROID_REFRESH_REUSE_GRACE_SECONDS": "token.refresh_reuse_grace_seconds",
+	// The stricter scope rules: off (default), shadow (count what they would
+	// change, enforce nothing) or enforce.
+	"ZEROID_SCOPE_RULES": "token.scope_rules",
 	// Accept an external-principal subject_token without verifying it, as
 	// before subject verification. Default false.
 	"ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT": "token.allow_unverified_external_principal_subject",
@@ -1417,6 +1507,9 @@ var envMapping = map[string]string{
 	// rows). The private-endpoint relaxation is for local development only.
 	"ZEROID_FEDERATION_ISSUER_STORE":            "federation.issuer_store",
 	"ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS": "federation.allow_private_endpoints",
+	// First-contact bounds.
+	"ZEROID_FEDERATION_FIRST_CONTACT_RATE_PER_MINUTE":            "federation.first_contact.rate_per_minute",
+	"ZEROID_FEDERATION_FIRST_CONTACT_MAX_DISCOVERED_PER_ACCOUNT": "federation.first_contact.max_discovered_per_account",
 
 	"ZEROID_CIMD_ENABLED":                 "cimd.enabled",
 	"ZEROID_CIMD_ALLOW_PRIVATE_ENDPOINTS": "cimd.allow_private_metadata_endpoints",

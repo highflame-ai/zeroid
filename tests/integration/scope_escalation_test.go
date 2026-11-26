@@ -19,13 +19,10 @@ import (
 // clientCredentials and jwtBearer used to silently narrow an unauthorized
 // requested scope down to an empty set and mint anyway. IssueCredential
 // omits the `scopes` claim entirely when the granted set is empty
-// (credential.go: `if len(req.Scopes) > 0`), and Shield's checkScopeCeiling
-// deliberately treats an absent claim as "check not applicable" — a
-// backward-compat allowance for tokens minted before the scopes feature
-// existed. The two behaviors compose into an escalation: an identity with
+// (credential.go: `if len(req.Scopes) > 0`), so an identity with
 // allowed_scopes=["tools:read"] that explicitly asked for "tools:execute"
-// got a token Shield would enforce NOTHING against, rather than one it
-// would deny call_tool on.
+// was answered with a token, indistinguishable from a legacy token minted
+// before the scopes feature existed, instead of a refusal.
 //
 // The fix (requireGrantableScope in oauth.go) mirrors tokenExchange's
 // existing "empty result -> invalid_scope" safety net, extended to the
@@ -330,9 +327,9 @@ func TestAPIKeyGrant_WhitespaceOnlyScopeTreatedAsOmitted(t *testing.T) {
 // has a second meaning — the client's registered scopes and the identity
 // policy's ceiling are disjoint, i.e. a denial. There is no identity or
 // delegation fallback here, so nothing is grantable either way, and minting
-// would hand back a token with NO scopes claim: exactly the
-// "Shield enforces nothing" escalation this file exists to close, reached
-// via the omitted-scope path instead of the explicit-request one.
+// would hand back a token with NO scopes claim: the success-instead-of-
+// refusal this file exists to close, reached via the omitted-scope path
+// instead of the explicit-request one.
 func TestClientCredentials_OmittedScopeNarrowedToEmptyRejected(t *testing.T) {
 	identityPolicyID := createRichCredentialPolicy(t, map[string]any{
 		"name":                 uid("cc-disjoint-cp"),
@@ -460,9 +457,8 @@ func TestAPIKeyGrant_IdentityAllowedScopesNarrowPolicyCeiling(t *testing.T) {
 
 // TestAPIKeyGrant_DisjointRowAndPolicyRejected: when the identity row and its
 // policy share no scope, an omitted-scope grant must be refused. Narrowing to
-// the empty set and minting anyway produced a token with no `scopes` claim,
-// which Shield reads as "no ceiling to check" — an unrestricted token for an
-// identity whose two ceilings together permit nothing.
+// the empty set and minting anyway produced a token with no `scopes` claim:
+// a success for an identity whose two ceilings together permit nothing.
 func TestAPIKeyGrant_DisjointRowAndPolicyRejected(t *testing.T) {
 	policyID := createRichCredentialPolicy(t, map[string]any{
 		"name":                uid("apikey-disjoint-policy"),

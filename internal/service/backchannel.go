@@ -1016,7 +1016,15 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	}
 	ttl := 900 // seconds — short-lived, matching ExternalPrincipalExchange; clamped to the bound identity's policy ceiling below
 	var identityPolicyID string
+	// The scope the bc-authorize request named is what the approval asks for.
+	trace := scopeTraceFrom(ctx)
+	trace.setTenant(row.AccountID, row.ProjectID)
+	trace.setClientID(row.ClientID)
+	trace.ask(parseScopeString(row.Scope), true)
 	client, cerr := s.oauthClientSvc.GetClientByClientID(ctx, row.ClientID)
+	if cerr == nil {
+		trace.setClient(client)
+	}
 	if cerr != nil {
 		if !errors.Is(cerr, ErrOAuthClientNotFound) {
 			// Only a definitive not-found may fall back to the unbound shape.
@@ -1048,6 +1056,7 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		if bound.IsExpired() {
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 		}
+		trace.setIdentity(bound)
 		// Identity credential policy — the same governance ceiling the
 		// authorization_code path enforces for bound clients: resolve it here
 		// and hand its ID to the IssueCredential chokepoint. The axes
@@ -1070,18 +1079,22 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 			}
 			for _, sc := range requested {
 				if !allowed[sc] {
+					trace.ceiling(policyCeilingName(ownerBoundIdentity, false), policy.AllowedScopes)
 					return nil, oauthBadRequest(oautherror.InvalidScope,
 						fmt.Sprintf("scope %q is not permitted by the bound identity's credential policy", sc))
 				}
 			}
 		}
-		if len(bound.AllowedScopes) > 0 {
+		// The bound identity's own list restricts even when empty on an
+		// identity registered by another identity, admitting no scope.
+		if bound.ScopeCeilingRestricts() {
 			allowed := make(map[string]bool, len(bound.AllowedScopes))
 			for _, sc := range bound.AllowedScopes {
 				allowed[sc] = true
 			}
 			for _, sc := range requested {
 				if !allowed[sc] {
+					trace.identityCeiling(ceilingBoundScopes, bound)
 					return nil, oauthBadRequest(oautherror.InvalidScope,
 						fmt.Sprintf("scope %q is not in the bound identity's allowed_scopes", sc))
 				}
@@ -1108,6 +1121,7 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	// what a redeem can be granted.
 	if cerr == nil {
 		if err := requireCIBAScopeWithinClient(client, row.Scope); err != nil {
+			trace.strictCeiling(clientCeilingName(client), client.Scopes)
 			return nil, err
 		}
 	}
@@ -1209,6 +1223,9 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 			return nil, mapped
 		}
 		switch {
+		case errors.Is(err, errScopeRulesRefusal):
+			// The stricter scope rules' own invalid_scope (enforce mode).
+			return nil, err
 		case errors.Is(err, ErrScopesNotAllowed):
 			return nil, oauthBadRequestCause(oautherror.InvalidScope, "requested scopes are not permitted for the bound identity", err)
 		case errors.Is(err, ErrPolicyViolation):
@@ -1424,17 +1441,25 @@ func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *doma
 	// so there is no DPoP proof — passes empty thumbprint to keep the token
 	// as Bearer. Resource-server-side DPoP for CIBA-push tokens is a future
 	// item if it's ever needed.
-	accessToken, err := s.issueTokenForApprovedRow(ctx, row, "")
+	//
+	// No token request carries this mint, so it is traced here for the
+	// stricter scope rules (a no-op while they are off). Rule D is not
+	// applied: a push client is sent CIBA Core §12 codes (pushRefusal).
+	traceCtx, trace := s.credentialSvc.traceScopes(ctx, string(domain.GrantTypeCIBA))
+	trace.deliveredByPush()
+	accessToken, err := s.issueTokenForApprovedRow(traceCtx, row, "")
+	trace.done(traceCtx, err)
 	if err != nil {
 		// Most likely an OAuthError("access_denied") from a lost race against
 		// a concurrent dispatch. Log and exit — the first dispatcher will
 		// have delivered (or will deliver).
 		log.Warn().Err(err).Str("auth_req_id", row.AuthReqID).Msg("push approval mint failed")
 		_ = s.repo.SetLastNotifyError(ctx, row.AuthReqID, err.Error())
-		// A person-ceiling refusal is final for this request, and a push
-		// client cannot poll to learn it, so it gets the CIBA Core §12 error
-		// payload. A lost race is not answered: the winner delivers.
-		if code, desc, ok := pushPersonGrantError(err); ok {
+		// A person-ceiling refusal, or a refusal by the enforced stricter
+		// scope rules, is final for this request, and a push client cannot
+		// poll to learn it, so it gets the CIBA Core §12 error payload. A
+		// lost race is not answered: the winner delivers.
+		if code, desc, ok := pushRefusal(err); ok {
 			s.postCallback(ctx, row, map[string]any{
 				"error":             code,
 				"error_description": desc,
@@ -1470,6 +1495,19 @@ func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *doma
 	}
 
 	s.postCallback(ctx, row, payload)
+}
+
+// pushRefusal maps a failed push-mode mint to the CIBA Core §12 error its
+// client is sent, or ok=false when none is. A person-ceiling failure is sent
+// as pushPersonGrantError maps it. A refusal the stricter scope rules make in
+// enforce mode is as final for the request, so it is sent too: as
+// access_denied, since §12 defines no invalid_scope, with the description
+// that names the first offending scope and the ceiling that must list it.
+func pushRefusal(err error) (code, description string, ok bool) {
+	if r := scopeRulesRefusalIn(err); r != nil {
+		return oautherror.AccessDenied, r.Description, true
+	}
+	return pushPersonGrantError(err)
 }
 
 // pushPersonGrantError maps a person-ceiling failure to a CIBA Core §12 push

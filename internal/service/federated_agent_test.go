@@ -61,11 +61,11 @@ func TestBindAgent(t *testing.T) {
 	ctx := context.Background()
 	linked := func(id string) *domain.OAuthClient { return &domain.OAuthClient{ClientID: "c", IdentityID: &id} }
 
-	got, err := bindAgent(ctx, bindings, lookup, row, "okta-client-1", linked("agent-1"), federatedGrantIDJAG)
+	got, err := bindAgent(ctx, bindings, lookup, row, "okta-client-1", linked("agent-1"), federatedGrantIDJAG, nil)
 	if err != nil || got.ID != "agent-1" {
 		t.Fatalf("bound agent: %v %v", got, err)
 	}
-	if got, err := bindAgent(ctx, bindings, lookup, row, "okta-client-1", nil, federatedGrantIDJAG); err != nil || got.ID != "agent-1" {
+	if got, err := bindAgent(ctx, bindings, lookup, row, "okta-client-1", nil, federatedGrantIDJAG, nil); err != nil || got.ID != "agent-1" {
 		t.Fatalf("no client to check (CIMD path passes nil-safe): %v %v", got, err)
 	}
 
@@ -74,7 +74,7 @@ func TestBindAgent(t *testing.T) {
 	// client_id must equal the authenticated client (idJAGBearer), so only
 	// an ID-JAG the IdP issued to this client for this agent gets here.
 	cimd := &domain.OAuthClient{ClientID: "https://agent.example/cimd.json", RegistrationSource: domain.RegistrationSourceCIMD}
-	if got, err := bindAgent(ctx, bindings, lookup, row, "okta-client-1", cimd, federatedGrantIDJAG); err != nil || got.ID != "agent-1" {
+	if got, err := bindAgent(ctx, bindings, lookup, row, "okta-client-1", cimd, federatedGrantIDJAG, nil); err != nil || got.ID != "agent-1" {
 		t.Fatalf("a CIMD client takes the binding of the IdP-signed act.sub: %v %v", got, err)
 	}
 
@@ -94,7 +94,7 @@ func TestBindAgent(t *testing.T) {
 		"client linked to nothing":                      {key: "okta-client-1", client: &domain.OAuthClient{ClientID: "c"}, msg: "not registered to the agent"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := bindAgent(ctx, bindings, lookup, row, tc.key, tc.client, federatedGrantIDJAG)
+			_, err := bindAgent(ctx, bindings, lookup, row, tc.key, tc.client, federatedGrantIDJAG, nil)
 			if oauthCode(err) != "invalid_grant" || !strings.Contains(err.Error(), tc.msg) {
 				t.Fatalf("err = %v, want invalid_grant containing %q", err, tc.msg)
 			}

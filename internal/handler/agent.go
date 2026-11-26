@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -27,6 +28,48 @@ func approvalChannelWriteError(err error) error {
 	return nil
 }
 
+// callerIdentity returns the identity the embedder's admin authentication
+// marked this request as made by (zeroid.WithCallerIdentity), or nil. It is
+// the only source of a new identity's parent: never the body or a header.
+func callerIdentity(ctx context.Context) *service.CallerIdentity {
+	if c, ok := service.CallerIdentityFromContext(ctx); ok {
+		return &c
+	}
+	return nil
+}
+
+// refuseCallerIdentity refuses, with 403, a request marked as made by a
+// registered identity on a route that is the deployer's alone: discovery
+// ingest and its source maintenance write identities no identity registered,
+// so no calling identity may reach them (docs/identity-tree.md).
+func refuseCallerIdentity(ctx context.Context) error {
+	if callerIdentity(ctx) != nil {
+		return huma.Error403Forbidden(service.ErrParentIdentityRefused.Error() + ": this route is not open to a calling identity")
+	}
+	return nil
+}
+
+// treeWriteError maps the registration-tree refusals: a registration or
+// change the calling identity may not make, or an owner change outside the
+// trusted path (403); a tree limit, an activation below an inactive
+// identity or while a cascade is pending, or a write that raced a status
+// change (409); and a deactivation that did not reach every identity below
+// the target (500, with a message that says the request can be repeated).
+// It returns nil for any other error.
+func treeWriteError(err error) error {
+	switch {
+	case errors.Is(err, service.ErrParentIdentityRefused), errors.Is(err, service.ErrOwnerWriteNotTrusted):
+		return huma.Error403Forbidden(err.Error())
+	case errors.Is(err, service.ErrIdentityTreeLimit), errors.Is(err, service.ErrAncestorNotActive),
+		errors.Is(err, service.ErrCascadeStillPending), errors.Is(err, service.ErrIdentityChanged):
+		return huma.Error409Conflict(err.Error())
+	case errors.Is(err, service.ErrCascadeIncomplete):
+		log.Error().Err(err).Msg("identity deactivation did not reach every identity below it")
+		return huma.Error500InternalServerError("the identity was deactivated, but not every identity it registered was; repeat the request to finish")
+	}
+	return nil
+}
+
 // mapErr converts service-layer errors to huma errors with proper HTTP status codes.
 // Internal details are logged server-side; only generic messages are returned to clients.
 func mapErr(err error) error {
@@ -34,6 +77,9 @@ func mapErr(err error) error {
 		return nil
 	}
 	if herr := approvalChannelWriteError(err); herr != nil {
+		return herr
+	}
+	if herr := treeWriteError(err); herr != nil {
 		return herr
 	}
 	// Typed sentinels first. Service-layer callers wrap with these so
@@ -75,7 +121,7 @@ type RegisterAgentInput struct {
 		ExternalID               string          `json:"external_id" required:"true" minLength:"1" doc:"Unique identifier within this project"`
 		IdentityType             string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (defaults to agent)"`
 		SubType                  string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent,approval_channel" doc:"Operational role. approval_channel (identity_type service only) marks a CIBA approval channel."`
-		TrustLevel               string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (defaults to unverified)"`
+		TrustLevel               string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (defaults to unverified). When the request is authenticated as an identity, the agent is its child and may not be above the parent's trust level."`
 		Framework                string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
 		Version                  string          `json:"version,omitempty" doc:"Agent version string"`
 		Publisher                string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
@@ -83,10 +129,10 @@ type RegisterAgentInput struct {
 		Capabilities             json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
 		Labels                   json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
 		Metadata                 json.RawMessage `json:"metadata,omitempty" doc:"JSON object of opaque product-specific metadata"`
-		AllowedScopes            []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling."`
-		CreatedBy                string          `json:"created_by,omitempty" doc:"User ID of the creator"`
+		AllowedScopes            []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling. When the request is authenticated as an identity, the agent is its child: empty takes the scopes both the parent's ceiling and the calling token hold, which may be none, every scope must be within them, and a child's empty allowed_scopes means it holds no scope."`
+		CreatedBy                string          `json:"created_by,omitempty" doc:"User ID of the creator, who becomes the owner. Ignored when the request is authenticated as an identity: the agent is its child and takes the parent's owner."`
 		PublicKeyPEM             string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
-		CredentialPolicyID       string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Also applied to the auto-created API key unless api_key_credential_policy_id is set. Defaults to the tenant default policy."`
+		CredentialPolicyID       string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Also applied to the auto-created API key unless api_key_credential_policy_id is set. Defaults to the tenant default policy, or, when the request is authenticated as an identity, to that parent identity's policy."`
 		APIKeyCredentialPolicyID string          `json:"api_key_credential_policy_id,omitempty" doc:"Optional narrower policy for the auto-created API key. Must be a subset of the identity policy (scopes, TTL, grant types, delegation depth, trust level, attestation). When empty, the API key inherits the identity policy."`
 		// ExpiresAt time-bounds the grant of authority and propagates to the
 		// auto-created API key. RFC3339. Omit for no expiry.
@@ -132,6 +178,20 @@ func splitCSV(vals []string) []string {
 	return out
 }
 
+// parentFilter validates a parent_identity_id list filter and returns it in
+// canonical form. Anything but an identity id would otherwise reach the uuid
+// column and fail as a 500.
+func parentFilter(v string) (string, error) {
+	if v == "" {
+		return "", nil
+	}
+	id, err := uuid.Parse(v)
+	if err != nil {
+		return "", huma.Error400BadRequest("invalid parent_identity_id filter: must be an identity id (UUID)")
+	}
+	return id.String(), nil
+}
+
 type ListAgentsInput struct {
 	AgentType      string   `query:"agent_type" doc:"Filter by agent type"`
 	IdentityType   []string `query:"identity_type,explode" doc:"Filter by identity type. Repeat or comma-separate for multiple (e.g. agent,application)."`
@@ -145,6 +205,7 @@ type ListAgentsInput struct {
 	Status         []string `query:"status,explode" doc:"Filter by lifecycle status. Repeat or comma-separate for multiple."`
 	OwnerUserID    string   `query:"owner_user_id" doc:"Filter by owner user ID"`
 	Ownerless      string   `query:"ownerless" doc:"Filter for identities with no owner (true or false)"`
+	ParentID       string   `query:"parent_identity_id" doc:"Filter to the identities registered by this identity (its direct children)"`
 	Limit          int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
 	Offset         int      `query:"offset" default:"0" doc:"Offset for pagination"`
 	IncludeParents bool     `query:"include_parents" doc:"Also return, in \"parents\", the parent agents of any sub-agents on this page whose parent is not itself on the page, so a paginated caller can nest them. Context only: not counted in total/limit/offset."`
@@ -163,7 +224,7 @@ type UpdateAgentInput struct {
 	Body struct {
 		Name         *string         `json:"name,omitempty" doc:"Human-readable name"`
 		SubType      *string         `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy" doc:"Agent role"`
-		TrustLevel   *string         `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
+		TrustLevel   *string         `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level. An agent registered by another identity cannot be raised above its parent's."`
 		Framework    *string         `json:"framework,omitempty" doc:"Framework"`
 		Version      *string         `json:"version,omitempty" doc:"Version"`
 		Publisher    *string         `json:"publisher,omitempty" doc:"Publisher"`
@@ -242,6 +303,7 @@ func (a *API) registerAgentRoutes(api huma.API) {
 		Method:        http.MethodDelete,
 		Path:          "/agents/registry/{id}",
 		Summary:       "Deactivate an agent (soft delete) and revoke its keys",
+		Description:   "Every identity registered below the agent is deactivated too, with the same key and credential revocation.",
 		Tags:          []string{"Agents"},
 		DefaultStatus: http.StatusOK,
 	}, a.deleteAgentOp)
@@ -259,6 +321,7 @@ func (a *API) registerAgentRoutes(api huma.API) {
 		Method:      http.MethodPost,
 		Path:        "/agents/registry/{id}/deactivate",
 		Summary:     "Deactivate an agent without deleting it",
+		Description: "Every identity registered below the agent is deactivated too, with the same key and credential revocation. Reactivating the agent does not reactivate them.",
 		Tags:        []string{"Agents"},
 	}, a.deactivateAgentOp)
 
@@ -426,9 +489,13 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		CredentialPolicyID:       input.Body.CredentialPolicyID,
 		APIKeyCredentialPolicyID: input.Body.APIKeyCredentialPolicyID,
 		ExpiresAt:                input.Body.ExpiresAt,
+		RegisteredBy:             callerIdentity(ctx),
 	})
 	if err != nil {
 		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
+		if herr := treeWriteError(err); herr != nil {
 			return nil, herr
 		}
 		// A collision with a soft-deleted identity is actionable — surface the
@@ -511,8 +578,12 @@ func (a *API) listAgentsOp(ctx context.Context, input *ListAgentsInput) (*ListAg
 	if input.Ownerless != "" && input.Ownerless != "true" && input.Ownerless != "false" {
 		return nil, huma.Error400BadRequest("invalid ownerless filter: must be true or false")
 	}
+	parentID, herr := parentFilter(input.ParentID)
+	if herr != nil {
+		return nil, herr
+	}
 
-	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, identityTypes, input.Label, trustLevels, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, statuses, input.OwnerUserID, input.Ownerless, input.Limit, input.Offset, input.IncludeParents)
+	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, identityTypes, input.Label, trustLevels, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, statuses, input.OwnerUserID, input.Ownerless, parentID, input.Limit, input.Offset, input.IncludeParents)
 	if err != nil {
 		return nil, mapErr(err)
 	}

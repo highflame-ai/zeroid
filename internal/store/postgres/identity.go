@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -80,6 +81,25 @@ func (r *IdentityRepository) GetByIDInAccounts(ctx context.Context, id string, a
 	return identity, nil
 }
 
+// GetByIDInAccountForUpdate is GetByIDInAccounts for one account, holding
+// the identity's row lock until the transaction ends. The same rules apply:
+// the id is a server-held reference, never caller input.
+func (r *IdentityRepository) GetByIDInAccountForUpdate(ctx context.Context, id, accountID string) (*domain.Identity, error) {
+	if !hasTx(ctx) {
+		return nil, errors.New("GetByIDInAccountForUpdate requires a transaction")
+	}
+	identity := &domain.Identity{}
+	err := dbOrTx(ctx, r.db).NewSelect().Model(identity).
+		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		For("UPDATE").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity: %w", err)
+	}
+	return identity, nil
+}
+
 // GetLinkedByID loads the identity an OAuth client's registration links to
 // (oauth_clients.identity_id), in whatever tenant it lives. Unscoped on
 // purpose: the tenant is what the caller is trying to learn, and the link was
@@ -138,6 +158,45 @@ func (r *IdentityRepository) GetByExternalID(ctx context.Context, externalID, ac
 	return identity, nil
 }
 
+// CountByOriginAndStatus counts an account's identities of one origin in one
+// status, across its projects: the per-account first-contact cap. Served by
+// the partial origin index (migration 035).
+func (r *IdentityRepository) CountByOriginAndStatus(ctx context.Context, accountID string, origin domain.Origin, status domain.IdentityStatus) (int, error) {
+	n, err := dbOrTx(ctx, r.db).NewSelect().Model((*domain.Identity)(nil)).
+		Where("account_id = ?", accountID).
+		Where("origin = ?", origin).
+		Where("origin <> 'native'").
+		Where("status = ?", status).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count identities: %w", err)
+	}
+	return n, nil
+}
+
+// GetByOriginAndMetadata returns the oldest identity in a tenant with the
+// given origin whose metadata contains doc (JSONB containment, served by the
+// metadata GIN index). sql.ErrNoRows (wrapped) when there is none.
+func (r *IdentityRepository) GetByOriginAndMetadata(ctx context.Context, accountID, projectID string, origin domain.Origin, doc map[string]any) (*domain.Identity, error) {
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode metadata filter: %w", err)
+	}
+	identity := &domain.Identity{}
+	err = dbOrTx(ctx, r.db).NewSelect().Model(identity).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("origin = ?", origin).
+		Where("metadata @> ?::jsonb", string(raw)).
+		OrderExpr("created_at, id").
+		Limit(1).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity by metadata: %w", err)
+	}
+	return identity, nil
+}
+
 // GetByWIMSEURI retrieves an identity by its WIMSE URI, scoped to tenant.
 func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accountID, projectID string) (*domain.Identity, error) {
 	identity := &domain.Identity{}
@@ -167,7 +226,9 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 // "external" — any non-native (discovered) provenance. The status filter is an
 // exact lifecycle match (e.g. "discovered") — the discovery adoption inbox is
 // status="discovered". Both are independent of the legacy is_active boolean.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int) ([]*domain.Identity, int, error) {
+// parentIdentityID, when set, keeps only the identities that identity
+// registered (its direct children); the caller validates it as a UUID.
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless, parentIdentityID string, limit, offset int) ([]*domain.Identity, int, error) {
 	var identities []*domain.Identity
 	db := dbOrTx(ctx, r.db)
 	q := db.NewSelect().Model(&identities).
@@ -241,6 +302,9 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 			q = q.Where("(owner_user_id IS NULL OR owner_user_id = '')")
 		}
 	}
+	if parentIdentityID != "" {
+		q = q.Where("parent_identity_id = ?", parentIdentityID)
+	}
 	if isActive != "" {
 		if active, err := strconv.ParseBool(isActive); err == nil {
 			if active {
@@ -304,7 +368,9 @@ func (r *IdentityRepository) ListByOwnerForOffboard(ctx context.Context, ownerUs
 	err := dbOrTx(ctx, r.db).NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
 		Where("owner_user_id = ?", ownerUserID).
-		Where("status <> ?", string(domain.IdentityStatusDeactivated)).
+		// A deactivated identity still marked cascade_pending is listed too:
+		// its deactivation cascade did not finish, and the retry finishes it.
+		Where("(status <> ? OR cascade_pending_at IS NOT NULL)", string(domain.IdentityStatusDeactivated)).
 		OrderExpr("created_at ASC").
 		Scan(ctx)
 	if err != nil {
@@ -495,17 +561,6 @@ func (r *IdentityRepository) GetFacets(ctx context.Context, accountID, projectID
 // Update saves changes to an existing identity. Participates in a caller-
 // provided transaction via postgres.WithTx(ctx, tx); falls through to a
 // single auto-commit update otherwise.
-func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identity) error {
-	identity.ModifiedBy = middleware.GetCallerName(ctx)
-	db := dbOrTx(ctx, r.db)
-	_, err := db.NewUpdate().Model(identity).
-		Where("id = ? AND account_id = ? AND project_id = ?", identity.ID, identity.AccountID, identity.ProjectID).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to update identity: %w", err)
-	}
-	return nil
-}
 
 // Delete removes an identity.
 //
@@ -560,8 +615,12 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 	// modified_by must be set in the UPDATE itself — the audit trigger
 	// reads NEW.modified_by, so a caller_name on the context only reaches
 	// the audit log when it's written into this row's column.
+	// cascade_pending_at is set in the same UPDATE: the caller walks the
+	// identities below this one next, and a walk that does not finish is
+	// resumed from the mark (docs/identity-tree.md).
 	q := db.NewUpdate().Model(identity).
 		Set("status = ?", string(domain.IdentityStatusDeactivated)).
+		Set("cascade_pending_at = now()").
 		Set("updated_at = ?", time.Now())
 	if callerID := middleware.GetCallerName(ctx); callerID != "" {
 		q = q.Set("modified_by = ?", callerID)

@@ -56,64 +56,75 @@ func issuerTenant(ctx context.Context) (string, string, error) {
 
 // ExternalIssuerCreateBody is POST /external-issuers.
 type ExternalIssuerCreateBody struct {
-	Preset              string              `json:"preset,omitempty" enum:"entra,okta,generic" doc:"Check the issuer's shape and fill IdP-fixed fields: entra (RS256, user key oid, email_verified from xms_edov, tid pinned) or okta (RS256, user key sub). Never overrides a field the request sets. jwks_uri always comes from the issuer's discovery document. Neither needs audiences: bind each agent's app id instead."`
-	Kind                string              `json:"kind" enum:"person,workload" doc:"person: an IdP whose ID-JAGs and ID tokens name people. workload: a client-assertion issuer."`
-	Issuer              string              `json:"issuer" doc:"The iss value tokens carry, matched exactly. https. Its {issuer}/.well-known/openid-configuration must name this issuer and the jwks_uri ZeroID uses."`
-	DisplayName         string              `json:"display_name,omitempty"`
-	Audiences           []string            `json:"audiences,omitempty" doc:"Optional on a person row, required on a workload row. Extra accepted aud values: on the ID-token exchange an enabled binding already admits the presenting client's client_id, and an ID-JAG's aud must be ZeroID's issuer."`
-	Algorithms          []string            `json:"algorithms,omitempty" doc:"Subset of RS256, ES256, ES384, PS256. Default all four."`
-	ClaimMapping        map[string]string   `json:"claim_mapping,omitempty" doc:"ZeroID name to token claim. user_id (the person's user key, required for person), email, email_verified, name, scope, trust_level, groups (the claim listing the person's groups, copied to the issued token's groups claim). role and privilege_scope are reserved (claim_mapping_reserved)."`
-	PropagateClaims     []string            `json:"propagate_claims,omitempty" doc:"Subset of auth_time, acr, amr."`
-	ClaimConstraints    map[string][]string `json:"claim_constraints,omitempty" doc:"claim to accepted values; every listed claim must match. Required for a shared issuer."`
-	MaxTokenAgeSeconds  int                 `json:"max_token_age_seconds,omitempty" doc:"1-3600, default 600."`
-	JWKSCacheTTLSeconds int                 `json:"jwks_cache_ttl_seconds,omitempty" doc:"30-86400, default 300."`
-	TrustEmail          bool                `json:"trust_email,omitempty" doc:"Person issuers only. The issuer vouches for its own email claim: a token with an email and no email_verified claim counts as verified (an explicit false stays false). For an organization's own directory, whose ID tokens leave email_verified to the UserInfo endpoint (OIDC Core 5.4). Default false."`
-	Source              string              `json:"source,omitempty" enum:"admin,connector" doc:"Default admin."`
-	SourceRef           string              `json:"source_ref,omitempty" doc:"The connector that created the row; only with source connector."`
-	Enabled             *bool               `json:"enabled,omitempty" doc:"Default true."`
+	Preset                  string              `json:"preset,omitempty" enum:"entra,okta,generic" doc:"Check the issuer's shape and fill IdP-fixed fields: entra (RS256, user key oid, email_verified from xms_edov, tid pinned) or okta (RS256, user key sub). Never overrides a field the request sets. jwks_uri always comes from the issuer's discovery document. Neither needs audiences: bind each agent's app id instead."`
+	Kind                    string              `json:"kind" enum:"person,workload" doc:"person: an IdP whose ID-JAGs and ID tokens name people. workload: a client-assertion issuer."`
+	Issuer                  string              `json:"issuer" doc:"The iss value tokens carry, matched exactly. https. Its {issuer}/.well-known/openid-configuration must name this issuer and the jwks_uri ZeroID uses."`
+	DisplayName             string              `json:"display_name,omitempty"`
+	Audiences               []string            `json:"audiences,omitempty" doc:"Optional on a person row, required on a workload row. Extra accepted aud values: on the ID-token exchange an enabled binding already admits the presenting client's client_id, and an ID-JAG's aud must be ZeroID's issuer."`
+	Algorithms              []string            `json:"algorithms,omitempty" doc:"Subset of RS256, ES256, ES384, PS256. Default all four."`
+	ClaimMapping            map[string]string   `json:"claim_mapping,omitempty" doc:"ZeroID name to token claim. user_id (the person's user key, required for person), email, email_verified, name, scope, trust_level, groups (the claim listing the person's groups, copied to the issued token's groups claim). role and privilege_scope are reserved (claim_mapping_reserved)."`
+	PropagateClaims         []string            `json:"propagate_claims,omitempty" doc:"Subset of auth_time, acr, amr."`
+	ClaimConstraints        map[string][]string `json:"claim_constraints,omitempty" doc:"claim to accepted values; every listed claim must match. Required for a shared issuer."`
+	MaxTokenAgeSeconds      int                 `json:"max_token_age_seconds,omitempty" doc:"1-3600, default 600."`
+	JWKSCacheTTLSeconds     int                 `json:"jwks_cache_ttl_seconds,omitempty" doc:"30-86400, default 300."`
+	TrustEmail              bool                `json:"trust_email,omitempty" doc:"Person issuers only. The issuer vouches for its own email claim: a token with an email and no email_verified claim counts as verified (an explicit false stays false). For an organization's own directory, whose ID tokens leave email_verified to the UserInfo endpoint (OIDC Core 5.4). Default false."`
+	Source                  string              `json:"source,omitempty" enum:"admin,connector" doc:"Default admin."`
+	SourceRef               string              `json:"source_ref,omitempty" doc:"The connector that created the row; only with source connector."`
+	Enabled                 *bool               `json:"enabled,omitempty" doc:"Default true."`
+	FirstContact            string              `json:"first_contact,omitempty" enum:"off,discover,adopt" doc:"What a credential that verified under this row does when no binding maps its subject key yet (a federated client assertion's sub on a workload row, an ID-JAG's act.sub on a person row). off (default): refused. discover: registers a discovered identity in first_contact_project_id with a disabled binding, labelled discovered_via:first_contact, then refuses. adopt: registers an active identity in first_contact_project_id owned by first_contact_owner_user_id, with an enabled binding, and serves the request. Stored on a disabled row, but acts only once the row is enabled."`
+	FirstContactProjectID   string              `json:"first_contact_project_id,omitempty" doc:"The project first contact registers agents into. Required for discover and adopt (first_contact_mapping_required). ZeroID checks its shape, not that the project exists."`
+	FirstContactOwnerUserID string              `json:"first_contact_owner_user_id,omitempty" doc:"The owner of the agents first contact adopts. Required for adopt (first_contact_mapping_required), optional for discover."`
 }
 
 // ExternalIssuerPatchBody is PATCH /external-issuers/{id}. Absent fields are
 // unchanged; issuer, kind and source never change.
 type ExternalIssuerPatchBody struct {
-	DisplayName         *string              `json:"display_name,omitempty"`
-	Audiences           *[]string            `json:"audiences,omitempty"`
-	Algorithms          *[]string            `json:"algorithms,omitempty"`
-	ClaimMapping        *map[string]string   `json:"claim_mapping,omitempty"`
-	PropagateClaims     *[]string            `json:"propagate_claims,omitempty"`
-	ClaimConstraints    *map[string][]string `json:"claim_constraints,omitempty"`
-	MaxTokenAgeSeconds  *int                 `json:"max_token_age_seconds,omitempty"`
-	JWKSCacheTTLSeconds *int                 `json:"jwks_cache_ttl_seconds,omitempty"`
-	TrustEmail          *bool                `json:"trust_email,omitempty"`
-	Enabled             *bool                `json:"enabled,omitempty"`
-	IfUpdatedAt         *time.Time           `json:"if_updated_at,omitempty" doc:"Apply the patch only if the row's updated_at still equals this (409 issuer_changed otherwise)."`
+	DisplayName             *string              `json:"display_name,omitempty"`
+	Audiences               *[]string            `json:"audiences,omitempty"`
+	Algorithms              *[]string            `json:"algorithms,omitempty"`
+	ClaimMapping            *map[string]string   `json:"claim_mapping,omitempty"`
+	PropagateClaims         *[]string            `json:"propagate_claims,omitempty"`
+	ClaimConstraints        *map[string][]string `json:"claim_constraints,omitempty"`
+	MaxTokenAgeSeconds      *int                 `json:"max_token_age_seconds,omitempty"`
+	JWKSCacheTTLSeconds     *int                 `json:"jwks_cache_ttl_seconds,omitempty"`
+	TrustEmail              *bool                `json:"trust_email,omitempty"`
+	Enabled                 *bool                `json:"enabled,omitempty"`
+	FirstContact            *string              `json:"first_contact,omitempty" enum:"off,discover,adopt" doc:"See the create body. Validated with the stored mapping fields this patch leaves unchanged."`
+	FirstContactProjectID   *string              `json:"first_contact_project_id,omitempty" doc:"See the create body. An empty string clears it."`
+	FirstContactOwnerUserID *string              `json:"first_contact_owner_user_id,omitempty" doc:"See the create body. An empty string clears it."`
+	IfUpdatedAt             *time.Time           `json:"if_updated_at,omitempty" doc:"Apply the patch only if the row's updated_at still equals this (409 issuer_changed otherwise)."`
 }
 
 // ExternalIssuerView is an issuer row, with the JWKS probe made by the write
 // when there was one.
 type ExternalIssuerView struct {
-	ID                  string              `json:"id"`
-	AccountID           string              `json:"account_id"`
-	Issuer              string              `json:"issuer"`
-	Kind                string              `json:"kind"`
-	DisplayName         string              `json:"display_name"`
-	JWKSURI             string              `json:"jwks_uri"`
-	Audiences           []string            `json:"audiences"`
-	Algorithms          []string            `json:"algorithms"`
-	ClaimMapping        map[string]string   `json:"claim_mapping"`
-	PropagateClaims     []string            `json:"propagate_claims"`
-	ClaimConstraints    map[string][]string `json:"claim_constraints"`
-	MaxTokenAgeSeconds  int                 `json:"max_token_age_seconds"`
-	JWKSCacheTTLSeconds int                 `json:"jwks_cache_ttl_seconds"`
-	TrustEmail          bool                `json:"trust_email"`
-	Source              string              `json:"source"`
-	SourceRef           string              `json:"source_ref"`
-	Enabled             bool                `json:"enabled"`
-	CreatedBy           string              `json:"created_by"`
-	UpdatedBy           string              `json:"updated_by"`
-	CreatedAt           time.Time           `json:"created_at"`
-	UpdatedAt           time.Time           `json:"updated_at"`
-	JWKSCheck           *service.JWKSCheck  `json:"jwks_check,omitempty"`
+	ID                      string              `json:"id"`
+	AccountID               string              `json:"account_id"`
+	Issuer                  string              `json:"issuer"`
+	Kind                    string              `json:"kind"`
+	DisplayName             string              `json:"display_name"`
+	JWKSURI                 string              `json:"jwks_uri"`
+	Audiences               []string            `json:"audiences"`
+	Algorithms              []string            `json:"algorithms"`
+	ClaimMapping            map[string]string   `json:"claim_mapping"`
+	PropagateClaims         []string            `json:"propagate_claims"`
+	ClaimConstraints        map[string][]string `json:"claim_constraints"`
+	MaxTokenAgeSeconds      int                 `json:"max_token_age_seconds"`
+	JWKSCacheTTLSeconds     int                 `json:"jwks_cache_ttl_seconds"`
+	TrustEmail              bool                `json:"trust_email"`
+	Source                  string              `json:"source"`
+	SourceRef               string              `json:"source_ref"`
+	Enabled                 bool                `json:"enabled"`
+	FirstContact            string              `json:"first_contact"`
+	FirstContactProjectID   string              `json:"first_contact_project_id"`
+	FirstContactOwnerUserID string              `json:"first_contact_owner_user_id"`
+	FirstContactUpdatedBy   string              `json:"first_contact_updated_by" doc:"Who last changed first_contact or its mapping. Read-only."`
+	FirstContactUpdatedAt   *time.Time          `json:"first_contact_updated_at,omitempty" doc:"When first_contact or its mapping last changed. Read-only."`
+	CreatedBy               string              `json:"created_by"`
+	UpdatedBy               string              `json:"updated_by"`
+	CreatedAt               time.Time           `json:"created_at"`
+	UpdatedAt               time.Time           `json:"updated_at"`
+	JWKSCheck               *service.JWKSCheck  `json:"jwks_check,omitempty"`
 }
 
 func issuerView(r *domain.ExternalIssuer, check *service.JWKSCheck) ExternalIssuerView {
@@ -123,6 +134,9 @@ func issuerView(r *domain.ExternalIssuer, check *service.JWKSCheck) ExternalIssu
 		ClaimMapping: r.ClaimMapping, PropagateClaims: nonNil(r.PropagateClaims), ClaimConstraints: r.ClaimConstraints,
 		MaxTokenAgeSeconds: r.MaxTokenAgeSeconds, JWKSCacheTTLSeconds: r.JWKSCacheTTLSeconds, TrustEmail: r.TrustEmail,
 		Source: string(r.Source), SourceRef: r.SourceRef, Enabled: r.Enabled,
+		FirstContact: string(r.FirstContact), FirstContactProjectID: r.FirstContactProjectID,
+		FirstContactOwnerUserID: r.FirstContactOwnerUserID,
+		FirstContactUpdatedBy:   r.FirstContactUpdatedBy, FirstContactUpdatedAt: r.FirstContactUpdatedAt,
 		CreatedBy: r.CreatedBy, UpdatedBy: r.UpdatedBy, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		JWKSCheck: check,
 	}
@@ -298,6 +312,8 @@ func (a *API) createExternalIssuerOp(ctx context.Context, input *struct {
 		PropagateClaims: b.PropagateClaims, ClaimConstraints: b.ClaimConstraints,
 		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds, TrustEmail: b.TrustEmail,
 		Source: domain.IssuerSource(b.Source), SourceRef: b.SourceRef, Enabled: b.Enabled,
+		FirstContact: domain.FirstContactMode(b.FirstContact), FirstContactProjectID: b.FirstContactProjectID,
+		FirstContactOwnerUserID: b.FirstContactOwnerUserID,
 	})
 	if err != nil {
 		return nil, issuerProblemFrom(err, "create external issuer")
@@ -342,6 +358,8 @@ func (a *API) updateExternalIssuerOp(ctx context.Context, input *struct {
 		ClaimMapping: b.ClaimMapping, PropagateClaims: b.PropagateClaims, ClaimConstraints: b.ClaimConstraints,
 		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds, TrustEmail: b.TrustEmail,
 		Enabled: b.Enabled, IfUpdatedAt: b.IfUpdatedAt,
+		FirstContact: (*domain.FirstContactMode)(b.FirstContact), FirstContactProjectID: b.FirstContactProjectID,
+		FirstContactOwnerUserID: b.FirstContactOwnerUserID,
 	})
 	if err != nil {
 		return nil, issuerProblemFrom(err, "update external issuer")

@@ -369,6 +369,43 @@ const (
 	OriginOkta            Origin = "okta"
 	OriginEntra           Origin = "entra"
 	OriginGoogleWorkspace Origin = "google_workspace"
+	// OriginFirstContact marks an identity ZeroID registered itself when a
+	// verified credential from a trusted issuer named an agent no binding
+	// mapped yet (docs/external-issuers.md, "First contact"). Reserved: no
+	// API caller may create an identity with it.
+	OriginFirstContact Origin = "first_contact"
+)
+
+// First-contact markers on an identity: the label a list can filter on
+// (label=discovered_via:first_contact), and the metadata key holding the
+// verified claims the agent arrived with.
+const (
+	FirstContactLabelKey    = "discovered_via"
+	FirstContactLabelValue  = "first_contact"
+	FirstContactMetadataKey = "first_contact"
+)
+
+// FirstContactExternalIDPrefix starts the external_id of every identity
+// first contact registers. Reserved like OriginFirstContact: no API caller may
+// create an identity whose external_id starts with it, and the discovered
+// ingest refuses one. So a first-contact identity's external_id never equals
+// an id an inventory sync supplies, even when the agent's subject key is also
+// the id of another record the inventory holds (an IdP app the agent uses as
+// its client, say), and an ingest reaches a first-contact identity only
+// through its issuer_binding metadata.
+const FirstContactExternalIDPrefix = "first_contact."
+
+// Standing-adoption markers on an identity an issuer row's standing adoption
+// mapping activated, whether first contact registered it or it existed
+// already (docs/external-issuers.md, "Standing adoption"): the label a list
+// can filter on (label=adopted_via:first_contact, its value
+// FirstContactLabelValue), and the metadata key naming the row and who last
+// set its mapping. A discovered ingest can neither add nor remove them; the
+// identity API writes labels and metadata as given, so the audit row of the
+// activation is the authoritative record.
+const (
+	StandingAdoptionLabelKey    = "adopted_via"
+	StandingAdoptionMetadataKey = "first_contact_adoption"
 )
 
 // IsExternal reports whether the identity was discovered in an external IdP
@@ -438,6 +475,24 @@ type Identity struct {
 	// identities and for discovered rows ingested without a source.
 	SourceID string `bun:"source_id,type:varchar(255),nullzero" json:"source_id,omitempty"`
 
+	// ParentIdentityID is the identity that registered this one: set when the
+	// embedding service authenticated the registration request as that
+	// identity acting as itself (zeroid.WithCallerIdentity), never from request
+	// input. Empty for identities registered by anyone else. Written once, at
+	// registration. A child is bound by its parent's scope ceilings and
+	// inherits its owner, and deactivating an identity deactivates every
+	// identity below it. See docs/identity-tree.md.
+	ParentIdentityID string `bun:"parent_identity_id,type:uuid,nullzero" json:"parent_identity_id,omitempty"`
+
+	// CascadePendingAt marks a retired identity whose deactivation cascade
+	// (or, for an identity the cascade deactivated, whose own cleanup) has not
+	// been confirmed finished. It is set in the same UPDATE that retires the
+	// identity and cleared when the work completes; the cleanup worker and a
+	// repeated deactivation resume any identity that still carries it. Nil for
+	// every identity with nothing pending. Internal: never returned by the API.
+	// See docs/identity-tree.md.
+	CascadePendingAt *time.Time `bun:"cascade_pending_at,nullzero" json:"-"`
+
 	// Ownership and governance.
 	//
 	// CredentialPolicyID is the identity policy — the authority ceiling for
@@ -454,8 +509,10 @@ type Identity struct {
 	// AllowedScopes is the identity's absolute scope ceiling, the equivalent
 	// of RFC 7591 client `scope` metadata: no token for this identity carries
 	// a scope outside it. Credential policies are reusable bundles that narrow
-	// within it. Empty means no ceiling from this layer. See
-	// docs/scope-ceilings.md.
+	// within it. Empty means no ceiling from this layer, except on an identity
+	// registered by another identity (ParentIdentityID set), where empty means
+	// it holds no scope (ScopeCeilingRestricts). See docs/scope-ceilings.md and
+	// docs/identity-tree.md.
 	OwnerUserID        string   `bun:"owner_user_id,type:varchar(255)" json:"owner_user_id"`
 	CredentialPolicyID string   `bun:"credential_policy_id,type:uuid,nullzero" json:"credential_policy_id,omitempty"`
 	AllowedScopes      []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // The identity's absolute scope ceiling; see above.
@@ -514,6 +571,23 @@ type Identity struct {
 	ModifiedBy string    `bun:"modified_by,type:varchar(255)"  json:"modified_by,omitempty"`
 	CreatedAt  time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
 	UpdatedAt  time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+}
+
+// ScopeCeilingRestricts reports whether AllowedScopes restricts the scopes a
+// token for the identity may carry. A non-empty list always does. An empty
+// list restricts to nothing on an identity registered by another identity
+// (ParentIdentityID set): such an identity holds no scope until one is listed,
+// so a parent whose token holds no scope can still register it. On any other
+// identity an empty list places no restriction.
+func (i *Identity) ScopeCeilingRestricts() bool {
+	return i != nil && (len(i.AllowedScopes) > 0 || i.ParentIdentityID != "")
+}
+
+// ListsNoScope reports whether the identity's own ceiling restricts it to no
+// scope at all: an identity registered by another identity whose
+// AllowedScopes is empty.
+func (i *Identity) ListsNoScope() bool {
+	return i != nil && i.ParentIdentityID != "" && len(i.AllowedScopes) == 0
 }
 
 // IsExpired reports whether the identity's authority has aged out. A nil
@@ -617,6 +691,7 @@ func GetIdentitySchema() *IdentitySchema {
 			{Value: string(OriginOkta), Label: "Okta", Description: "Discovered via the Okta connector"},
 			{Value: string(OriginEntra), Label: "Microsoft Entra", Description: "Discovered via the Microsoft Entra connector"},
 			{Value: string(OriginGoogleWorkspace), Label: "Google Workspace", Description: "Discovered via the Google Workspace connector"},
+			{Value: string(OriginFirstContact), Label: "First contact", Description: "Registered on its first verified call through a trusted issuer"},
 		},
 	}
 }

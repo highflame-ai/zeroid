@@ -523,6 +523,51 @@ func TestBackchannelApproverConfig(t *testing.T) {
 	})
 }
 
+// token.scope_rules: off by default, the env var reaches it, and Validate
+// refuses anything but off, shadow or enforce, naming the key, so a typo never runs as
+// off unnoticed.
+func TestScopeRulesConfig(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.Token.ScopeRules != "off" {
+			t.Errorf("token.scope_rules must default to off, got %q", cfg.Token.ScopeRules)
+		}
+	})
+
+	t.Run("env", func(t *testing.T) {
+		for _, mode := range []string{"shadow", "enforce"} {
+			t.Setenv("ZEROID_SCOPE_RULES", mode)
+			cfg, err := LoadConfig("")
+			if err != nil {
+				t.Fatalf("LoadConfig failed: %v", err)
+			}
+			if cfg.Token.ScopeRules != mode {
+				t.Errorf("ZEROID_SCOPE_RULES=%s did not reach token.scope_rules, got %q", mode, cfg.Token.ScopeRules)
+			}
+		}
+	})
+
+	t.Run("validate", func(t *testing.T) {
+		for _, mode := range []string{"", "off", "shadow", "enforce"} {
+			cfg := baseValidConfig(t)
+			cfg.Token.ScopeRules = mode
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("scope_rules=%q must validate, got %v", mode, err)
+			}
+		}
+		for _, mode := range []string{"on", "SHADOW", "Enforce"} {
+			cfg := baseValidConfig(t)
+			cfg.Token.ScopeRules = mode
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "token.scope_rules") {
+				t.Errorf("scope_rules=%q must be rejected naming the key, got %v", mode, err)
+			}
+		}
+	})
+}
+
 // Ratchet: every `# Env: ZEROID_*` line in the shipped sample config must name a
 // variable the loader actually reads.
 //
@@ -862,6 +907,38 @@ func TestConfig_FederationIssuerStore(t *testing.T) {
 				t.Fatalf("err = %v, want %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestConfig_FirstContactBounds: the first-contact bounds default from the
+// loader, read from the environment, and refuse a negative value.
+func TestConfig_FirstContactBounds(t *testing.T) {
+	cfg := baseValidConfig(t)
+	cfg.Federation.FirstContact = FirstContactConfig{RatePerMinute: -1}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "first_contact") {
+		t.Fatalf("a negative rate: err = %v", err)
+	}
+	cfg.Federation.FirstContact = FirstContactConfig{}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("zero means the defaults: %v", err)
+	}
+
+	t.Setenv("ZEROID_HMAC_SECRET", "this-is-a-sufficiently-long-secret-key")
+	loaded, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := loaded.Federation.FirstContact; got.RatePerMinute != 10 || got.MaxDiscoveredPerAccount != 500 {
+		t.Fatalf("defaults = %+v, want 10 and 500", got)
+	}
+	t.Setenv("ZEROID_FEDERATION_FIRST_CONTACT_RATE_PER_MINUTE", "3")
+	t.Setenv("ZEROID_FEDERATION_FIRST_CONTACT_MAX_DISCOVERED_PER_ACCOUNT", "40")
+	loaded, err = LoadConfig("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := loaded.Federation.FirstContact; got.RatePerMinute != 3 || got.MaxDiscoveredPerAccount != 40 {
+		t.Fatalf("from the environment = %+v, want 3 and 40", got)
 	}
 }
 

@@ -198,6 +198,21 @@ const (
 // authorization_code and refresh) and /oauth2/authorize answers invalid_scope.
 var ErrPersonScopeDenied = service.ErrPersonScopeDenied
 
+// ScopeRulesMode is what the stricter scope issuance rules do: off (default);
+// shadow, which evaluates them on every grant and records each request whose
+// outcome they would change, without changing any token or response; or
+// enforce, which applies the outcome that same evaluation gives and records
+// each request it changes.
+// Set it with token.scope_rules or Server.SetScopeRulesMode. See
+// docs/scope-ceilings.md, "Stricter scope rules".
+type ScopeRulesMode = service.ScopeRulesMode
+
+const (
+	ScopeRulesModeOff     = service.ScopeRulesModeOff
+	ScopeRulesModeShadow  = service.ScopeRulesModeShadow
+	ScopeRulesModeEnforce = service.ScopeRulesModeEnforce
+)
+
 // FederatedPersonRequest names the person in a verified IdP token (ID-JAG or
 // ID-token exchange) for a FederatedPersonResolver. See
 // internal/service/person_federation.go for the field docs.
@@ -512,4 +527,58 @@ func WithReservedScopeWrite(ctx context.Context) context.Context {
 // ReservedScopeWrite reports whether ctx carries WithReservedScopeWrite.
 func ReservedScopeWrite(ctx context.Context) bool {
 	return service.ReservedScopeWrite(ctx)
+}
+
+// CallerIdentity names the registered identity an admin request was
+// authenticated as, when the caller is that identity acting as itself, and
+// what the token it presented holds. See WithCallerIdentity.
+//
+// See internal/service/identity_tree.go for the canonical doc comment.
+type CallerIdentity = service.CallerIdentity
+
+// WithCallerIdentity returns ctx marked as an admin request made by the given
+// registered identity, acting as itself. An identity registered by such a
+// request (POST /identities, POST /agents/register) becomes the caller's
+// child: it records the caller as parent_identity_id, takes the caller's
+// owner, takes what the caller and its token hold where the request names no
+// allowed_scopes or credential policy, may hold no scope, policy, trust level
+// or lifetime beyond the caller's and its token's, and is deactivated whenever
+// the caller is. Any other write such a request makes on the identity and
+// agent registry routes is refused unless its target is the caller's own
+// child, is held to the same bound, can lower but never raise that child's
+// status, and can change no identity's owner or identity_type. The routes
+// that manage API keys, credentials, credential policies and attestations do
+// not consult the mark: do not let an identity's own token reach them. See
+// docs/identity-tree.md.
+//
+// Set it in the AdminAuth layer, from an access token that layer verified,
+// and only when the token is the identity's own, issued to it for itself (no
+// act claim, not held for a person). Fill the fields from the verified
+// claims: WIMSEURI from sub (or IdentityID), Scopes from scopes, and APIKeyID
+// from api_key_id when present. Never derive any of them from a header or
+// body field the client controls. The identity must belong to the account and
+// project the request is made in; a caller from another tenant, or one that is
+// not active, is refused with 403. Without the mark, registration is unchanged.
+func WithCallerIdentity(ctx context.Context, c CallerIdentity) context.Context {
+	return service.WithCallerIdentity(ctx, c)
+}
+
+// WithTrustedOwnerWrite returns ctx marked as the deployer's trusted path,
+// which may change the owner_user_id of an identity registered by another
+// identity. Without it, such a change is refused with 403. A request marked
+// with WithCallerIdentity can change no identity's owner, with or without
+// this mark. Set it in the AdminAuth layer for the most trusted caller class
+// only.
+func WithTrustedOwnerWrite(ctx context.Context) context.Context {
+	return service.WithTrustedOwnerWrite(ctx)
+}
+
+// TrustedOwnerWrite reports whether ctx carries WithTrustedOwnerWrite.
+func TrustedOwnerWrite(ctx context.Context) bool {
+	return service.TrustedOwnerWrite(ctx)
+}
+
+// CallerIdentityFromContext returns the identity set by WithCallerIdentity.
+func CallerIdentityFromContext(ctx context.Context) (CallerIdentity, bool) {
+	return service.CallerIdentityFromContext(ctx)
 }

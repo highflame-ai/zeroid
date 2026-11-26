@@ -230,6 +230,12 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	// The approval extends the chain, so the token holds the chain's scopes,
 	// never more (RFC 8693: a child never exceeds its parent). The approval
 	// itself grants the authorization_details entry, not scopes.
+	//
+	// A step-up that names no scope beside openid keeps the chain's scopes;
+	// for the stricter rules' shadow count that is a request naming none.
+	trace := scopeTraceFrom(ctx)
+	trace.ask(authorityScopes(req.Scopes), true)
+	trace.strictCeiling(ceilingRequestingToken, cred.Scopes)
 	scopes, err := requestingChainScopes(cred.Scopes, req.Scopes)
 	if err != nil {
 		return true, err
@@ -254,10 +260,12 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if ident.IsExpired() {
 		return true, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 	}
+	trace.setIdentity(ident)
 	if refused := scopeRefusedForIdentityType(ident.IdentityType, req.Scopes); refused != "" {
 		return true, oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not issued to this identity", refused))
 	}
-	if err := requireScopesWithin(req.Scopes, ident.AllowedScopes, "the requesting identity's allowed_scopes"); err != nil {
+	trace.identityCeiling(ceilingRequesterScopes, ident)
+	if err := requireScopesWithinIdentity(req.Scopes, ident, "the requesting identity's allowed_scopes"); err != nil {
 		return true, err
 	}
 
@@ -280,6 +288,7 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if userGrant {
 		policyCeiling, ceilingName = policy.UserGrantScopes, "the requesting identity's credential policy user_grant_scopes"
 	}
+	trace.ceiling(policyCeilingName(ownerRequestingIdentity, userGrant), policyCeiling)
 	if err := requireScopesWithin(req.Scopes, policyCeiling, ceilingName); err != nil {
 		return true, err
 	}
@@ -378,7 +387,9 @@ func (s *BackchannelService) boundAnchorGates(ctx context.Context, req *IssueReq
 	if refused := scopeRefusedForIdentityType(req.Identity.IdentityType, req.Scopes); refused != "" {
 		return oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not issued to the bound identity", refused))
 	}
-	if err := requireScopesWithin(req.Scopes, req.Identity.AllowedScopes, "the bound identity's allowed_scopes"); err != nil {
+	trace := scopeTraceFrom(ctx)
+	trace.identityCeiling(ceilingBoundScopes, req.Identity)
+	if err := requireScopesWithinIdentity(req.Scopes, req.Identity, "the bound identity's allowed_scopes"); err != nil {
 		return err
 	}
 	if req.IdentityPolicyID == "" || s.credentialSvc.policySvc == nil {
@@ -402,6 +413,7 @@ func (s *BackchannelService) boundAnchorGates(ctx context.Context, req *IssueReq
 		PrincipalType:    req.PrincipalType,
 		UserGrantBounded: req.UserGrantBounded,
 	}
+	trace.ceiling(policyCeilingName(ownerBoundIdentity, req.UserGrantBounded && req.PrincipalType == domain.PrincipalUser), scopeCeiling(policy, enforce))
 	if err := requireScopesWithin(req.Scopes, scopeCeiling(policy, enforce), "the bound identity's credential policy"); err != nil {
 		return err
 	}
@@ -545,6 +557,17 @@ func requestingChainPrincipal(cred *domain.IssuedCredential, sub, issuer string)
 	default:
 		return resolvedPrincipal{Type: domain.PrincipalUser, Sub: sub, Iss: issuer}
 	}
+}
+
+// requireScopesWithinIdentity is requireScopesWithin for an identity's own
+// allowed_scopes, which restricts even when empty on an identity registered
+// by another identity (domain.Identity.ScopeCeilingRestricts): there it
+// admits no scope.
+func requireScopesWithinIdentity(requested []string, ident *domain.Identity, what string) error {
+	if ident.ListsNoScope() && len(requested) > 0 {
+		return oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not permitted by %s", requested[0], what))
+	}
+	return requireScopesWithin(requested, ident.AllowedScopes, what)
 }
 
 // requireScopesWithin refuses any requested scope outside a non-empty ceiling.

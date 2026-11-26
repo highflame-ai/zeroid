@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -50,6 +52,133 @@ type CredentialService struct {
 	// personGrant is the deployer's person-grant ceiling (ADR 0041 D15),
 	// consulted for every person root. Nil-safe: unset, nothing changes.
 	personGrant personGrantState
+	// tree reads registration-tree ancestors and credential lineages for
+	// the issuance and introspection guards (SetIdentityTree). Unset, every
+	// check that needs it refuses: the guards fail closed.
+	tree identityTreeReader
+	// scopeRules is the stricter scope rules' mode. Off by default; shadow
+	// only counts what they would change.
+	scopeRules scopeRulesState
+}
+
+// identityTreeReader is what the tree guards read: an identity's ancestor
+// chain (the identity first), and the identities a credential and the
+// credentials it was delegated from were issued to.
+// postgres.IdentityRepository implements it.
+type identityTreeReader interface {
+	AncestorChain(ctx context.Context, fromID, accountID, projectID string) ([]postgres.Ancestor, error)
+	CredentialLineage(ctx context.Context, jti string) ([]postgres.LineageIdentity, error)
+}
+
+// SetIdentityTree wires the reads the issuance and introspection guards use
+// to refuse a token that speaks for, or acts as, an identity at or below one
+// that is not active. Wired once at server construction.
+func (s *CredentialService) SetIdentityTree(t identityTreeReader) {
+	s.tree = t
+}
+
+// checkAncestorsUsable refuses issuance to an identity any of whose ancestors
+// in the registration tree is not active, is suspended, or has expired, so a
+// stopped tree stops minting at once, before (and whether or not) the
+// deactivation walk reaches the identities below. One statement of at most
+// postgres.MaxTreeDepth primary-key lookups, run only for an identity that
+// has a parent; any failure to read the chain refuses.
+func (s *CredentialService) checkAncestorsUsable(ctx context.Context, identity *domain.Identity) error {
+	if identity.ParentIdentityID == "" {
+		return nil
+	}
+	if s.tree == nil {
+		return fmt.Errorf("%w: the registration tree above it cannot be checked", domain.ErrIdentityNotUsable)
+	}
+	chain, err := s.tree.AncestorChain(ctx, identity.ParentIdentityID, identity.AccountID, identity.ProjectID)
+	if err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Msg("issuance: could not read the registration tree above the identity; refusing")
+		return fmt.Errorf("%w: the registration tree above it could not be read", domain.ErrIdentityNotUsable)
+	}
+	if err := usableChain(chain); err != nil {
+		return fmt.Errorf("%w: %w, above it in the registration tree", domain.ErrIdentityNotUsable, err)
+	}
+	return nil
+}
+
+// identityChainRefusal reports why a token may not speak for, or act as, the
+// identity id in its tenant: the identity, or an identity above it in the
+// registration tree, is not active and unexpired, or the identity no longer
+// exists. "" means it may. err is a failure to read, never a refusal.
+func (s *CredentialService) identityChainRefusal(ctx context.Context, id, accountID, projectID string) (string, error) {
+	chain, err := s.tree.AncestorChain(ctx, id, accountID, projectID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Sprintf("identity %s no longer exists", id), nil
+	case errors.Is(err, postgres.ErrBrokenAncestorChain):
+		return fmt.Sprintf("the registration tree above identity %s is broken", id), nil
+	case err != nil:
+		return "", err
+	}
+	if err := usableChain(chain); err != nil {
+		return fmt.Sprintf("%s, at or above identity %s in the registration tree", err, id), nil
+	}
+	return "", nil
+}
+
+// lineageRefusal reports why a token delegated from the credential jti may
+// not be issued or honoured: an identity that credential, or any credential
+// it was delegated from, was issued to (the chain's principal and every
+// actor) is not usable, or sits below an identity that is not. "" means
+// every one is usable. err is a failure to read, never a refusal.
+func (s *CredentialService) lineageRefusal(ctx context.Context, jti string) (string, error) {
+	ids, err := s.tree.CredentialLineage(ctx, jti)
+	if errors.Is(err, postgres.ErrBrokenLineage) {
+		return err.Error(), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	for _, li := range ids {
+		if reason, err := s.identityChainRefusal(ctx, li.IdentityID, li.AccountID, li.ProjectID); reason != "" || err != nil {
+			return reason, err
+		}
+	}
+	return "", nil
+}
+
+// checkLineageUsable refuses a delegated issuance whose parent credential
+// (parentJTI) speaks for or acts as an identity that is stopped: not active,
+// expired, or below one that is. The actor the new token is issued to is
+// checked separately (checkAncestorsUsable and the status checks). Any
+// failure to read refuses.
+func (s *CredentialService) checkLineageUsable(ctx context.Context, parentJTI string) error {
+	if s.tree == nil {
+		return fmt.Errorf("%w: the delegation chain cannot be checked", domain.ErrIdentityNotUsable)
+	}
+	reason, err := s.lineageRefusal(ctx, parentJTI)
+	if err != nil {
+		log.Warn().Err(err).Str("parent_jti", parentJTI).Msg("issuance: could not read the identities the delegation chain speaks for; refusing")
+		return fmt.Errorf("%w: the delegation chain could not be checked", domain.ErrIdentityNotUsable)
+	}
+	if reason != "" {
+		return fmt.Errorf("%w: the token it is delegated from speaks for or acts as a stopped identity: %s", domain.ErrIdentityNotUsable, reason)
+	}
+	return nil
+}
+
+// credentialTreeRefusal reports why an issued, unrevoked, unexpired
+// credential is no longer active: the identity it was issued to, an identity
+// a credential it was delegated from was issued to, or an identity above any
+// of them in the registration tree, is not active and unexpired.
+func (s *CredentialService) credentialTreeRefusal(ctx context.Context, cred *domain.IssuedCredential) (string, error) {
+	if s.tree == nil {
+		return "the registration tree cannot be checked", nil
+	}
+	if cred.IdentityID != nil && *cred.IdentityID != "" {
+		if reason, err := s.identityChainRefusal(ctx, *cred.IdentityID, cred.AccountID, cred.ProjectID); reason != "" || err != nil {
+			return reason, err
+		}
+	}
+	if cred.ParentJTI != "" {
+		return s.lineageRefusal(ctx, cred.ParentJTI)
+	}
+	return "", nil
 }
 
 // SetTenantSettingsService wires the per-tenant settings the issuance
@@ -427,7 +556,7 @@ func (s *CredentialService) recordUnboundedScope(ctx context.Context, req IssueR
 		root = "workload"
 	case req.RequestBoundedRoot && principal.Type == domain.PrincipalUser:
 		// An enforced person-grant ceiling bounds the root (ADR 0041 D15).
-		bounded := len(req.Identity.AllowedScopes) > 0 || (req.personGrant != nil && req.personGrant.enforced)
+		bounded := req.Identity.ScopeCeilingRestricts() || (req.personGrant != nil && req.personGrant.enforced)
 		if identityPolicy != nil {
 			bounded = bounded || len(identityPolicy.AllowedScopes) > 0 || len(identityPolicy.UserGrantScopes) > 0
 		}
@@ -647,6 +776,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	if req.Identity == nil {
 		return nil, nil, fmt.Errorf("identity is required")
 	}
+	// The stricter scope rules' shadow count (nil when off) attributes the
+	// request to the identity and client the token is for.
+	trace := scopeTraceFrom(ctx)
+	trace.setIdentity(req.Identity)
+	trace.setClientID(req.ClientID)
 	if !req.Identity.Status.IsUsable() {
 		return nil, nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, req.Identity.Status)
 	}
@@ -656,6 +790,17 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		// is what guarantees no grant path can mint a token past the
 		// authority's expiry window, regardless of worker timing.
 		return nil, nil, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
+	}
+	// Nor does an identity below one that is no longer active, nor a token
+	// delegated from one that speaks for or acts as such an identity
+	// (docs/identity-tree.md).
+	if err := s.checkAncestorsUsable(ctx, req.Identity); err != nil {
+		return nil, nil, err
+	}
+	if req.ParentJTI != "" {
+		if err := s.checkLineageUsable(ctx, req.ParentJTI); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	ttl, ttlRequested, err := s.issueTTL(req)
@@ -699,6 +844,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// Reserved scopes are issued only through the api_key grant's checks; an
 	// unbounded ceiling, an exchange or any other grant never yields one.
 	if r := s.reserved.in(req.Scopes); len(r) > 0 && !req.ReservedScopesAuthorized {
+		trace.refusedByReservedScopes()
 		return nil, nil, fmt.Errorf("%w: %q is issued only on the api_key grant, from a key that lists it", ErrScopesNotAllowed, r[0])
 	}
 
@@ -709,14 +855,17 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// chain acting for a person) only narrow within it. The grants narrow to it
 	// first (grantScopes); this re-check is the chokepoint, and covers the
 	// grants that take their scopes from a person's grant rather than computing
-	// them. See docs/scope-ceilings.md.
-	if len(req.Identity.AllowedScopes) > 0 && len(req.Scopes) > 0 {
+	// them. See docs/scope-ceilings.md. An identity registered by another
+	// identity is restricted by its list even when the list is empty, which
+	// then admits no scope (domain.Identity.ScopeCeilingRestricts).
+	if req.Identity.ScopeCeilingRestricts() && len(req.Scopes) > 0 {
 		allowed := make(map[string]bool, len(req.Identity.AllowedScopes))
 		for _, s := range req.Identity.AllowedScopes {
 			allowed[s] = true
 		}
 		for _, requested := range req.Scopes {
 			if !allowed[requested] {
+				trace.identityCeiling(ceilingIdentityScopes, req.Identity)
 				return nil, nil, fmt.Errorf("%w: %q not in allowed_scopes", ErrScopesNotAllowed, requested)
 			}
 		}
@@ -760,7 +909,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	//
 	// The identity's governing policy, kept for choices beyond enforcement
 	// (the token's typ header). Nil when no identity policy governs the grant.
-	var identityPolicy *domain.CredentialPolicy
+	// keyPolicy is the API key's own policy, when distinct from it.
+	var identityPolicy, keyPolicy *domain.CredentialPolicy
 	if s.policySvc != nil {
 		var attestationLevel string
 		if s.attestationRepo != nil && req.Identity.ID != "" {
@@ -819,6 +969,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 					Str("policy_id", identityPolicyID).
 					Str("policy_layer", "identity").
 					Msg("Identity policy enforcement denied issuance")
+				trace.policyRefused(err, policy, enforceReq, identityPolicyOwner(req.Identity))
 				return nil, nil, err
 			}
 			identityPolicy = policy
@@ -843,13 +994,35 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 					Str("policy_id", req.CredentialPolicyID).
 					Str("policy_layer", "credential").
 					Msg("Credential policy enforcement denied issuance")
+				trace.policyRefused(err, policy, enforceReq, ownerAPIKey)
 				return nil, nil, err
 			}
+			keyPolicy = policy
 		}
 	}
 
 	if identityPolicy == nil && req.EnforcedIdentityPolicy != nil {
 		identityPolicy = req.EnforcedIdentityPolicy
+	}
+
+	// With token.scope_rules=enforce the stricter scope rules decide the
+	// token's scopes here, after every check above and before anything is
+	// signed or stored: they judge the request exactly as shadow mode judges
+	// the token minted below, refusing it (rules B and C) or dropping the
+	// default a request that named no scope was given (rule A). A no-op in
+	// any other mode.
+	var listings [][]string
+	if trace != nil {
+		listings = scopeListings(req, principal, identityPolicy, keyPolicy)
+	}
+	if trace.enforcing() {
+		trace.chokepoint(listings)
+		trace.listableAt(req, principal, identityPolicy, keyPolicy)
+		scopes, err := trace.enforceScopes(req.Scopes)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Scopes = scopes
 	}
 
 	now := time.Now()
@@ -1189,6 +1362,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		Msg("Credential issued")
 
 	s.recordUnboundedScope(ctx, req, principal, identityPolicy)
+	if trace != nil {
+		trace.minted(req.Scopes, listings...)
+	}
 
 	tokenType := "Bearer"
 	if req.DPoPKeyThumbprint != "" {
@@ -1523,7 +1699,11 @@ func stringPtrOrNil(s string) *string {
 	return &s
 }
 
-// IntrospectToken checks the validity of a JTI against the credential store.
+// IntrospectToken checks the validity of a JTI against the credential store:
+// a token is active while it is unrevoked, unexpired, and its identity, every
+// identity a token it was delegated from was issued to, and every identity
+// above any of them in the registration tree is active and unexpired. A
+// failure to read those returns an error with active false.
 func (s *CredentialService) IntrospectToken(ctx context.Context, jti string) (*domain.IssuedCredential, bool, error) {
 	cred, err := s.repo.GetByJTI(ctx, jti)
 	if err != nil {
@@ -1533,6 +1713,19 @@ func (s *CredentialService) IntrospectToken(ctx context.Context, jti string) (*d
 		return cred, false, nil
 	}
 	if time.Now().After(cred.ExpiresAt) {
+		return cred, false, nil
+	}
+	// Nor is a token whose identity, or an identity a token it was
+	// delegated from was issued to, is stopped or sits below a stopped
+	// identity in the registration tree (docs/identity-tree.md). Suspending
+	// an identity does not revoke the tokens of the identities below it, so
+	// this is what makes them inactive.
+	reason, err := s.credentialTreeRefusal(ctx, cred)
+	if err != nil {
+		return cred, false, fmt.Errorf("check the identities the token speaks for: %w", err)
+	}
+	if reason != "" {
+		log.Debug().Str("jti", jti).Str("reason", reason).Msg("introspection: token inactive, its identity chain is stopped")
 		return cred, false, nil
 	}
 	return cred, true, nil

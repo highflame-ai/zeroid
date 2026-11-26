@@ -201,6 +201,9 @@ func (s *CredentialService) decidePersonGrant(ctx context.Context, req *IssueReq
 	}
 	d := &personGrantDecision{requested: pr.RequestedScopes, scopes: req.Scopes, roles: roles}
 	if hook.mode == PersonGrantModeEnforce {
+		// What the ceiling removed, for the stricter scope rules' refusal
+		// text (a no-op unless token.scope_rules is enforce).
+		scopeTraceFrom(ctx).strictCeiling(ceilingPersonScopes, ceiling)
 		if outcome == "denied" {
 			return ErrPersonScopeDenied
 		}
@@ -314,13 +317,15 @@ func personGrantOAuthError(err error, deniedCode string) error {
 
 // issuanceRefusal reports whether err is an issuance refusal that the token
 // handler answers with a 4xx: a credential policy violation, a scope outside
-// the identity's allowed_scopes, or an identity or credential that is no
-// longer usable. A grant that wraps other issuance errors in server_error
-// returns these unchanged, so a client that asked for more than it may have
-// gets the same answer on every grant.
+// the identity's allowed_scopes, a refusal by the stricter scope rules in
+// enforce mode, or an identity or credential that is no longer usable. A
+// grant that wraps other issuance errors in server_error returns these
+// unchanged, so a client that asked for more than it may have gets the same
+// answer on every grant.
 func issuanceRefusal(err error) bool {
 	return errors.Is(err, ErrPolicyViolation) ||
 		errors.Is(err, ErrScopesNotAllowed) ||
+		errors.Is(err, errScopeRulesRefusal) ||
 		errors.Is(err, domain.ErrIdentityExpired) ||
 		errors.Is(err, domain.ErrIdentityNotUsable) ||
 		errors.Is(err, domain.ErrCredentialExpired)

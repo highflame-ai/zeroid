@@ -66,6 +66,10 @@ type OAuthService struct {
 	// issuerBindings maps federated agents to identities when issuers are
 	// account rows (ADR 0042 D6). Nil in static mode.
 	issuerBindings issuerBindingSource
+	// firstContact registers an agent a verified credential names when no
+	// binding maps it yet, as its issuer row's first_contact says. Nil keeps
+	// first contact off. Wired via SetFirstContact.
+	firstContact *FirstContactRegistrar
 	// federatedPerson resolves the person in an IdP token to the deployer's
 	// user (ADR 0042 D5a).
 	federatedPerson federatedPersonHook
@@ -191,10 +195,10 @@ const defaultExternalPrincipalRefreshTokenTTL = 12 * 3600
 var reservedClaims = map[string]bool{
 	// RFC 7519 registered claims
 	"iss": true, "sub": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
-	// RFC 8707 resource binding. Shield reads `resource` as proof that ZeroID
-	// recorded a resource restriction AT THE MINT and enforces INV-IDN-006 on
-	// it — so the claim only means that if ZeroID is the only party who can set
-	// it. Reserving it keeps the presence of the claim load-bearing: a caller
+	// RFC 8707 resource binding. A resource server reads `resource` as proof
+	// that ZeroID recorded a resource restriction AT THE MINT and enforces the
+	// binding on it — so the claim only means that if ZeroID is the only party
+	// who can set it. Reserving it keeps the presence of the claim load-bearing: a caller
 	// must never be able to make a token look resource-bound when it isn't, or
 	// to widen a real binding by overriding it through additional_claims.
 	"resource": true,
@@ -248,9 +252,9 @@ var reservedClaims = map[string]bool{
 	// trusted-service caller that legitimately sets it. That pre-existing gap
 	// is worth its own change rather than being smuggled into this one.
 	"client_id": true,
-	// Step-up approvals (RFC 9396). Shield honours a `highflame_tool_call`
-	// entry in `authorization_details` only on a CIBA-minted token, and only
-	// when its `approval_id` names a challenge Shield raised — but the claim
+	// Step-up approvals (RFC 9396). A policy decision point may honour an
+	// `authorization_details` entry only on a CIBA-minted token, and only
+	// when its `approval_id` names a challenge it raised — but the claim
 	// must still never be writable through additional_claims, or a token
 	// from another grant could carry an approval nobody gave. ZeroID writes
 	// it only on the CIBA path, from the approved request row
@@ -259,9 +263,9 @@ var reservedClaims = map[string]bool{
 	// caller can mint a look-alike.
 	"authorization_details": true,
 	"approval_id":           true,
-	// Agent provenance. Shield projects `origin`, `agent_idp_iss` and
-	// `agent_idp_parent` into context.principal / context.actor, where
-	// policies use them to tell native agents from IdP-registered ones
+	// Agent provenance. A policy decision point may project `origin`,
+	// `agent_idp_iss` and `agent_idp_parent` into its principal and actor
+	// context, where policies use them to tell native agents from IdP-registered ones
 	// (e.g. "forbid unless origin == native", or trusting one IdP tenant).
 	// ZeroID does not mint them yet; until it does from the identity row,
 	// nothing may set them, or a caller with an id_token exchange could
@@ -792,7 +796,7 @@ type TokenRequest struct {
 	// form-encoded request may repeat the parameter (RFC 8707 §2).
 	//
 	// It only ever NARROWS. The values are stamped as the token's `aud` AND as
-	// the reserved `resource` claim that Shield enforces INV-IDN-006 on, and
+	// the reserved `resource` claim that a resource server enforces the binding on, and
 	// grant no authority the grant did not already carry — which is why an
 	// arbitrary caller-supplied identifier is safe to accept without a registry
 	// of known resource servers.
@@ -830,8 +834,19 @@ type TokenRequest struct {
 }
 
 // Token handles the /oauth2/token endpoint dispatch.
-func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (tok *domain.AccessToken, err error) {
 	ctx = withPolicyMemo(ctx)
+	// With token.scope_rules=shadow, record what the stricter scope rules
+	// would change about this request once its outcome is known. The trace
+	// only observes: the token and the error returned are untouched. With
+	// enforce, the same trace decides where the token is minted, and records
+	// what it changed.
+	ctx, trace := s.credentialSvc.traceScopes(ctx, scopeTraceGrant(req.GrantType))
+	// With enforce, a scope refusal is answered invalid_scope (rule D).
+	// Deferred first so it runs last, after done has judged the refusal as
+	// today's rules answered it.
+	defer func() { err = trace.answer(err) }()
+	defer func() { trace.done(ctx, err) }()
 	// RFC 8707 resource indicators (CAP-IDN-026). Resolved here, once, BEFORE
 	// grant dispatch so every grant — including custom ones registered via
 	// RegisterGrant — sees the same validated list and no grant can forget the
@@ -862,7 +877,7 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		// so all three exchange modes (NHI delegation, the trusted-broker
 		// principal exchange, OIDC ID-token federation) carry it and a new
 		// mode cannot forget to. Every mode issues a ZeroID access token.
-		tok, err := s.tokenExchange(ctx, req)
+		tok, err = s.tokenExchange(ctx, req)
 		if tok != nil {
 			tok.IssuedTokenType = TokenTypeAccessToken
 		}
@@ -907,6 +922,10 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidRequest,
 			"account_id and project_id must be sent together, or both omitted")
 	}
+	trace := scopeTraceFrom(ctx)
+	trace.ask(parseScopeString(req.Scope), true)
+	// The tenant is recorded from the identity once it resolves, never from
+	// the request: a caller could otherwise name any tenant it likes.
 
 	// A client_assertion from a trusted workload issuer authenticates the
 	// agent with no registered client (ADR 0042 D8).
@@ -926,6 +945,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	if err != nil {
 		return nil, err
 	}
+	trace.setClient(client)
 
 	// Ensure client_credentials grant is permitted.
 	allowed := slices.Contains(client.GrantTypes, "client_credentials")
@@ -1011,6 +1031,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	if identity.IsExpired() {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 	}
+	trace.setIdentity(identity)
 	// A token in the service tenant is one of the deployment's services
 	// calling as itself, which a receiver recognises by client_id and this
 	// account. Only such a service's own client may mint one, and it lives
@@ -1048,9 +1069,14 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// Narrow against the client's own scopes first (checked above: a
 	// client with none can mint nothing), then against the identity's
 	// policy and row ceilings. client.Scopes is non-empty, so grantScopes
-	// always sees a restricting ceiling and never returns an empty grant.
+	// always sees a restricting ceiling and never returns an empty grant,
+	// except for an identity whose own ceiling lists no scope, which gets
+	// none (grantIdentityScopes).
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
-	scopes, err := grantScopes(req.Scope, client.Scopes, policyScopes, rowScopes)
+	trace.strictCeiling(clientCeilingName(client), client.Scopes)
+	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
+	scopes, err := grantIdentityScopes(req.Scope, identity, client.Scopes, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err
 	}
@@ -1188,15 +1214,20 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	if err != nil {
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
 	}
+	trace := scopeTraceFrom(ctx)
+	trace.setIdentity(identity)
+	trace.ask(parseScopeString(req.Scope), true)
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
-	scopes, err := grantScopes(req.Scope, policyScopes, rowScopes)
+	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
+	scopes, err := grantIdentityScopes(req.Scope, identity, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		// The ceiling rule (P1) counts a workload that named a scope no layer capped.
-		ScopeCeilingUnbounded: len(policyScopes) == 0 && len(rowScopes) == 0,
+		ScopeCeilingUnbounded: len(policyScopes) == 0 && !identity.ScopeCeilingRestricts(),
 		Identity:              identity,
 		IdentityPolicyID:      policy.ID,
 		Scopes:                scopes,
@@ -1398,6 +1429,11 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// never receive more than its principal currently holds, per RFC 8693
 	// intent.
 	requestedScopes := parseScopeString(req.Scope)
+	trace := scopeTraceFrom(ctx)
+	trace.ask(requestedScopes, false)
+	trace.markDelegation()
+	trace.setIdentity(actorIdentity)
+	trace.setClientID(actorIdentity.ExternalID)
 	// The parent's depth. jwx v4: jwt.Get[float64] replaces the v2 Token.Get
 	// + assertion; JSON numbers decode as float64 regardless of integer intent.
 	var parentDepth int
@@ -1423,6 +1459,12 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	for _, s := range subjectCred.Scopes {
 		orchSet[s] = true
 	}
+	// The terms below, in the order they narrow, for the stricter scope
+	// rules' refusal text: in delegation the subject token is one more
+	// ceiling.
+	trace.strictCeiling(ceilingSubjectToken, subjectCred.Scopes)
+	trace.ceiling(policyCeilingName(ownerActor, userGrantCeiling), actorPolicyScopes)
+	trace.identityCeiling(ceilingActorScopes, actorIdentity)
 	// The orchestrator term is filtered explicitly rather than through
 	// narrowScopes: an orchestrator holding no scopes can delegate nothing,
 	// whereas narrowScopes reads an empty ceiling as "no restriction".
@@ -1433,8 +1475,19 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		}
 	}
 	scopes = narrowScopes(narrowScopes(scopes, actorPolicyScopes), actorRowScopes)
+	if actorIdentity.ListsNoScope() {
+		// An actor whose own ceiling lists no scope can be delegated none:
+		// narrowScopes would read its empty list as no restriction.
+		scopes = nil
+	}
 	if len(scopes) == 0 {
-		return nil, delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes, userGrantCeiling)
+		denial := delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes, actorIdentity.ListsNoScope(), userGrantCeiling)
+		// With token.scope_rules=enforce, rule C issues a delegation that
+		// names no scope with none, where today's rules refuse it. Every
+		// other empty result stays refused.
+		if !trace.issuesRefusedDelegation(denial) {
+			return nil, denial
+		}
 	}
 
 	// Step 5: the child's delegation depth is the parent's plus one
@@ -1672,6 +1725,8 @@ func (s *OAuthService) parentPrincipal(subjectParsed jwt.Token, subjectCred *dom
 // ExternalPrincipalExchange issues an RS256 token for an externally-authenticated principal.
 // Exported so deployers can call it from custom grant handlers.
 func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	trace := scopeTraceFrom(ctx)
+	trace.setGrant(PersonGrantExternalPrincipal)
 	// Step 1: Verify the caller. A session broker (a client on
 	// service_tokens.session_broker_clients) authenticates as that client and
 	// nothing else: its client authentication must pass, the trusted-service
@@ -1866,6 +1921,13 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		}
 		scopes = slices.Clone(profile)
 		audience = []string{req.Audience}
+	}
+	// A profiled audience's scopes are the server's, not the caller's: they
+	// are what was asked, every one is listed, and rule A keeps them.
+	trace.setIdentity(identity)
+	trace.ask(scopes, len(audience) == 0)
+	if len(audience) > 0 {
+		trace.listAll()
 	}
 
 	issue := IssueRequest{
@@ -2279,8 +2341,23 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		}
 		keyPolicyScopes = kp.AllowedScopes
 	}
+	// The key's stored scopes are a deployer-controlled listing, and the
+	// default an omitted request keeps under rule A when the key has any.
+	trace := scopeTraceFrom(ctx)
+	trace.setIdentity(identity)
+	trace.ask(parseScopeString(req.Scope), len(sk.Scopes) == 0)
+	trace.addListing(sk.Scopes)
+	trace.addListing(keyPolicyScopes)
+	trace.listableIn(ceilingAPIKeyScopes)
+	if sk.CredentialPolicyID != "" {
+		trace.listableIn(policyCeilingName(ownerAPIKey, false))
+	}
 	identityPolicyScopes, rowScopes := identityScopeCeilings(identityPolicy, identity)
-	scopes, err := grantScopes(req.Scope, sk.Scopes, keyPolicyScopes, identityPolicyScopes, rowScopes)
+	trace.ceiling(ceilingAPIKeyScopes, sk.Scopes)
+	trace.ceiling(policyCeilingName(ownerAPIKey, false), keyPolicyScopes)
+	trace.ceiling(policyCeilingName(identityPolicyOwner(identity), false), identityPolicyScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
+	scopes, err := grantIdentityScopes(req.Scope, identity, sk.Scopes, keyPolicyScopes, identityPolicyScopes, rowScopes)
 	if err != nil {
 		return nil, err
 	}
@@ -2300,7 +2377,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// must never mint a 30-day token even if the identity policy allows.
 		CredentialExpiresAt:   sk.ExpiresAt,
 		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
-		ScopeCeilingUnbounded: len(sk.Scopes) == 0 && len(keyPolicyScopes) == 0 && len(identityPolicyScopes) == 0 && len(rowScopes) == 0,
+		ScopeCeilingUnbounded: len(sk.Scopes) == 0 && len(keyPolicyScopes) == 0 && len(identityPolicyScopes) == 0 && !identity.ScopeCeilingRestricts(),
 
 		ChannelTrustedCredential: sk.ChannelTrusted,
 		APIKeyID:                 sk.ID,
@@ -2686,7 +2763,18 @@ func (s *OAuthService) ResolveCIMDClientForDisplay(
 
 // Returns a signed JWT on success, or an *OAuthError shaped for direct
 // surfacing from the /oauth2/authorize handler.
-func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeRequest) (string, error) {
+func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeRequest) (code string, err error) {
+	// The authorization request is where an omitted scope, and a narrowing
+	// of the scope the caller named, are visible: the code carries only the
+	// result. With token.scope_rules=shadow, record what the stricter rules
+	// would change about it; the code and the error are untouched.
+	ctx, trace := s.credentialSvc.traceScopes(ctx, string(domain.GrantTypeAuthorizationCode))
+	// Rule D's answer in enforce mode, after done judges today's (see Token).
+	defer func() { err = trace.answer(err) }()
+	defer func() { trace.done(ctx, err) }()
+	trace.setClientID(req.ClientID)
+	trace.setTenant(req.AccountID, req.ProjectID)
+
 	// Required-field gate.
 	if req.ClientID == "" {
 		return "", oauthBadRequest(oautherror.InvalidRequest, "client_id is required")
@@ -2739,6 +2827,12 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 	if _, err := checkAuthorizeClientPolicy(oauthClient, req.RedirectURI); err != nil {
 		return "", err
 	}
+	trace.setClient(oauthClient)
+	if oauthClient.IdentityID != nil {
+		// The identity a token redeemed from this code is minted for.
+		trace.setIdentityID(*oauthClient.IdentityID)
+	}
+	trace.ask(parseScopeString(req.RequestedScope), true)
 
 	// Scope intersection: the issued code can never authorize a scope the
 	// client itself isn't allowed. Which meaning req.Scopes==[] carries is
@@ -2753,6 +2847,11 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 	narrow := intersectScopes
 	if len(parseScopeString(req.RequestedScope)) > 0 {
 		narrow = narrowScopes
+		// What narrowed a named request, for the stricter scope rules'
+		// refusal text: the principal's scopes, folded into Scopes upstream,
+		// then the client's.
+		trace.strictCeiling(ceilingPrincipalScopes, req.Scopes)
+		trace.ceiling(clientCeilingName(oauthClient), oauthClient.Scopes)
 	}
 	scopes := narrow(req.Scopes, oauthClient.Scopes)
 	if err := requireGrantableScope(req.RequestedScope, scopes); err != nil {
@@ -2764,7 +2863,7 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 	// same posture checkAuthorizeClientPolicy takes above: a programmatic
 	// caller supplying a pre-resolved Client cannot skip a gate, and a
 	// ceiling is a security claim — a value that reaches the "rsc" claim
-	// unvalidated is one Shield will later enforce on.
+	// unvalidated is one a resource server will later enforce on.
 	resources, err := ValidateAuthorizeResource(req.Resources)
 	if err != nil {
 		return "", err
@@ -2787,6 +2886,14 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 			return "", personGrantOAuthError(err, oautherror.InvalidScope)
 		}
 	}
+	// With token.scope_rules=enforce the stricter rules decide the code's
+	// scopes here, as shadow mode judges them: no default for a request that
+	// named none (rule A), or invalid_scope for one that would be narrowed
+	// (rule C). A no-op in any other mode.
+	if scopes, err = trace.enforceScopes(scopes); err != nil {
+		return "", err
+	}
+	trace.codeIssued(scopes)
 
 	// Build the claim shape that decodeAuthCodeJWT reads. Use time.Now
 	// as the issuance instant — mintAuthCodeJWT derives jti + exp from
@@ -2959,6 +3066,13 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	if !verifyCodeChallenge(req.CodeVerifier, authCode.CodeChallenge) {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "PKCE verification failed")
 	}
+
+	// The code's scopes are what this redemption asks for. Whether the
+	// authorization request named any was judged when the code was issued.
+	trace := scopeTraceFrom(ctx)
+	trace.setClient(oauthClient)
+	trace.setTenant(authCode.AccountID, authCode.ProjectID)
+	trace.ask(authCode.Scopes, false)
 
 	// Resolve the RFC 8707 binding against the ceiling the code recorded
 	// (CAP-IDN-027) BEFORE the code is consumed.
@@ -3260,10 +3374,15 @@ func (s *OAuthService) revokeAuthCodeTokens(ctx context.Context, codeJTI string)
 	}
 
 	if record.CredentialJTI != nil && *record.CredentialJTI != "" {
+		// Whether the token is active does not matter here: it is revoked
+		// either way. IntrospectToken returns the row even when the tree read
+		// behind its answer fails, so a failure there must not leave the
+		// original access token live (fail closed).
 		cred, _, introspectErr := s.credentialSvc.IntrospectToken(ctx, *record.CredentialJTI)
 		if introspectErr != nil {
-			log.Error().Err(introspectErr).Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: failed to introspect access token for revocation")
-		} else if cred != nil {
+			log.Error().Err(introspectErr).Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: could not check the access token's identity chain; revoking it anyway")
+		}
+		if cred != nil {
 			if revokeErr := s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "auth_code_replay"); revokeErr != nil {
 				log.Error().Err(revokeErr).Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: failed to revoke access token")
 			} else {
@@ -3357,6 +3476,11 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 				"audience profile, so it cannot be rotated into a resource-bound token")
 	}
 
+	// A refresh repeats its family's grant (RFC 6749 §6), so the family's
+	// scopes are what it asks for. An audience-profile family's scopes are
+	// the server's profile, every one listed; any other family's client
+	// lists its scopes when the deployer's trusted path created it.
+	trace := scopeTraceFrom(ctx)
 	var accessTTL, refreshTokenTTL int
 	if audienceRefreshToken != nil {
 		// Client-less audience-profile token. The refreshed access token is
@@ -3367,6 +3491,8 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		if audienceRefreshToken.ClientID != req.ClientID {
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
 		}
+		trace.setClientID(req.ClientID)
+		trace.listAll()
 		accessTTL = externalPrincipalAccessTokenTTL
 		refreshTokenTTL = s.externalPrincipalRefreshTokenTTL
 		if refreshTokenTTL <= 0 {
@@ -3390,6 +3516,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret, req.ClientAssertion, req.ClientAssertionType); err != nil {
 			return nil, err
 		}
+		trace.setClient(oauthClient)
 	} else if err == nil {
 		// CIMD client, re-resolved from its metadata document (served from
 		// cache in steady state). CIMD clients are public PKCE clients —
@@ -3404,6 +3531,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 			return nil, oauthBadRequest(oautherror.UnauthorizedClient,
 				"client metadata document no longer permits the refresh_token grant")
 		}
+		trace.setClient(oauthClient)
 	} else if viaCIMD {
 		// Resolution failure fails closed WITHOUT consuming the token (we're
 		// before rotation).
@@ -3507,6 +3635,10 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 			}
 			identityPolicyID = policy.ID
 		}
+
+		trace.setTenant(peeked.AccountID, peeked.ProjectID)
+		trace.setIdentity(identity)
+		trace.ask(parseScopeString(peeked.Scopes), false)
 
 		// The person's current ceiling, on the peek like every other gate, so
 		// a demoted user's refresh is refused without burning the token and
@@ -3635,6 +3767,10 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	if err != nil {
 		return nil, err
 	}
+
+	// The claimed row is authoritative, as for the binding above; it carries
+	// the scopes the peek did.
+	trace.ask(parseScopeString(oldToken.Scopes), false)
 
 	// Inherit scopes from the original refresh token. Without this the
 	// refreshed access token would be issued with no scopes (or default
@@ -4372,7 +4508,10 @@ func parseScopeString(scope string) []string {
 // Either may be nil (no restriction from that layer). Pass both to
 // grantScopes as separate ceilings rather than pre-intersecting them: a
 // disjoint pair intersects to an empty list, which every scope helper reads
-// as "unrestricted".
+// as "unrestricted". For the same reason an identity whose own empty list
+// restricts it to nothing (domain.Identity.ListsNoScope) cannot be expressed
+// through rowScopes: grantIdentityScopes and the token exchange check it
+// separately.
 func identityScopeCeilings(policy *domain.CredentialPolicy, identity *domain.Identity) (policyScopes, rowScopes []string) {
 	if policy != nil {
 		policyScopes = policy.AllowedScopes
@@ -4397,11 +4536,10 @@ func identityScopeCeilings(policy *domain.CredentialPolicy, identity *domain.Ide
 // When any ceiling restricts and nothing survives, the grant is refused with
 // invalid_scope whether or not the caller named a scope. Minting anyway would
 // produce a token with no `scopes` claim, because IssueCredential omits the
-// claim and skips its own scope checks when the set is empty. Downstream
-// (Shield's checkScopeCeiling) reads an absent claim as "no ceiling to
-// check", so a disjoint pair of ceilings would otherwise mint an
-// unrestricted token. Only an identity with no ceiling anywhere still gets
-// the legacy scopeless token on an omitted request.
+// claim and skips its own scope checks when the set is empty, so a request
+// whose ceilings excluded everything would succeed as if it had asked for
+// nothing. Only an identity with no ceiling anywhere still gets the legacy
+// scopeless token on an omitted request.
 func grantScopes(requestedRaw string, ceilings ...[]string) ([]string, error) {
 	scopes := parseScopeString(requestedRaw)
 	seeded := len(scopes) > 0
@@ -4424,15 +4562,31 @@ func grantScopes(requestedRaw string, ceilings ...[]string) ([]string, error) {
 	return scopes, nil
 }
 
+// grantIdentityScopes is grantScopes for a grant to identity, whose own
+// allowed_scopes is one of the ceilings. An identity registered by another
+// identity whose allowed_scopes is empty lists no scope
+// (domain.Identity.ListsNoScope), which no []string ceiling can say, since an
+// empty one places no restriction. For it, a request that names a scope is
+// refused exactly as grantScopes refuses one that every ceiling excluded, and
+// an omitted request gets no scopes: the token carries no scopes claim, which
+// is what the identity holds. Any other identity is grantScopes unchanged.
+func grantIdentityScopes(requestedRaw string, identity *domain.Identity, ceilings ...[]string) ([]string, error) {
+	if !identity.ListsNoScope() {
+		return grantScopes(requestedRaw, ceilings...)
+	}
+	if len(parseScopeString(requestedRaw)) > 0 {
+		return nil, oauthBadRequest(oautherror.InvalidScope, "requested scopes are not permitted for this identity")
+	}
+	return nil, nil
+}
+
 // requireGrantableScope closes the gap between intersectScopes' silent
 // narrowing and IssueCredential's "if len(req.Scopes) > 0" claim-omission
 // (credential.go): when a caller explicitly names a scope and every named
 // scope gets intersected away, minting anyway produces a token with no
-// `scopes` claim at all — indistinguishable downstream from a legacy token
-// that predates the scopes feature. Shield's checkScopeCeiling deliberately
-// treats an absent claim as "check not applicable" for that legacy case (see
-// its own comment), so a caller could otherwise escalate past its ceiling
-// simply by naming a scope it does not hold.
+// `scopes` claim at all — indistinguishable to a resource server from a
+// legacy token that predates the scopes feature, and a request that named a
+// scope it does not hold would succeed instead of being refused.
 //
 // Mirrors tokenExchange's existing "len(scopes) == 0 -> invalid_scope"
 // safety net (this file, tokenExchange). Used by IssueAuthCode's single
@@ -4476,10 +4630,12 @@ func requireGrantableScope(requestedRaw string, granted []string) error {
 // means "no restriction from this layer", so an unrestricted layer is never
 // blamed. They are kept apart because widening a credential policy and
 // widening a registration are different repairs — naming the wrong one is the
-// mistake this whole function exists to prevent. userGrant says actorPolicy is
+// mistake this whole function exists to prevent. actorRowNone says the actor's
+// empty allowed_scopes lists no scope (domain.Identity.ListsNoScope), so it
+// excludes every scope rather than none. userGrant says actorPolicy is
 // the policy's user_grant_scopes, the ceiling on what the actor may hold for a
 // person (D10), so the denial names that field rather than allowed_scopes.
-func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorPolicy, actorRow []string, userGrant bool) error {
+func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorPolicy, actorRow []string, actorRowNone, userGrant bool) error {
 	const base = "requested scopes are not available for delegation"
 
 	// token_exchange is the one grant with no RFC 6749 §3.3 default, so an
@@ -4506,7 +4662,7 @@ func delegationScopeDenial(requested []string, subjectHolds map[string]bool, act
 			notHeld = append(notHeld, s)
 		case excludes(actorPolicy, s):
 			notPermitted = append(notPermitted, s)
-		case excludes(actorRow, s):
+		case actorRowNone || excludes(actorRow, s):
 			notRegistered = append(notRegistered, s)
 		}
 	}

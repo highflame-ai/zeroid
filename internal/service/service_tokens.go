@@ -570,6 +570,12 @@ func refuseServiceGrantParams(req TokenRequest, grant string, tenantAllowed bool
 //
 // client is the client the request authenticated as; tokenExchange verified
 // its assertion before routing here.
+//
+// The stricter scope rules' shadow count (token.scope_rules) records nothing
+// here, on purpose: only the deployment's own services reach this exchange,
+// a scope parameter is refused with invalid_scope and the token carries no
+// scopes, so no client chooses a scope and every rule would answer as today
+// does. It therefore never describes its request to the trace.
 func (s *OAuthService) onBehalfExchange(ctx context.Context, req TokenRequest, client *domain.OAuthClient) (*domain.AccessToken, error) {
 	cfg := s.serviceTokenCfg()
 	if cfg == nil {
@@ -727,6 +733,10 @@ func (s *OAuthService) onBehalfExchange(ctx context.Context, req TokenRequest, c
 // act.client_id) and principal, no scopes, and lives five minutes. Every
 // issuance writes an audit row in the named tenant, and the token is revoked
 // if the row cannot be written.
+//
+// The stricter scope rules' shadow count does not evaluate this grant (see
+// scopeTraceGrant): only the deployment's own services reach it, a scope
+// parameter is refused with invalid_scope and the token carries no scopes.
 func (s *OAuthService) assertedTenantGrant(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	cfg := s.serviceTokenCfg()
 	if cfg == nil || len(cfg.asserted) == 0 {

@@ -354,6 +354,15 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// issuance chokepoint reads it (human-rooted delegation, phase 1).
 	credentialSvc.SetTenantSettingsService(tenantSettingsSvc)
 	tenantSettingsSvc.SetCredentialService(credentialSvc)
+	// The stricter scope rules' mode. Validate() already rejected an unknown
+	// value; empty is off.
+	scopeRulesMode, err := service.ParseScopeRulesMode(cfg.Token.ScopeRules)
+	if err != nil {
+		return nil, fmt.Errorf("token.scope_rules: %w", err)
+	}
+	if err := credentialSvc.SetScopeRulesMode(scopeRulesMode); err != nil {
+		return nil, fmt.Errorf("token.scope_rules: %w", err)
+	}
 	signalSvc := service.NewSignalService(signalRepo, credentialSvc, identityRepo)
 	signingCredSvc := service.NewSigningCredentialService(
 		signingCredRepo,
@@ -371,6 +380,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	reservedScopes := &service.ReservedScopes{}
 	apiKeySvc.SetReservedScopes(reservedScopes)
 	credentialSvc.SetReservedScopes(reservedScopes)
+	identitySvc.SetReservedScopes(reservedScopes)
+	identitySvc.SetTreeLimits(service.TreeLimits{MaxDepth: cfg.IdentityTree.MaxDepth, MaxChildren: cfg.IdentityTree.MaxChildren})
+	credentialSvc.SetIdentityTree(identityRepo)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
 
 	// RevocationNotifier plumbing. One shared
@@ -476,6 +488,12 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		externalIssuerRegistry = service.NewDBExternalIssuerRegistry(externalIssuerRepo, cfg.Federation.AllowPrivateEndpoints, cfg.Federation.SharedIssuers, jwksOpts...)
 		oauthSvc.SetExternalIssuerRegistry(externalIssuerRegistry)
 		oauthSvc.SetIssuerBindings(externalIssuerRepo)
+		// First contact registers through bindings, so it exists only with
+		// issuer rows; each row's first_contact switches it on.
+		oauthSvc.SetFirstContact(service.NewFirstContactRegistrar(externalIssuerRepo, identitySvc, service.FirstContactConfig{
+			RatePerMinute:           cfg.Federation.FirstContact.RatePerMinute,
+			MaxDiscoveredPerAccount: cfg.Federation.FirstContact.MaxDiscoveredPerAccount,
+		}))
 		log.Info().Bool("allow_private_endpoints", cfg.Federation.AllowPrivateEndpoints).
 			Msg("Trusted issuers are per-account rows (federation.issuer_store=db)")
 	} else if len(cfg.ExternalIssuers) > 0 {
@@ -1588,6 +1606,32 @@ func (s *Server) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrant
 	return s.credentialSvc.SetPersonGrantResolver(fn, mode)
 }
 
+// SetScopeRulesMode sets token.scope_rules at runtime. In ScopeRulesModeShadow
+// every grant (authorization_code, refresh_token, api_key,
+// client_credentials, jwt_bearer, token exchange, ID-token exchange, ID-JAG
+// and CIBA) is evaluated against the stricter scope issuance rules, and each
+// request whose outcome they would change is logged as
+// scope_rule_would_change and counted in
+// zeroid_scope_rule_would_change_total. Nothing is enforced: every token and
+// every response is exactly what ScopeRulesModeOff produces. In
+// ScopeRulesModeEnforce the same evaluation decides the outcome: a request
+// that names no scope is issued only an API key's own scopes or an audience
+// profile's, and otherwise none; a scope no deployer-controlled ceiling lists,
+// or a request that would be narrowed, is refused whole; a delegation that
+// names no scope is issued none; and every scope refusal at the token endpoint
+// is answered invalid_scope. Any other request refused with the mode off
+// stays refused. Each request changed is recorded the same way, with
+// mode=enforce. Roll out off, then shadow, then enforce. In both modes the
+// internal service grants, which issue no scopes, are not evaluated, and
+// reserved scopes (SetReservedScopes) are left to their own rules. An empty or
+// unknown mode is rejected and the setting left unchanged. See
+// docs/scope-ceilings.md, "Stricter scope rules".
+//
+// Can be called any time after NewServer; safe to call concurrently.
+func (s *Server) SetScopeRulesMode(mode ScopeRulesMode) error {
+	return s.credentialSvc.SetScopeRulesMode(mode)
+}
+
 // SetReservedScopes reserves scope prefixes for the deployer's own APIs
 // (Highflame: "highflame."). A reserved scope is written onto an API key only
 // in a WithReservedScopeWrite context, and issued only on the api_key grant
@@ -1811,6 +1855,25 @@ func (s *Server) GetIdentity(ctx context.Context, id, accountID, projectID strin
 // rewriting that row, because whoever registered it first may hold its
 // credential. Remove the row (or rename the seed) to proceed.
 var ErrClientNotOwned = errors.New("oauth client exists and is not owned by this seed")
+
+// IsRegisteredBy reports whether the identity identityID, in the given
+// tenant, was registered by the identity parent names: whether that identity
+// is its parent (parent_identity_id), and that parent and every identity
+// above it are still active and unexpired. Name the parent by id, by WIMSE
+// URI, or both, as with WithCallerIdentity. Only the direct parent counts: an
+// identity is not registered by its grandparent. An identity outside the
+// tenant, one with no parent, a reference that names no identity in the
+// tenant, or a parent that is not active reports false; an error means the
+// lookup itself failed.
+//
+// Use it to authorize a calling identity's changes to identities it
+// registered, for example in the AdminAuth layer:
+//
+//	caller := zeroid.CallerIdentity{WIMSEURI: claims.Subject}
+//	ok, err := srv.IsRegisteredBy(ctx, targetID, caller, claims.AccountID, claims.ProjectID)
+func (s *Server) IsRegisteredBy(ctx context.Context, identityID string, parent CallerIdentity, accountID, projectID string) (bool, error) {
+	return s.identitySvc.IsRegisteredBy(ctx, identityID, parent, accountID, projectID)
+}
 
 // EnsureClient registers an OAuth client if it doesn't exist, or updates it if the
 // config has changed. Idempotent — safe to call on every startup.
@@ -2160,7 +2223,12 @@ func initDatabase(databaseURL string, maxOpenConns, maxIdleConns int) (*bun.DB, 
 	sqldb.SetConnMaxLifetime(30 * time.Minute)
 	sqldb.SetConnMaxIdleTime(5 * time.Minute)
 
-	db := bun.NewDB(sqldb, pgdialect.New())
+	// Ignore columns this version does not know. A rolling deploy or a
+	// rollback runs this binary against a schema that a newer version's
+	// migration has already extended; without this, every RETURNING * or
+	// SELECT * into a model fails with "does not have column", after the
+	// statement itself has run.
+	db := bun.NewDB(sqldb, pgdialect.New(), bun.WithDiscardUnknownColumns())
 
 	if parsedURL, err := url.Parse(databaseURL); err == nil {
 		log.Info().Str("host", parsedURL.Host).Str("database", parsedURL.Path).Msg("Database connection established")

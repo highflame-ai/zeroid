@@ -13,7 +13,14 @@ enumerate via a connector) is **not** a separate inventory — it is an identity
 the same store as a native agent, distinguished by two orthogonal fields:
 
 - **`origin`** — provenance: `native` (we issued it) vs an external ecosystem
-  (`okta` / `entra` / `google_workspace` / …).
+  (`okta` / `entra` / `google_workspace` / …), or `first_contact`: registered by ZeroID
+  itself on the agent's first verified call through a trusted issuer row whose
+  `first_contact` is on ([external-issuers.md](external-issuers.md#first-contact)). Such
+  an identity enters `discovered` (`discover`), or `active` directly under the row's
+  standing adoption mapping (`adopt`). An `adopt` row's mapping also activates an agent
+  an inventory sync already ingested as `discovered` in the mapped project, on its first
+  verified call ([standing adoption](external-issuers.md#standing-adoption)); such an
+  identity keeps its own `origin`.
 - **`status`** — lifecycle state, extending the existing `IdentityStatus` machine with one
   new state, `discovered`, that sits *below* the existing states.
 
@@ -64,7 +71,10 @@ row in the same registry as native ones, but deliberately constrained:
 - **It becomes a usable principal only through explicit human action.** To ever authenticate it
   must be **adopted** (a human owner is assigned — mandatory at that step) *and* **activated** (a
   credential is enrolled, or it is reconciled through a federated mint). Both are gated lifecycle
-  transitions; until then the identity is posture/inventory only.
+  transitions; until then the identity is posture/inventory only. The one standing form of that
+  action is a trusted issuer row set to `adopt` by a person in advance: it adopts the row's
+  agents into one project under one owner, and never an agent a person has decided on
+  ([standing adoption](external-issuers.md#standing-adoption)).
 - **A poisoned or malicious discovered record is a data-quality issue, not an auth bypass.** The
   boundary is the `active`+credential gate, not table separation, so the worst an attacker-
   influenced discovered row can do is add noise to the inventory — it cannot impersonate,
@@ -140,13 +150,24 @@ SDK / Cedar / DB contract for no functional gain).
   out-of-scope (kept as an archived record for audit, never hard-deleted).
 - `discovered → active` — **direct activation**, permitted only when adoption *and*
   activation happen together: the first EMA / ID-JAG mint for the agent both assigns the
-  reconciled identity and grants it rights. (Otherwise go `discovered → pending → active`.)
+  reconciled identity and grants it rights. A trusted issuer row's standing adoption takes
+  this transition on the agent's first verified call, owned by the row's mapped owner
+  ([external-issuers.md](external-issuers.md#standing-adoption)). (Otherwise go
+  `discovered → pending → active`.)
 - Both adoption transitions stamp `adopted_at`; reverting an adoption (`pending →
   discovered`, via dismiss) clears it. Connector syncs never touch it, unlike
   `updated_at`, so inventory lists order by `COALESCE(adopted_at, created_at)`:
   newest adoption first, with native identities keeping their creation time.
 - All existing transitions (`pending→active`, `active→suspended|deactivated|expired`,
   `suspended→active`, …) are unchanged.
+- An identity that another identity registered is that identity's child
+  ([identity-tree.md](identity-tree.md)). A transition into `deactivated` or
+  `expired`, by any path, deactivates every identity below it with the same key
+  and credential revocation; reactivation and suspension do not cascade, but
+  no identity below a suspended, deactivated or expired one receives a token,
+  and none can be reactivated while one above it is not active. A request
+  authenticated as an identity can lower its children's status but never
+  raise it.
 
 ## Ownership: relaxed for `discovered` only
 

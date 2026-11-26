@@ -168,3 +168,29 @@ func TestSubTypeValidForIdentityType(t *testing.T) {
 		}
 	}
 }
+
+// TestScopeCeilingRestricts pins when allowed_scopes restricts: always when
+// it lists a scope, and when empty only on an identity registered by another
+// identity, where it then lists none.
+func TestScopeCeilingRestricts(t *testing.T) {
+	const parent = "0b4b4c5e-5b7a-4d36-9a52-1b9f6c0e7d11"
+	cases := []struct {
+		name               string
+		identity           *Identity
+		restricts, listsNo bool
+	}{
+		{"nil", nil, false, false},
+		{"no parent, empty", &Identity{AllowedScopes: []string{}}, false, false},
+		{"no parent, listed", &Identity{AllowedScopes: []string{"a"}}, true, false},
+		{"child, empty", &Identity{ParentIdentityID: parent}, true, true},
+		{"child, listed", &Identity{ParentIdentityID: parent, AllowedScopes: []string{"a"}}, true, false},
+	}
+	for _, c := range cases {
+		if got := c.identity.ScopeCeilingRestricts(); got != c.restricts {
+			t.Errorf("%s: ScopeCeilingRestricts = %v, want %v", c.name, got, c.restricts)
+		}
+		if got := c.identity.ListsNoScope(); got != c.listsNo {
+			t.Errorf("%s: ListsNoScope = %v, want %v", c.name, got, c.listsNo)
+		}
+	}
+}
