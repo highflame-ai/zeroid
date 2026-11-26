@@ -63,7 +63,7 @@ func (k JWK) PublicKey() (crypto.PublicKey, error) {
 		if k.Kty != "OKP" || k.Crv != "Ed25519" || k.Y != "" {
 			return nil, fmt.Errorf("%w: %s needs kty OKP, crv Ed25519", errKeyMismatch, k.Alg)
 		}
-		x, err := base64.RawURLEncoding.DecodeString(k.X)
+		x, err := base64.RawURLEncoding.Strict().DecodeString(k.X)
 		if err != nil || len(x) != ed25519.PublicKeySize {
 			return nil, fmt.Errorf("%w: x is not a 32-byte Ed25519 key", errKeyMismatch)
 		}
@@ -72,8 +72,8 @@ func (k JWK) PublicKey() (crypto.PublicKey, error) {
 		if k.Kty != "EC" || k.Crv != "P-256" {
 			return nil, fmt.Errorf("%w: %s needs kty EC, crv P-256", errKeyMismatch, k.Alg)
 		}
-		x, errX := base64.RawURLEncoding.DecodeString(k.X)
-		y, errY := base64.RawURLEncoding.DecodeString(k.Y)
+		x, errX := base64.RawURLEncoding.Strict().DecodeString(k.X)
+		y, errY := base64.RawURLEncoding.Strict().DecodeString(k.Y)
 		if errX != nil || errY != nil || len(x) != 32 || len(y) != 32 {
 			return nil, fmt.Errorf("%w: x and y are not 32-byte P-256 coordinates", errKeyMismatch)
 		}

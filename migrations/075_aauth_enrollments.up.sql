@@ -6,9 +6,9 @@
 --
 -- A refresh re-checks everything the platform token proved, except the
 -- token itself: the issuer row and the binding (issuer_id, subject) still map
--- to identity_id, the enrollment's first agent token (root_jti) is not
--- revoked, and the enrollment is younger than expires_at. Refreshed tokens
--- are children of root_jti, so revoking it revokes them all.
+-- to identity_id, no agent token of the enrollment (root_jti or a refresh,
+-- its child) has been revoked, and the enrollment is younger than
+-- expires_at. Revoking the agent's current token cuts off the durable key.
 CREATE TABLE IF NOT EXISTS aauth_enrollments (
     durable_jkt VARCHAR(64)  PRIMARY KEY,
     identity_id UUID         NOT NULL,

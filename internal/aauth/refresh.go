@@ -16,6 +16,7 @@ import (
 	"github.com/lestrrat-go/jwx/v4/jwa"
 	"github.com/lestrrat-go/jwx/v4/jws"
 	"github.com/rs/zerolog/log"
+	"github.com/uptrace/bun"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/service"
@@ -28,7 +29,7 @@ import (
 // request under the jkt-jwt Signature-Key scheme; the new agent token binds
 // the ephemeral key. No platform token is presented, so everything it proved
 // is re-checked from the enrollment: the issuer row and binding still map the
-// subject to the same identity, the enrollment's first agent token is not
+// subject to the same identity, no agent token of the enrollment has been
 // revoked, and the enrollment is younger than aauth.enrollment_ttl_seconds.
 // A policy opts in by listing aauth_refresh. A workload can always enroll
 // again with a fresh platform token instead.
@@ -315,7 +316,7 @@ func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (s
 		IdentityPolicyID:  policy.ID,
 		TTL:               ttl,
 		GrantType:         domain.GrantTypeAAuthAgent,
-		ParentJTI:         e.RootJTI, // revoking the enrollment's first token revokes every refresh
+		ParentJTI:         e.RootJTI, // revoking the first token while it lives revokes every refresh
 		DPoPKeyThumbprint: ephemeralJKT,
 		AgentTokenSigner: func(jti string, iat, exp time.Time) (string, error) {
 			return p.key.sign(p.cfg.Issuer, sub, d.ephemeral, jti, iat, exp, tokenExtras{PS: ps})
@@ -348,17 +349,30 @@ func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (s
 	return issued.AccessToken, issued.ExpiresIn, nil
 }
 
-// rootLive refuses an enrollment whose first agent token was revoked (it
-// may have expired; that is fine), and fails closed on a storage error.
+// rootLive refuses an enrollment once its first agent token, or any agent
+// token refreshed from it, has been revoked, and fails closed on a storage
+// error. Any of them, not only the first: a revoke skips an expired token,
+// so the first token (which lives minutes) cannot be revoked for most of the
+// enrollment's life, but the agent's current token can. Revoking it cuts off
+// the durable key; the workload enrolls again with a platform token.
 func (p *Provider) rootLive(ctx context.Context, rootJTI string) error {
-	root, err := p.creds.CredentialByJTI(ctx, rootJTI)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	if _, err := p.creds.CredentialByJTI(ctx, rootJTI); errors.Is(err, sql.ErrNoRows) {
 		return notEnrolled("the enrollment's first agent token is gone")
-	case err != nil:
+	} else if err != nil {
 		return fmt.Errorf("reading the enrollment's first agent token: %w", err)
-	case root.IsRevoked:
-		return notEnrolled("the enrollment's first agent token was revoked")
+	}
+	revoked, err := p.db.NewSelect().Table("issued_credentials").
+		Where("is_revoked").
+		WhereGroup(" AND ", func(q *bun.SelectQuery) *bun.SelectQuery {
+			return q.Where("jti = ?", rootJTI).
+				WhereOr("parent_jti = ? AND grant_type = ?", rootJTI, string(domain.GrantTypeAAuthAgent))
+		}).
+		Exists(ctx)
+	if err != nil {
+		return fmt.Errorf("checking the enrollment's agent tokens: %w", err)
+	}
+	if revoked {
+		return notEnrolled("an agent token of this enrollment was revoked")
 	}
 	return nil
 }

@@ -71,3 +71,21 @@ func TestSignAsServerVerifies(t *testing.T) {
 		t.Fatalf("verify poll: %v", err)
 	}
 }
+
+// TestJWKStrictBase64 refuses a non-canonical encoding of a key: the spare
+// bits of Ed25519's last base64url character would otherwise let one key
+// present several thumbprints.
+func TestJWKStrictBase64(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	k := Ed25519JWK(pub)
+	if _, err := k.PublicKey(); err != nil {
+		t.Fatal(err)
+	}
+	last := k.X[len(k.X)-1]
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	i := strings.IndexByte(alphabet, last)
+	k.X = k.X[:len(k.X)-1] + string(alphabet[i^1]) // flip a spare bit
+	if _, err := k.PublicKey(); err == nil {
+		t.Fatal("a non-canonical x was accepted")
+	}
+}

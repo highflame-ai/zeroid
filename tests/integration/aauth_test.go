@@ -1267,6 +1267,26 @@ func TestAAuthRefresh(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, again.status)
 	})
 
+	t.Run("revoking the agent's current token stops refresh, whatever became of the first", func(t *testing.T) {
+		durable, _ := enroll(t, a, "")
+		eph := newAgentKey(t)
+		res := a.refresh(t, eph, namingJWT(t, durable, eph, time.Now().Add(5*time.Minute)))
+		require.Equal(t, http.StatusOK, res.status)
+		current := a.credential(t, decodeJWTPayload(t, res.body["agent_token"].(string))["jti"].(string))
+		status, body := a.f.call(t, http.MethodPost, "/credentials/"+current["id"].(string)+"/revoke",
+			map[string]any{"reason": "key compromised"}, a.tn.headers)
+		require.Contains(t, []int{http.StatusOK, http.StatusNoContent}, status, "revoke: %v", body)
+
+		eph2 := newAgentKey(t)
+		again := a.refresh(t, eph2, namingJWT(t, durable, eph2, time.Now().Add(5*time.Minute)))
+		assert.Equal(t, http.StatusForbidden, again.status, "the durable key is cut off")
+		// A fresh platform token enrolls the key again.
+		res = a.bootstrap(t, durable, a.assertion(t, nil))
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		eph3 := newAgentKey(t)
+		assert.Equal(t, http.StatusOK, a.refresh(t, eph3, namingJWT(t, durable, eph3, time.Now().Add(5*time.Minute))).status)
+	})
+
 	t.Run("disabling the binding stops refresh", func(t *testing.T) {
 		sub := "system:serviceaccount:agents:" + uid("sa")
 		status, b := a.f.bind(t, a.tn, a.rowID, sub, a.agent, false)
