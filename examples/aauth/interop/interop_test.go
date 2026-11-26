@@ -271,7 +271,7 @@ func newEnv(t *testing.T) *env {
 			return (&net.Dialer{}).DialContext(ctx, network, addr)
 		},
 	}}
-	srv, err := zeroid.NewServer(cfg, zeroid.WithExternalIssuerHTTPClient(client))
+	srv, err := zeroid.NewServer(cfg, zeroid.WithExternalIssuerHTTPClient(client), zeroid.WithAAuthPersonServerHTTPClient(client))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = srv.Shutdown(ctx) })
 	zeroidSrv := ca.serve(t, zeroidHost, srv.Router())

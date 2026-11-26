@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/attestation"
 )
 
 // Revoking agent tokens at the agent's person server (protocol draft, "Token
@@ -103,61 +105,148 @@ type pendingPSRevocation struct {
 	Attempts     int       `bun:"attempts"`
 }
 
-// SendPersonServerRevocations runs one pass: every tracked, unexpired token
-// whose credential is revoked or whose identity is not active, and which is
-// due, is revoked at its person server. It returns how many reached a
-// terminal outcome. Several replicas may send the same revocation; the
-// person server treats a repeat as idempotent.
+// psLease is how long a pass holds the rows it claimed: another replica
+// takes them only after it lapses (a crashed pass), so replicas do not send
+// the same revocation at once.
+const psLease = 5 * time.Minute
+
+// psConcurrency bounds the person servers one pass talks to at once. Rows of
+// one person server are sent in turn, so a slow or dead one delays only its
+// own.
+const psConcurrency = 8
+
+// SendPersonServerRevocations runs one pass: it claims every tracked,
+// unexpired token whose credential is revoked or whose identity is not
+// active, and which is due, and revokes each at its person server. It
+// returns how many reached a terminal outcome.
 func (p *Provider) SendPersonServerRevocations(ctx context.Context) (int, error) {
 	now := p.now()
 	var due []pendingPSRevocation
-	err := p.db.NewRaw(`SELECT r.jti, r.person_server, r.expires_at, r.attempts
-		FROM aauth_ps_revocations r
-		JOIN issued_credentials ic ON ic.jti = r.jti
-		LEFT JOIN identities i ON i.id = ic.identity_id
-		WHERE r.notified_at IS NULL AND r.next_attempt_at <= ? AND r.expires_at > ?
-		  AND (ic.is_revoked OR i.id IS NULL OR i.status <> ?)
-		ORDER BY r.next_attempt_at
-		LIMIT 100`, now, now, string(domain.IdentityStatusActive)).Scan(ctx, &due)
+	err := p.db.NewRaw(`UPDATE aauth_ps_revocations SET next_attempt_at = ?
+		WHERE jti IN (
+			SELECT r.jti FROM aauth_ps_revocations r
+			JOIN issued_credentials ic ON ic.jti = r.jti
+			LEFT JOIN identities i ON i.id = ic.identity_id
+			WHERE r.notified_at IS NULL AND r.next_attempt_at <= ? AND r.expires_at > ?
+			  AND (ic.is_revoked OR i.id IS NULL OR i.status <> ?)
+			ORDER BY r.next_attempt_at
+			LIMIT 100
+			FOR UPDATE OF r SKIP LOCKED)
+		RETURNING jti, person_server, expires_at, attempts`,
+		now.Add(psLease), now, now, string(domain.IdentityStatusActive)).Scan(ctx, &due)
 	if err != nil {
-		return 0, fmt.Errorf("reading pending person-server revocations: %w", err)
+		return 0, fmt.Errorf("claiming pending person-server revocations: %w", err)
 	}
-	done := 0
+	byPS := map[string][]pendingPSRevocation{}
 	for _, r := range due {
+		byPS[r.PersonServer] = append(byPS[r.PersonServer], r)
+	}
+
+	var (
+		mu       sync.Mutex
+		done     int
+		firstErr error
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, psConcurrency)
+	)
+	for ps, rows := range byPS {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ps string, rows []pendingPSRevocation) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			n, err := p.sendToPersonServer(ctx, ps, rows)
+			mu.Lock()
+			defer mu.Unlock()
+			done += n
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}(ps, rows)
+	}
+	wg.Wait()
+	return done, firstErr
+}
+
+// sendToPersonServer revokes rows, all for ps, discovering its
+// revocation_endpoint once.
+func (p *Provider) sendToPersonServer(ctx context.Context, ps string, rows []pendingPSRevocation) (int, error) {
+	dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	endpoint, err := p.psRevocationEndpoint(dctx, ps)
+	cancel()
+	done := 0
+	for _, r := range rows {
 		if ctx.Err() != nil {
 			return done, ctx.Err()
 		}
-		outcome, err := p.revokeAtPersonServer(ctx, r)
-		var retry *errPSRetry
-		if errors.As(err, &retry) {
-			wait := psBackoff(r.Attempts)
-			if retry.retryAfter > wait {
-				wait = retry.retryAfter
-			}
-			log.Info().Err(err).Str("jti", r.JTI).Str("person_server", r.PersonServer).Dur("retry_in", wait).
-				Msg("aauth: person-server revocation not yet delivered")
-			_, uErr := p.db.NewRaw(`UPDATE aauth_ps_revocations
-				SET attempts = attempts + 1, next_attempt_at = ?, last_error = ? WHERE jti = ?`,
-				now.Add(wait), truncate(err.Error(), 500), r.JTI).Exec(ctx)
-			if uErr != nil {
-				return done, fmt.Errorf("recording a failed person-server revocation: %w", uErr)
-			}
-			continue
+		var outcome string
+		var rErr error
+		switch {
+		case err != nil:
+			outcome, rErr = classifyTransport(err)
+		case endpoint == "":
+			outcome, rErr = psOutcomeUnsupported, errors.New("the person server publishes no revocation_endpoint")
+		default:
+			outcome, rErr = p.revokeAtPersonServer(ctx, endpoint, r)
 		}
-		lastErr := ""
-		if err != nil {
-			lastErr = truncate(err.Error(), 500)
-			log.Warn().Err(err).Str("jti", r.JTI).Str("person_server", r.PersonServer).Str("outcome", outcome).
-				Msg("aauth: person server did not take the revocation")
+		terminal, uErr := p.recordPSOutcome(ctx, r, outcome, rErr)
+		if uErr != nil {
+			return done, uErr
 		}
-		if _, uErr := p.db.NewRaw(`UPDATE aauth_ps_revocations
-			SET notified_at = ?, outcome = ?, attempts = attempts + 1, last_error = NULLIF(?, '') WHERE jti = ?`,
-			now, outcome, lastErr, r.JTI).Exec(ctx); uErr != nil {
-			return done, fmt.Errorf("recording a person-server revocation: %w", uErr)
+		if terminal {
+			done++
 		}
-		done++
 	}
 	return done, nil
+}
+
+// recordPSOutcome records one revocation attempt: a terminal outcome, or a
+// retry after the backoff (or the person server's Retry-After, if longer).
+// Each write applies only while the row is still pending.
+func (p *Provider) recordPSOutcome(ctx context.Context, r pendingPSRevocation, outcome string, err error) (bool, error) {
+	now := p.now()
+	var retry *errPSRetry
+	if errors.As(err, &retry) {
+		wait := psBackoff(r.Attempts)
+		if retry.retryAfter > wait {
+			wait = retry.retryAfter
+		}
+		log.Info().Err(err).Str("jti", r.JTI).Str("person_server", r.PersonServer).Dur("retry_in", wait).
+			Msg("aauth: person-server revocation not yet delivered")
+		if _, uErr := p.db.NewRaw(`UPDATE aauth_ps_revocations
+			SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?
+			WHERE jti = ? AND notified_at IS NULL`,
+			now.Add(wait), truncate(err.Error(), 500), r.JTI).Exec(ctx); uErr != nil {
+			return false, fmt.Errorf("recording a failed person-server revocation: %w", uErr)
+		}
+		return false, nil
+	}
+	lastErr := ""
+	if err != nil {
+		lastErr = truncate(err.Error(), 500)
+		log.Warn().Err(err).Str("jti", r.JTI).Str("person_server", r.PersonServer).Str("outcome", outcome).
+			Msg("aauth: person server did not take the revocation")
+	}
+	if _, uErr := p.db.NewRaw(`UPDATE aauth_ps_revocations
+		SET notified_at = ?, outcome = ?, attempts = attempts + 1, last_error = NULLIF(?, '')
+		WHERE jti = ? AND notified_at IS NULL`,
+		now, outcome, lastErr, r.JTI).Exec(ctx); uErr != nil {
+		return false, fmt.Errorf("recording a person-server revocation: %w", uErr)
+	}
+	return true, nil
+}
+
+// classifyTransport makes a request that the SSRF guard refused terminal
+// (no retry reaches a private address), and leaves anything else to retry.
+func classifyTransport(err error) (string, error) {
+	if errors.Is(err, attestation.ErrPrivateAttestationEndpoint) {
+		return psOutcomeRejected, err
+	}
+	var retry *errPSRetry
+	if errors.As(err, &retry) {
+		return "", err
+	}
+	return "", &errPSRetry{err: err}
 }
 
 // psBackoff is the wait after the attempts-th failure: 10 s doubling to at
@@ -170,18 +259,14 @@ func psBackoff(attempts int) time.Duration {
 	return min(d, 10*time.Minute)
 }
 
-// revokeAtPersonServer discovers the person server's revocation_endpoint
-// and posts the revocation, signed as this Agent Provider. It returns a
-// terminal outcome, or an *errPSRetry.
-func (p *Provider) revokeAtPersonServer(ctx context.Context, r pendingPSRevocation) (string, error) {
+// revokeAtPersonServer posts the revocation to endpoint, signed as this
+// Agent Provider. It returns a terminal outcome, or an *errPSRetry.
+func (p *Provider) revokeAtPersonServer(ctx context.Context, endpoint string, r pendingPSRevocation) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxPSPollWait+15*time.Second)
 	defer cancel()
-	endpoint, err := p.psRevocationEndpoint(ctx, r.PersonServer)
+	endpointURL, err := url.Parse(endpoint)
 	if err != nil {
-		return "", err
-	}
-	if endpoint == "" {
-		return psOutcomeUnsupported, errors.New("the person server publishes no revocation_endpoint")
+		return psOutcomeRejected, err
 	}
 	body, _ := json.Marshal(map[string]any{"jti": r.JTI, "exp": r.ExpiresAt.Unix()})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
@@ -194,7 +279,7 @@ func (p *Provider) revokeAtPersonServer(ctx context.Context, r pendingPSRevocati
 	}
 	res, err := p.psClient.Do(req)
 	if err != nil {
-		return "", &errPSRetry{err: fmt.Errorf("revocation request: %w", err)}
+		return classifyTransport(fmt.Errorf("revocation request: %w", err))
 	}
 	deadline := time.Now().Add(maxPSPollWait)
 	for res.StatusCode == http.StatusAccepted {
@@ -202,12 +287,11 @@ func (p *Provider) revokeAtPersonServer(ctx context.Context, r pendingPSRevocati
 		// identity until the cascade has a terminal outcome.
 		loc, wait := res.Header.Get("Location"), retryAfter(res)
 		drain(res)
-		pending, err := url.Parse(endpoint)
-		if err == nil {
-			pending, err = pending.Parse(loc)
-		}
-		if err != nil || loc == "" || pending.Scheme != "https" {
-			return "", &errPSRetry{err: fmt.Errorf("a 202 without a usable https Location %q", loc)}
+		// The pending URL is polled only on the endpoint's own origin: a
+		// signed request goes nowhere else on a person server's say-so.
+		pending, err := endpointURL.Parse(loc)
+		if err != nil || loc == "" || pending.Scheme != "https" || pending.Host != endpointURL.Host {
+			return "", &errPSRetry{err: fmt.Errorf("a 202 whose Location %q is not on the revocation endpoint's origin", loc)}
 		}
 		if wait <= 0 {
 			wait = time.Second
@@ -225,7 +309,7 @@ func (p *Provider) revokeAtPersonServer(ctx context.Context, r pendingPSRevocati
 			return "", &errPSRetry{err: err}
 		}
 		if res, err = p.psClient.Do(poll); err != nil {
-			return "", &errPSRetry{err: fmt.Errorf("polling the revocation: %w", err)}
+			return classifyTransport(fmt.Errorf("polling the revocation: %w", err))
 		}
 	}
 	defer drain(res)
@@ -240,11 +324,15 @@ func (p *Provider) revokeAtPersonServer(ctx context.Context, r pendingPSRevocati
 		return psOutcomeRevoked, nil
 	case res.StatusCode == http.StatusForbidden && problem.Error == "unsupported_iss":
 		return psOutcomeUnsupported, fmt.Errorf("the person server does not take revocations from this Agent Provider: %s", problem.Detail)
-	case res.StatusCode == http.StatusTooManyRequests || res.StatusCode == http.StatusUnauthorized || res.StatusCode >= 500:
-		// 401: the person server may hold a stale copy of our keys.
-		return "", &errPSRetry{err: fmt.Errorf("status %d %s: %s", res.StatusCode, problem.Error, problem.Detail), retryAfter: retryAfter(res)}
-	default:
+	case res.StatusCode == http.StatusBadRequest:
+		// invalid_request: the request itself is malformed; resending it
+		// changes nothing.
 		return psOutcomeRejected, fmt.Errorf("status %d %s: %s", res.StatusCode, problem.Error, problem.Detail)
+	default:
+		// Anything else may pass: 401 (a stale copy of our keys), 404 or 403
+		// from a deploy or a proxy, 408, 429, 5xx. Retried until the token
+		// expires, which bounds it.
+		return "", &errPSRetry{err: fmt.Errorf("status %d %s: %s", res.StatusCode, problem.Error, problem.Detail), retryAfter: retryAfter(res)}
 	}
 }
 

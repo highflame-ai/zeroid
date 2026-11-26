@@ -160,7 +160,8 @@ func newAAuthServer(t *testing.T, mutate func(*zeroid.Config)) (*zeroid.Server, 
 	}
 	srv, err := zeroid.NewServer(cfg,
 		zeroid.WithExternalIssuerHTTPClient(insecure),
-		zeroid.WithExternalIssuerJWKSOption(authjwt.WithHTTPClient(insecure)))
+		zeroid.WithExternalIssuerJWKSOption(authjwt.WithHTTPClient(insecure)),
+		zeroid.WithAAuthPersonServerHTTPClient(insecure))
 	require.NoError(t, err)
 	httpSrv := httptest.NewServer(srv.Router())
 	t.Cleanup(httpSrv.Close)
@@ -974,6 +975,11 @@ func (ps *fakePS) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ps.revoked[req.JTI] = req.Exp
+		if mode == "foreign" {
+			w.Header().Set("Location", "https://elsewhere.zeroid.test/pending/"+req.JTI)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		if mode == "defer" {
 			w.Header().Set("Location", "/pending/"+req.JTI)
 			w.Header().Set("Retry-After", "1")
@@ -1086,6 +1092,17 @@ func TestAAuthPersonServer(t *testing.T) {
 		assert.Empty(t, sigErrs)
 	})
 
+	t.Run("a 202 pointing at another host is not polled", func(t *testing.T) {
+		ps.mode.Store("foreign")
+		defer ps.mode.Store("ok")
+		_, token := enroll(t)
+		revoke(t, token)
+		_, polledBefore, _, _ := ps.state()
+		assert.Equal(t, 0, pass(t), "no terminal outcome: left to retry")
+		_, polled, _, _ := ps.state()
+		assert.Equal(t, polledBefore, polled)
+	})
+
 	t.Run("an unavailable person server is retried later; one that takes none is not", func(t *testing.T) {
 		ps.mode.Store("fail")
 		_, token := enroll(t)
@@ -1127,7 +1144,7 @@ func TestAAuthPersonServer(t *testing.T) {
 func TestAAuthRateLimits(t *testing.T) {
 	a := newAAuthFedWith(t, func(c *zeroid.Config) { c.AAuth.RequestsPerMinute = 3 }, "aauth_agent", "aauth_subagent")
 
-	t.Run("one workload subject's enrollments are limited, without spending its attestation", func(t *testing.T) {
+	t.Run("one workload subject's enrollments are limited", func(t *testing.T) {
 		var last apResponse
 		for i := 0; i < 4; i++ {
 			last = a.bootstrap(t, newAgentKey(t), a.assertion(t, nil))

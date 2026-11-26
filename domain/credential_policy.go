@@ -150,7 +150,7 @@ func ValidateServerIdentifier(s string) (string, error) {
 		return "", errors.New("not https")
 	case u.Host == "" || u.Port() != "" || strings.Contains(u.Host, ":"):
 		return "", errors.New("no host, or a port")
-	case u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || strings.HasSuffix(s, "/") || strings.Contains(s, "?") || strings.Contains(s, "#"):
+	case u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || strings.HasSuffix(s, "/") || strings.ContainsAny(s, "?#%@"):
 		return "", errors.New("more than scheme and host")
 	case s != strings.ToLower(s):
 		return "", errors.New("not lower case")

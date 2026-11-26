@@ -205,6 +205,7 @@ type ServerOption func(*serverOptions)
 type serverOptions struct {
 	externalIssuerJWKSOpts   []jwks.Option
 	externalIssuerHTTPClient *http.Client
+	aauthPersonServerClient  *http.Client
 	cimdHTTPClient           *http.Client
 }
 
@@ -226,6 +227,17 @@ func WithExternalIssuerJWKSOption(opt jwks.Option) ServerOption {
 func WithExternalIssuerHTTPClient(c *http.Client) ServerOption {
 	return func(o *serverOptions) {
 		o.externalIssuerHTTPClient = c
+	}
+}
+
+// WithAAuthPersonServerHTTPClient replaces the HTTP client the AAuth Agent
+// Provider uses for person servers (metadata discovery and revocations), whose
+// URLs come from credential policies and the person servers' own metadata.
+// For tests against httptest.NewTLSServer. SUPPLYING ONE REPLACES THE SSRF
+// GUARD; federation.allow_private_endpoints is the supported relaxation.
+func WithAAuthPersonServerHTTPClient(c *http.Client) ServerOption {
+	return func(o *serverOptions) {
+		o.aauthPersonServerClient = c
 	}
 }
 
@@ -707,9 +719,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 				"documentation_uri": cfg.AAuth.DocumentationURI, "tos_uri": cfg.AAuth.TOSURI, "policy_uri": cfg.AAuth.PolicyURI,
 			},
 		}, aauth.Deps{OAuth: oauthSvc, Credentials: credentialSvc, Identities: identitySvc, DB: db,
-			// Person servers are tenant-configured URLs: the same SSRF guard
-			// as issuer discovery, unless the embedder supplies its client.
-			PersonServerClient: personServerClient(options.externalIssuerHTTPClient, cfg.Federation.AllowPrivateEndpoints)})
+			// Person servers are tenant-configured URLs: SSRF-guarded unless
+			// the embedder supplies its own client for them.
+			PersonServerClient: personServerClient(options.aauthPersonServerClient, cfg.Federation.AllowPrivateEndpoints)})
 		if err != nil {
 			return nil, err
 		}
@@ -1873,8 +1885,8 @@ func (s *Server) RunAAuthPersonServerRevocationsOnce(ctx context.Context) (int, 
 	return s.aauthProvider.SendPersonServerRevocations(ctx)
 }
 
-// personServerClient is the HTTP client for AAuth person servers: the
-// embedder's external-issuer client when set, else an SSRF-guarded one.
+// personServerClient is the HTTP client for AAuth person servers: the one
+// WithAAuthPersonServerHTTPClient supplied, else an SSRF-guarded one.
 func personServerClient(embedder *http.Client, allowPrivate bool) *http.Client {
 	if embedder != nil {
 		return embedder

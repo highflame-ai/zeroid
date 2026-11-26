@@ -642,10 +642,6 @@ func scopeCeiling(policy *domain.CredentialPolicy, req EnforcePolicyRequest) []s
 	return policy.AllowedScopes
 }
 
-// validateRequiredPrincipalType accepts the principal requirements a policy
-// may set today. "owner" needs the personal-agent profile (the agent's owner
-// bound to a linked IdP identity), which ships later, so it is refused rather
-// than stored as a requirement nothing can satisfy correctly.
 // validateAAuthPersonServer accepts an AAuth server identifier or empty. The
 // value becomes the ps claim and the host ZeroID sends revocations to.
 func validateAAuthPersonServer(v string) error {
@@ -658,6 +654,10 @@ func validateAAuthPersonServer(v string) error {
 	return nil
 }
 
+// validateRequiredPrincipalType accepts the principal requirements a policy
+// may set today. "owner" needs the personal-agent profile (the agent's owner
+// bound to a linked IdP identity), which ships later, so it is refused rather
+// than stored as a requirement nothing can satisfy correctly.
 func validateRequiredPrincipalType(v string) error {
 	switch v {
 	case domain.RequirePrincipalAny, domain.RequirePrincipalUser:
