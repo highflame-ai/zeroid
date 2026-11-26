@@ -802,14 +802,25 @@ type TokenConfig struct {
 	// ScopeRules is what the stricter scope issuance rules do (see
 	// docs/scope-ceilings.md, "Stricter scope rules"):
 	//
-	//   off    (default) no rule is evaluated, and nothing is logged or
-	//          counted.
-	//   shadow every grant is evaluated against the stricter rules, and each
-	//          request whose outcome they would change is logged as
-	//          scope_rule_would_change and counted in
-	//          zeroid_scope_rule_would_change_total. Nothing is enforced:
-	//          tokens and responses are exactly as with off.
+	//   off     (default) no rule is evaluated, and nothing is logged or
+	//           counted.
+	//   shadow  every grant is evaluated against the stricter rules, and each
+	//           request whose outcome they would change is logged as
+	//           scope_rule_would_change and counted in
+	//           zeroid_scope_rule_would_change_total. Nothing is enforced:
+	//           tokens and responses are exactly as with off.
+	//   enforce the same evaluation decides the outcome. A request that names
+	//           no scope is issued only an API key's own scopes or an
+	//           audience profile's, and otherwise none; a scope no
+	//           deployer-controlled ceiling lists, or a request that would be
+	//           narrowed, is refused whole; a delegation that names no scope
+	//           is issued none; and every scope refusal at the token endpoint
+	//           answers invalid_scope. Any other request refused with off
+	//           stays refused. Each request changed is logged and counted as
+	//           in shadow, with mode=enforce.
 	//
+	// Roll out off, then shadow, then enforce once shadow records nothing
+	// that should keep working.
 	// Empty means off. Any other value is refused at startup. Can also be
 	// changed at runtime with Server.SetScopeRulesMode. Env var:
 	// ZEROID_SCOPE_RULES.
@@ -1458,8 +1469,8 @@ var envMapping = map[string]string{
 	// Seconds after a rotation in which re-presenting the rotated-out refresh
 	// token is a benign retry, not reuse. 0 = strict RFC 9700; max 300.
 	"ZEROID_REFRESH_REUSE_GRACE_SECONDS": "token.refresh_reuse_grace_seconds",
-	// The stricter scope rules: off (default) or shadow (count what they
-	// would change, enforce nothing).
+	// The stricter scope rules: off (default), shadow (count what they would
+	// change, enforce nothing) or enforce.
 	"ZEROID_SCOPE_RULES": "token.scope_rules",
 	// Accept an external-principal subject_token without verifying it, as
 	// before subject verification. Default false.

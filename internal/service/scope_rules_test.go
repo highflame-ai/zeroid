@@ -84,23 +84,22 @@ func captureScopeRules(t *testing.T) (points func() []map[string]string, lines f
 }
 
 func TestParseScopeRulesMode(t *testing.T) {
-	for in, want := range map[string]ScopeRulesMode{"": ScopeRulesModeOff, "off": ScopeRulesModeOff, "shadow": ScopeRulesModeShadow} {
+	for in, want := range map[string]ScopeRulesMode{
+		"": ScopeRulesModeOff, "off": ScopeRulesModeOff, "shadow": ScopeRulesModeShadow, "enforce": ScopeRulesModeEnforce,
+	} {
 		got, err := ParseScopeRulesMode(in)
 		require.NoError(t, err, "mode %q", in)
 		assert.Equal(t, want, got, "mode %q", in)
 	}
 
-	_, err := ParseScopeRulesMode("enforce")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not available yet", "enforce is named as not yet available, not as unknown")
-
-	for _, in := range []string{"on", "Shadow", "count"} {
+	for _, in := range []string{"on", "Shadow", "count", "Enforce"} {
 		_, err := ParseScopeRulesMode(in)
 		assert.Error(t, err, "mode %q must be refused", in)
 	}
 }
 
-// A wiring mistake never changes the mode, and only shadow creates a trace.
+// A wiring mistake never changes the mode, and only shadow and enforce create
+// a trace; only enforce's trace enforces.
 func TestSetScopeRulesMode(t *testing.T) {
 	svc := &CredentialService{}
 	ctx := context.Background()
@@ -115,11 +114,20 @@ func TestSetScopeRulesMode(t *testing.T) {
 	_, untraced := svc.traceScopes(ctx, "")
 	assert.Nil(t, untraced, "a grant the rules do not evaluate gets no trace")
 
-	for _, bad := range []ScopeRulesMode{"", "enforce", "bogus"} {
+	assert.False(t, trace.enforcing(), "shadow enforces nothing")
+	assert.Equal(t, ScopeRulesModeShadow, trace.mode())
+
+	for _, bad := range []ScopeRulesMode{"", "bogus"} {
 		assert.Error(t, svc.SetScopeRulesMode(bad), "mode %q", bad)
 		_, still := svc.traceScopes(ctx, "client_credentials")
 		assert.NotNil(t, still, "a refused mode %q leaves shadow on", bad)
 	}
+
+	require.NoError(t, svc.SetScopeRulesMode(ScopeRulesModeEnforce))
+	_, trace = svc.traceScopes(ctx, "client_credentials")
+	require.NotNil(t, trace)
+	assert.True(t, trace.enforcing())
+	assert.Equal(t, ScopeRulesModeEnforce, trace.mode())
 
 	require.NoError(t, svc.SetScopeRulesMode(ScopeRulesModeOff))
 	_, trace = svc.traceScopes(ctx, "client_credentials")
