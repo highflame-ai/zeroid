@@ -1265,7 +1265,7 @@ func TestValidateAAuthMetadataURLs(t *testing.T) {
 		t.Fatalf("valid metadata refused: %v", err)
 	}
 
-	for _, bad := range []string{"http://example.com/logo.svg", "logo.svg", "https://"} {
+	for _, bad := range []string{"http://example.com/logo.svg", "logo.svg", "https://", "https://:443", "https://user:pw@example.com/tos"} {
 		cfg := base(t)
 		cfg.AAuth.TOSURI = bad
 		err := cfg.Validate()

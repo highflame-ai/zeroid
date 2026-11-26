@@ -1077,7 +1077,7 @@ func (c *Config) Validate() error {
 			"logo_uri": c.AAuth.LogoURI, "logo_dark_uri": c.AAuth.LogoDarkURI,
 			"documentation_uri": c.AAuth.DocumentationURI, "tos_uri": c.AAuth.TOSURI, "policy_uri": c.AAuth.PolicyURI,
 		} {
-			if u, err := url.Parse(v); v != "" && (err != nil || u.Scheme != "https" || u.Host == "") {
+			if u, err := url.Parse(v); v != "" && (err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil) {
 				return fmt.Errorf("aauth.%s must be an https URL, got %q", name, v)
 			}
 		}

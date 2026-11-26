@@ -164,11 +164,19 @@ func (p *Provider) handleMetadata(w http.ResponseWriter, _ *http.Request) {
 		doc["name"] = p.cfg.Name
 	}
 	for k, v := range p.cfg.Metadata {
-		if v != "" {
+		// Display members only: never issuer, jwks_uri or another member
+		// the provider sets itself.
+		if _, set := doc[k]; !set && displayMembers[k] && v != "" {
 			doc[k] = v
 		}
 	}
 	writeCacheableJSON(w, doc)
+}
+
+// displayMembers are the optional metadata members Config.Metadata may set.
+var displayMembers = map[string]bool{
+	"description": true, "logo_uri": true, "logo_dark_uri": true,
+	"documentation_uri": true, "tos_uri": true, "policy_uri": true,
 }
 
 func (p *Provider) handleJWKS(w http.ResponseWriter, _ *http.Request) {
