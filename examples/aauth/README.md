@@ -70,7 +70,24 @@ admin API is reachable through Caddy too; a real deployment keeps it private.
 
 `demo-agent` also takes `PLATFORM=k8s` (a projected service account token file
 with audience ZeroID's issuer and `expirationSeconds: 600`; `TOKEN_FILE`) and
-`PLATFORM=aws` (an STS web identity token from the AWS CLI). Those paths are
-written but not yet run against real accounts. Keep `KEY_FILE` on a volume
+`PLATFORM=aws` (an STS web identity token from the AWS CLI). The Kubernetes
+path is written but not yet run on a real cluster.
+
+### With a real AWS token
+
+Verified on 2026-11-26 against a real account. The account needs outbound
+identity federation (`aws iam enable-outbound-web-identity-federation`, which
+prints its issuer) and the principal `sts:GetWebIdentityToken`. The token's
+`sub` is the role ARN, so bind that.
+
+```bash
+docker compose up -d --build postgres keygen zeroid caddy demo-resource
+docker compose run --rm -e CLUSTER_ISSUER=<account issuer> -e SA_SUBJECT=<role ARN> demo-setup
+aws sts get-web-identity-token --audience https://auth.zeroid.test --signing-algorithm RS256 \
+  --output json | jq -r .WebIdentityToken > aws-token        # valid 5 minutes
+docker compose run --rm --no-deps -e PLATFORM=k8s -e TOKEN_FILE=/aws/token \
+  -v "$PWD/aws-token:/aws/token:ro" demo-agent
+docker compose down -v && rm -f aws-token
+``` Keep `KEY_FILE` on a volume
 every container of the pod shares (an `emptyDir`): the pod keeps one agent key,
 which is what lets a restarted container redeem the pod's platform token again.

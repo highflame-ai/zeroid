@@ -1,0 +1,4 @@
+# Platform tokens minted for manual runs (bearer credentials, never commit)
+aws.json
+aws-token
+*.token

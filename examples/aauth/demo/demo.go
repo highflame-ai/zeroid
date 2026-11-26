@@ -69,16 +69,18 @@ func FileToken(path string) PlatformToken {
 }
 
 // AWSToken gets an STS web identity token for audience with the AWS CLI
-// (aws sts get-web-identity-token), from the role the workload runs as.
-// Written for real accounts with outbound identity federation enabled; not
-// exercised by the local demo, and the CLI's output field should be checked
-// against AWS's documentation before use.
+// (aws sts get-web-identity-token), from the principal the workload runs as.
+// The account needs outbound identity federation enabled
+// (aws iam enable-outbound-web-identity-federation) and the principal
+// sts:GetWebIdentityToken. The CLI requires a signing algorithm; ZeroID
+// accepts RS256 (the default here) and ES384.
 func AWSToken(signingAlgorithm string) PlatformToken {
+	if signingAlgorithm == "" {
+		signingAlgorithm = "RS256"
+	}
 	return func(ctx context.Context, audience string) (string, error) {
-		args := []string{"sts", "get-web-identity-token", "--audience", audience, "--output", "json"}
-		if signingAlgorithm != "" {
-			args = append(args, "--signing-algorithm", signingAlgorithm)
-		}
+		args := []string{"sts", "get-web-identity-token", "--audience", audience,
+			"--signing-algorithm", signingAlgorithm, "--output", "json"}
 		out, err := exec.CommandContext(ctx, "aws", args...).Output()
 		if err != nil {
 			return "", fmt.Errorf("aws sts get-web-identity-token: %w", err)
