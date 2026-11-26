@@ -221,7 +221,7 @@ func (s *OAuthService) mintFederatedClientCredentials(
 			"the agent has no scope limit: set allowed_scopes on its identity or credential policy")
 	}
 	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
-	trace.ceiling(ceilingIdentityScopes, rowScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
 	scopes, err := grantIdentityScopes(req.Scope, identity, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err

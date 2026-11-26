@@ -1094,7 +1094,7 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 			}
 			for _, sc := range requested {
 				if !allowed[sc] {
-					trace.ceiling(ceilingBoundScopes, bound.AllowedScopes)
+					trace.identityCeiling(ceilingBoundScopes, bound)
 					return nil, oauthBadRequest(oautherror.InvalidScope,
 						fmt.Sprintf("scope %q is not in the bound identity's allowed_scopes", sc))
 				}

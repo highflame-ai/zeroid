@@ -865,7 +865,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		}
 		for _, requested := range req.Scopes {
 			if !allowed[requested] {
-				trace.ceiling(ceilingIdentityScopes, req.Identity.AllowedScopes)
+				trace.identityCeiling(ceilingIdentityScopes, req.Identity)
 				return nil, nil, fmt.Errorf("%w: %q not in allowed_scopes", ErrScopesNotAllowed, requested)
 			}
 		}

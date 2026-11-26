@@ -427,6 +427,18 @@ func (t *scopeTrace) strictCeiling(what string, scopes []string) {
 	}
 }
 
+// identityCeiling records the identity's own allowed_scopes as a ceiling. An
+// identity registered by another identity whose list is empty holds no scope,
+// so its list is a strict ceiling that lists nothing; on any other identity an
+// empty list places no restriction.
+func (t *scopeTrace) identityCeiling(what string, identity *domain.Identity) {
+	if identity.ListsNoScope() {
+		t.strictCeiling(what, nil)
+		return
+	}
+	t.ceiling(what, identity.AllowedScopes)
+}
+
 // listableIn records, in enforce mode, a deployer-controlled ceiling that
 // applies to the request, where a refusal by rule B says a scope can be
 // listed.

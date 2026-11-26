@@ -264,7 +264,7 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if refused := scopeRefusedForIdentityType(ident.IdentityType, req.Scopes); refused != "" {
 		return true, oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not issued to this identity", refused))
 	}
-	trace.ceiling(ceilingRequesterScopes, ident.AllowedScopes)
+	trace.identityCeiling(ceilingRequesterScopes, ident)
 	if err := requireScopesWithinIdentity(req.Scopes, ident, "the requesting identity's allowed_scopes"); err != nil {
 		return true, err
 	}
@@ -388,7 +388,7 @@ func (s *BackchannelService) boundAnchorGates(ctx context.Context, req *IssueReq
 		return oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not issued to the bound identity", refused))
 	}
 	trace := scopeTraceFrom(ctx)
-	trace.ceiling(ceilingBoundScopes, req.Identity.AllowedScopes)
+	trace.identityCeiling(ceilingBoundScopes, req.Identity)
 	if err := requireScopesWithinIdentity(req.Scopes, req.Identity, "the bound identity's allowed_scopes"); err != nil {
 		return err
 	}

@@ -1075,7 +1075,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
 	trace.strictCeiling(clientCeilingName(client), client.Scopes)
 	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
-	trace.ceiling(ceilingIdentityScopes, rowScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
 	scopes, err := grantIdentityScopes(req.Scope, identity, client.Scopes, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err
@@ -1219,7 +1219,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	trace.ask(parseScopeString(req.Scope), true)
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
 	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
-	trace.ceiling(ceilingIdentityScopes, rowScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
 	scopes, err := grantIdentityScopes(req.Scope, identity, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err
@@ -1464,7 +1464,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// ceiling.
 	trace.strictCeiling(ceilingSubjectToken, subjectCred.Scopes)
 	trace.ceiling(policyCeilingName(ownerActor, userGrantCeiling), actorPolicyScopes)
-	trace.ceiling(ceilingActorScopes, actorRowScopes)
+	trace.identityCeiling(ceilingActorScopes, actorIdentity)
 	// The orchestrator term is filtered explicitly rather than through
 	// narrowScopes: an orchestrator holding no scopes can delegate nothing,
 	// whereas narrowScopes reads an empty ceiling as "no restriction".
@@ -2356,7 +2356,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	trace.ceiling(ceilingAPIKeyScopes, sk.Scopes)
 	trace.ceiling(policyCeilingName(ownerAPIKey, false), keyPolicyScopes)
 	trace.ceiling(policyCeilingName(identityPolicyOwner(identity), false), identityPolicyScopes)
-	trace.ceiling(ceilingIdentityScopes, rowScopes)
+	trace.identityCeiling(ceilingIdentityScopes, identity)
 	scopes, err := grantIdentityScopes(req.Scope, identity, sk.Scopes, keyPolicyScopes, identityPolicyScopes, rowScopes)
 	if err != nil {
 		return nil, err

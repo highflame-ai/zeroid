@@ -12,6 +12,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -35,8 +36,8 @@ func emptyCeilingPolicy(t *testing.T, tn treeTenant) string {
 	}, tn.headers())
 }
 
-// requireNoScopes asserts a token response issued a token carrying no scope.
-func requireNoScopes(t *testing.T, status int, body map[string]any) {
+// requireTokenNoScopes asserts a token response issued a token carrying no scope.
+func requireTokenNoScopes(t *testing.T, status int, body map[string]any) {
 	t.Helper()
 	require.Equal(t, http.StatusOK, status, "an omitted request is answered: %v", body)
 	assert.Empty(t, body["scope"], "the response names no scope")
@@ -44,8 +45,8 @@ func requireNoScopes(t *testing.T, status int, body map[string]any) {
 	assert.NotContains(t, claims, "scopes", "the token carries no scope")
 }
 
-// requireInvalidScope asserts a token request was refused over its scopes.
-func requireInvalidScope(t *testing.T, status int, body map[string]any, what string) {
+// requireTokenRefused asserts a token request was refused over its scopes.
+func requireTokenRefused(t *testing.T, status int, body map[string]any, what string) {
 	t.Helper()
 	assert.Equal(t, http.StatusBadRequest, status, "%s: %v", what, body)
 	assert.Equal(t, "invalid_scope", body["error"], "%s", what)
@@ -90,11 +91,11 @@ func TestIdentityTree_ScopelessCallerRegistersChild(t *testing.T) {
 			assert.Empty(t, getTreeIdentity(t, tn, child.ID).AllowedScopes)
 
 			status, body := apiKeyToken(t, key, "data:read")
-			requireInvalidScope(t, status, body, "api_key: a scope the inherited policy lists")
+			requireTokenRefused(t, status, body, "api_key: a scope the inherited policy lists")
 			status, body = apiKeyToken(t, key, "admin:all")
-			requireInvalidScope(t, status, body, "api_key: a scope nothing lists")
+			requireTokenRefused(t, status, body, "api_key: a scope nothing lists")
 			status, body = apiKeyToken(t, key, "")
-			requireNoScopes(t, status, body)
+			requireTokenNoScopes(t, status, body)
 
 			// The same on the jwt-bearer grant.
 			signer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -102,9 +103,9 @@ func TestIdentityTree_ScopelessCallerRegistersChild(t *testing.T) {
 			signed := mustTreeIdentity(t, tn.asWith(parent.ID), map[string]any{"public_key_pem": ecPublicKeyPEM(t, signer)})
 			assert.Empty(t, signed.AllowedScopes)
 			status, body = jwtBearerToken(t, signer, signed.WIMSEURI, "data:read")
-			requireInvalidScope(t, status, body, "jwt_bearer: a scope the inherited policy lists")
+			requireTokenRefused(t, status, body, "jwt_bearer: a scope the inherited policy lists")
 			status, body = jwtBearerToken(t, signer, signed.WIMSEURI, "")
-			requireNoScopes(t, status, body)
+			requireTokenNoScopes(t, status, body)
 
 			// The child's own scopeless key registers a grandchild in turn.
 			childID := child.ID
@@ -118,6 +119,38 @@ func TestIdentityTree_ScopelessCallerRegistersChild(t *testing.T) {
 			assert.Empty(t, records.counts(t))
 		})
 	}
+}
+
+// TestIdentityTree_ScopelessChildUnderEnforce: with token.scope_rules=enforce
+// a child whose own list is empty is read as listing nothing. A scope it
+// requests is refused invalid_scope naming its registration as the ceiling
+// that must list it, though the policy it inherits lists the scope, and a
+// request that names none is issued a token with no scopes claim.
+func TestIdentityTree_ScopelessChildUnderEnforce(t *testing.T) {
+	setScopeRules(t, zeroid.ScopeRulesModeEnforce)
+	tn := newTreeTenant()
+	pol := emptyCeilingPolicy(t, tn)
+	parent := mustTreeIdentity(t, tn.headers(), map[string]any{
+		"credential_policy_id": pol, "allowed_scopes": []string{"data:read", "data:write"},
+	})
+	child, key := mustTreeAgent(t, tn.asWith(parent.ID), map[string]any{})
+	require.Empty(t, child.AllowedScopes)
+
+	const refusal = "scope %s is not granted: the identity's allowed_scopes must list it"
+	status, body := apiKeyToken(t, key, "data:read")
+	requireTokenRefused(t, status, body, "api_key: a scope the inherited policy lists")
+	assert.Equal(t, fmt.Sprintf(refusal, "data:read"), body["error_description"])
+	status, body = apiKeyToken(t, key, "")
+	requireTokenNoScopes(t, status, body)
+
+	signer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	signed := mustTreeIdentity(t, tn.asWith(parent.ID), map[string]any{"public_key_pem": ecPublicKeyPEM(t, signer)})
+	status, body = jwtBearerToken(t, signer, signed.WIMSEURI, "data:write")
+	requireTokenRefused(t, status, body, "jwt_bearer: a scope the inherited policy lists")
+	assert.Equal(t, fmt.Sprintf(refusal, "data:write"), body["error_description"])
+	status, body = jwtBearerToken(t, signer, signed.WIMSEURI, "")
+	requireTokenNoScopes(t, status, body)
 }
 
 // TestIdentityTree_ChildKeyScopesWithinItsList: a key for a child carries
@@ -167,13 +200,13 @@ func TestIdentityTree_ChildWithNoScopeGainsNoneByDelegation(t *testing.T) {
 	childToken := mustAPIKeyToken(t, childKey)
 	actor, actorKey := exchangeActor(t, tn, pol)
 	status, body := exchangeTree(t, childToken, actorKey, actor.WIMSEURI)
-	requireInvalidScope(t, status, body, "the child's token as the subject")
+	requireTokenRefused(t, status, body, "the child's token as the subject")
 
 	signer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 	childActor := mustTreeIdentity(t, tn.asWith(parent.ID), map[string]any{"public_key_pem": ecPublicKeyPEM(t, signer)})
 	status, body = exchangeTree(t, parentToken, signer, childActor.WIMSEURI)
-	requireInvalidScope(t, status, body, "the child as the actor")
+	requireTokenRefused(t, status, body, "the child as the actor")
 	assert.Contains(t, body["error_description"], "the actor identity is not registered for [data:read]")
 }
 
@@ -211,9 +244,9 @@ func TestIdentityTree_ClearingChildListNarrows(t *testing.T) {
 	require.Equal(t, http.StatusOK, status, "an admin clearing the list: %s", raw)
 	assert.Empty(t, getTreeIdentity(t, tn, child.ID).AllowedScopes)
 	status, body = apiKeyToken(t, key, "data:read")
-	requireInvalidScope(t, status, body, "a scope the cleared list used to hold")
+	requireTokenRefused(t, status, body, "a scope the cleared list used to hold")
 	status, body = apiKeyToken(t, key, "")
-	requireNoScopes(t, status, body)
+	requireTokenNoScopes(t, status, body)
 
 	other := mustTreeIdentity(t, tn.as(parent.ID), map[string]any{"allowed_scopes": []string{"data:read"}})
 	status, raw = treeRequest(t, http.MethodPatch, adminPath("/identities/"+other.ID), map[string]any{"allowed_scopes": []string{}}, tn.asWith(parent.ID))
