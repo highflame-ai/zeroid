@@ -349,10 +349,11 @@ func TestIdentityTree_ScopeCeiling(t *testing.T) {
 		map[string]any{"allowed_scopes": []string{"data:read", "admin:all"}}, tn.headers())
 	assert.Equal(t, http.StatusBadRequest, status, "an update is held to the parent too")
 	assert.Contains(t, string(raw), `admin:all`)
+	assert.Equal(t, []string{"data:read"}, getTreeIdentity(t, tn, child.ID).AllowedScopes, "a refused update changes nothing")
 	status, raw = treeRequest(t, http.MethodPatch, adminPath("/identities/"+child.ID),
 		map[string]any{"allowed_scopes": []string{}}, tn.headers())
-	assert.Equal(t, http.StatusBadRequest, status, "clearing the only ceiling would free the child: %s", raw)
-	assert.Equal(t, []string{"data:read"}, getTreeIdentity(t, tn, child.ID).AllowedScopes, "a refused update changes nothing")
+	assert.Equal(t, http.StatusOK, status, "clearing a child's list narrows it to no scope: %s", raw)
+	assert.Empty(t, getTreeIdentity(t, tn, child.ID).AllowedScopes)
 
 	open := mustTreeIdentity(t, tn.headers(), map[string]any{})
 	anything := mustTreeIdentity(t, tn.asWith(open.ID, "admin:all"), map[string]any{"allowed_scopes": []string{"admin:all"}})

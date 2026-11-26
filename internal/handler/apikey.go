@@ -24,7 +24,7 @@ type CreateAPIKeyInput struct {
 		IdentityID         string          `json:"identity_id,omitempty" doc:"Identity to link this key to. Required unless product is supplied"`
 		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Credential policy to enforce on this key (default: the identity's own policy, or the tenant default when the identity has none)"`
 		Product            string          `json:"product,omitempty" doc:"Product namespace for key scoping. Required unless identity_id is supplied — a service identity is provisioned for the product"`
-		Scopes             []string        `json:"scopes,omitempty" doc:"Allowed scopes"`
+		Scopes             []string        `json:"scopes,omitempty" doc:"Allowed scopes. For an identity registered by another identity, each must be listed in its allowed_scopes; an empty allowed_scopes lists none"`
 		Environment        string          `json:"environment,omitempty" enum:"live,test" doc:"Environment (default: live)"`
 		ExpiresInDays      *int            `json:"expires_in_days,omitempty" doc:"Expiry in days (nil = never)"`
 		Metadata           json.RawMessage `json:"metadata,omitempty" doc:"Arbitrary JSON metadata for extensions"`
@@ -154,7 +154,7 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		if errors.Is(err, service.ErrReservedScopeWriteNotTrusted) {
 			return nil, huma.Error403Forbidden(err.Error())
 		}
-		if errors.Is(err, service.ErrScopeHasWhitespace) {
+		if errors.Is(err, service.ErrScopeHasWhitespace) || errors.Is(err, service.ErrKeyScopeOutsideIdentityCeiling) {
 			return nil, huma.Error400BadRequest(err.Error())
 		}
 		// Neither identity_id nor product supplied — the key has no identity to

@@ -36,7 +36,7 @@ func TestDelegationScopeDenial_NoScopesRequested(t *testing.T) {
 	// token_exchange is the ONE grant with no RFC 6749 §3.3 default, so an
 	// omitted scope is a hard failure rather than "grant the full ceiling".
 	// A caller who has only ever used the other grants will not expect that.
-	err := delegationScopeDenial(nil, map[string]bool{"tools:read": true}, nil, nil, false)
+	err := delegationScopeDenial(nil, map[string]bool{"tools:read": true}, nil, nil, false, false)
 
 	desc := denialText(t, err)
 	assert.Contains(t, desc, "no scopes were requested")
@@ -53,6 +53,7 @@ func TestDelegationScopeDenial_SubjectDoesNotHold(t *testing.T) {
 		[]string{"data:read", "tools:read"},
 		nil,
 		false,
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -68,6 +69,7 @@ func TestDelegationScopeDenial_ActorCeilingExcludes(t *testing.T) {
 		map[string]bool{"data:read": true},
 		nil,                    // the policy places no restriction
 		[]string{"tools:read"}, // the registration excludes data:read
+		false,
 		false,
 	)
 
@@ -87,6 +89,7 @@ func TestDelegationScopeDenial_BothTermsNamedSeparately(t *testing.T) {
 		nil,
 		[]string{"order:write"}, // actor registration lacks data:read
 		false,
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -104,6 +107,7 @@ func TestDelegationScopeDenial_UnrestrictedActorBlamesTheSubjectOnly(t *testing.
 		nil, // no actor policy ceiling
 		nil, // no actor registration ceiling
 		false,
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -119,6 +123,7 @@ func TestDelegationScopeDenial_EachScopeIsBlamedOnce(t *testing.T) {
 		map[string]bool{},      // subject lacks it
 		[]string{"tools:read"}, // and the actor policy lacks it too
 		nil,
+		false,
 		false,
 	)
 
@@ -140,6 +145,7 @@ func TestDelegationScopeDenial_PolicyCeilingBlamesThePolicy(t *testing.T) {
 		[]string{"tools:read"},
 		[]string{"data:read"}, // the registration lists it; the policy does not
 		false,
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -158,6 +164,7 @@ func TestDelegationScopeDenial_RowNarrowerThanPolicyBlamesTheRegistration(t *tes
 		[]string{"nhi:manage", "tools:read"},
 		[]string{"tools:read"},
 		false,
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -171,6 +178,7 @@ func TestDelegationScopeDenial_ScopeBothCeilingsExcludeIsBlamedOnce(t *testing.T
 		map[string]bool{"data:read": true},
 		[]string{"tools:read"},
 		[]string{"tools:read"},
+		false,
 		false,
 	)
 
@@ -251,9 +259,61 @@ func TestDelegationScopeDenial_NamesUserGrantScopes(t *testing.T) {
 		map[string]bool{"data:write": true},
 		[]string{"data:read"},
 		nil,
+		false,
 		true,
 	)
 
 	desc := denialText(t, err)
 	assert.Contains(t, desc, "user_grant_scopes does not permit [data:write]")
+}
+
+// TestDelegationScopeDenial_ActorListsNoScope: an actor registered by another
+// identity with an empty allowed_scopes lists no scope, so every scope the
+// subject can delegate is blamed on the actor's registration, not left
+// unexplained as it would be if the empty list read as no restriction.
+func TestDelegationScopeDenial_ActorListsNoScope(t *testing.T) {
+	err := delegationScopeDenial(
+		[]string{"data:read"},
+		map[string]bool{"data:read": true},
+		nil,
+		nil,
+		true,
+		false,
+	)
+
+	desc := denialText(t, err)
+	assert.Contains(t, desc, "the actor identity is not registered for [data:read]")
+}
+
+// TestGrantIdentityScopes: an identity registered by another identity whose
+// allowed_scopes is empty lists no scope. A named scope is refused as one
+// every ceiling excluded is, and an omitted request gets no scopes rather than
+// the first restricting ceiling's, or a refusal. An identity with no parent,
+// or a child that lists scopes, is grantScopes unchanged.
+func TestGrantIdentityScopes(t *testing.T) {
+	child := &domain.Identity{ParentIdentityID: "0b4b4c5e-5b7a-4d36-9a52-1b9f6c0e7d11"}
+	root := &domain.Identity{}
+	policyAB := []string{"a", "b"}
+
+	got, err := grantIdentityScopes("", child, policyAB, child.AllowedScopes)
+	require.NoError(t, err, "an omitted request is answered, with no scopes")
+	assert.Empty(t, got)
+
+	_, err = grantIdentityScopes("a", child, policyAB, child.AllowedScopes)
+	require.Error(t, err)
+	oe, ok := err.(*OAuthError)
+	require.True(t, ok)
+	assert.Equal(t, oautherror.InvalidScope, oe.Code)
+
+	got, err = grantIdentityScopes("", root, policyAB, root.AllowedScopes)
+	require.NoError(t, err)
+	assert.Equal(t, policyAB, got, "an identity with no parent keeps the RFC 6749 §3.3 default")
+	got, err = grantIdentityScopes("z", root, nil, root.AllowedScopes)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"z"}, got, "an identity with no parent and no ceiling stays unrestricted")
+
+	listing := &domain.Identity{ParentIdentityID: child.ParentIdentityID, AllowedScopes: []string{"a"}}
+	got, err = grantIdentityScopes("", listing, policyAB, listing.AllowedScopes)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a"}, got)
 }

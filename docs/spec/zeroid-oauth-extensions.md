@@ -414,7 +414,9 @@ non-agent NHIs uses the same mechanism without those role labels.
 ### 5.1 Scope attenuation (intersection)
 
 On an NHI delegation exchange the issued scope set **MUST** equal the
-intersection of (an empty set places no restriction, except the subject token's):
+intersection of (an empty set places no restriction, except the subject token's
+and the `allowed_scopes` of a sub-agent registered by another identity, which
+then lists no scope):
 
 1. the scopes **requested** (`scope` parameter),
 2. the scopes the **orchestrator** (subject_token) actually holds, and

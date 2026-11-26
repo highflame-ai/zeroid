@@ -1084,7 +1084,9 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 				}
 			}
 		}
-		if len(bound.AllowedScopes) > 0 {
+		// The bound identity's own list restricts even when empty on an
+		// identity registered by another identity, admitting no scope.
+		if bound.ScopeCeilingRestricts() {
 			allowed := make(map[string]bool, len(bound.AllowedScopes))
 			for _, sc := range bound.AllowedScopes {
 				allowed[sc] = true

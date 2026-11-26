@@ -58,11 +58,14 @@ ceiling.
 
 ## The model
 
-Layers, each optional; an empty layer places no restriction:
+Layers, each optional; an empty layer places no restriction, except an
+identity's own `allowed_scopes` when the identity was registered by another
+identity (it has a parent): there an empty list means the identity holds no
+scope ([identity-tree.md](identity-tree.md#empty-means-no-scope)):
 
 | Layer | Applies to |
 |---|---|
-| The identity's `allowed_scopes` | every token for the identity: the absolute ceiling |
+| The identity's `allowed_scopes` | every token for the identity: the absolute ceiling. Empty on an identity with a parent: no scope |
 | The identity's credential policy `allowed_scopes` | every token for the identity, except a chain acting for a person |
 | The credential policy's `user_grant_scopes` | a token-exchange hop whose chain acts for a person, in place of the policy's `allowed_scopes` (empty: no extra cap from the policy) |
 | The API key's scopes and its own credential policy | `api_key` tokens |
@@ -76,9 +79,13 @@ Rules:
 - A token's scopes are the request intersected with every restricting layer.
 - A request that names no scope defaults to the first restricting layer,
   narrowed by the rest. Token exchange has no default: the scopes to delegate
-  must be named.
+  must be named. A child whose `allowed_scopes` is empty has no default: an
+  omitted request is issued a token with no `scopes` claim, since it holds
+  no scope.
 - A grant whose layers leave nothing is refused with `invalid_scope`. A token
   is never minted without a `scopes` claim because the layers were disjoint.
+  The one scopeless token a restricting layer allows is the one above: an
+  omitted request from a child that holds no scope.
 - No token ever carries a scope outside the identity's `allowed_scopes`.
 
 Stricter rules are planned for the default, the empty layer and narrowing. A
@@ -107,8 +114,9 @@ deployment can count what they would change before any is enforced; see
 | Scenario | Behaviour |
 |---|---|
 | Registration (`POST /identities`, `PATCH /identities/{id}`, `POST /agents/register`) | Stores the ceiling. No check that it is a subset of the policy, or the reverse: the intersection at issuance makes either order safe |
-| Registration by an identity acting as itself (a child), and changes to a child's ceiling | Where the request names none, the child takes the scopes both its parent's ceiling and the parent's token hold, and the parent's credential policy (or the narrower of it and the presented API key's). Its ceilings must stay within the parent's and the token's, and a named policy must be a subset of the parent's, and of the presented key's, on every axis: anything else is refused with `400` ([identity-tree.md](identity-tree.md)) |
-| API key with its own policy | The key's policy must be a subset of the identity's policy; the identity ceiling then applies on top |
+| Registration by an identity acting as itself (a child), and changes to a child's ceiling | Where the request names none, the child takes the scopes both its parent's ceiling and the parent's token hold (possibly none), and the parent's credential policy (or the narrower of it and the presented API key's). Its ceilings must stay within the parent's and the token's, and a named policy must be a subset of the parent's, and of the presented key's, on every axis: anything else is refused with `400`. Clearing a child's `allowed_scopes` narrows it to no scope and is accepted ([identity-tree.md](identity-tree.md)) |
+| A child whose `allowed_scopes` is empty | Holds no scope on every grant and in every `token.scope_rules` mode: a named scope is refused as an unlisted one is, an omitted request is issued a token with no `scopes` claim, a token exchange delegates it none, and an API key for it cannot list a scope (`400`) |
+| API key with its own policy | The key's policy must be a subset of the identity's policy; the identity ceiling then applies on top. A key for a child may list only scopes the child's `allowed_scopes` lists |
 | `client_credentials`, `jwt_bearer`, `api_key` | Scopes = request ∩ client or key scopes ∩ key policy ∩ identity policy ∩ identity ceiling; an omitted request gets the narrowest layer; nothing left is refused |
 | `client_credentials` with a federated client assertion | No client or key scopes, so: request ∩ identity policy ∩ identity ceiling. An agent with neither set is refused with `invalid_scope` ([external-issuers.md](external-issuers.md)) |
 | Token exchange (agent to sub-agent) | Scopes = request ∩ the subject token's scopes ∩ the actor's policy ∩ the actor's ceiling; every hop narrows; a denial names the layer that excluded each scope. When the chain acts for a person, the actor's policy term is its `user_grant_scopes`; the actor's ceiling still binds |
@@ -117,7 +125,7 @@ deployment can count what they would change before any is enforced; see
 | CIBA step-up into a requesting chain (`requesting_token`) | Scopes = the requesting token's scopes: `openid` or no scope keeps them, other named scopes narrow to those, and a named scope the chain does not hold is refused. The requesting identity's ceiling and policy are re-checked against the current layers (its `user_grant_scopes` when the chain acts for a person), and a scope now outside them is refused. A requesting token with no identity is bounded by the polling client's bound identity instead |
 | Refresh after a ceiling or policy changed | The refreshed token is re-checked against the current layers; a scope now outside them fails the refresh |
 | Ceiling or policy changed with tokens outstanding | Issued tokens keep their scopes until they expire; new grants and new delegations use the current layers |
-| No layer restricts | An omitted request mints a token without a `scopes` claim, as before |
+| No layer restricts | An omitted request mints a token without a `scopes` claim, as before. A child's empty `allowed_scopes` is a layer that restricts (to nothing), so this row never applies to a child |
 
 ## A person's ceiling
 
@@ -185,8 +193,9 @@ enforcement would affect before turning it on.
 **Rules.**
 
 - An empty ceiling grants nothing. This differs from `Principal.Scopes` and
-  the other layers, where empty means no restriction: a person with no role
-  holds no scopes.
+  the other layers, where empty means no restriction (except a child
+  identity's own `allowed_scopes`, which also grants nothing when empty): a
+  person with no role holds no scopes.
 - `openid` asks for authentication, not authority, so the ceiling never
   removes it, and a request for `openid` alone is never refused.
 - Refusals, by where they happen:
@@ -235,7 +244,7 @@ with the request.
 | Rule | Recorded as | Planned | Today |
 |---|---|---|---|
 | A, omitted request | `omitted_request` | A request that names no scope is issued only the scopes stored on the API key it exchanges (`api_key`) or an audience profile's scopes (the trusted external-principal exchange), and otherwise none. A request refused today stays refused. | An omitted request gets the client's registered scopes on `authorization_code` (for a client identified by a metadata document, the scopes the document publishes) and the first restricting ceiling on the self-mint grants. |
-| B, listing | `listing` | A scope is issued only when at least one ceiling the deployer controls lists it: the API key's scopes or the key's own credential policy, the identity's `allowed_scopes`, the governing credential policy's ceiling (`allowed_scopes`, or `user_grant_scopes` for a chain bounded by a person's grant), or the registered scopes of a client created through the admin API. A client's own metadata (a metadata document's `scope`, or a dynamically registered client's `scope`) is a request, never a listing. An empty ceiling neither lists nor excludes. | An empty ceiling places no restriction, so a scope nothing lists is granted. |
+| B, listing | `listing` | A scope is issued only when at least one ceiling the deployer controls lists it: the API key's scopes or the key's own credential policy, the identity's `allowed_scopes`, the governing credential policy's ceiling (`allowed_scopes`, or `user_grant_scopes` for a chain bounded by a person's grant), or the registered scopes of a client created through the admin API. A client's own metadata (a metadata document's `scope`, or a dynamically registered client's `scope`) is a request, never a listing. An empty ceiling neither lists nor excludes, except a child identity's empty `allowed_scopes`, which lists nothing and excludes everything; issuance applies that itself, so the rule never counts it as a change. | An empty ceiling places no restriction, so a scope nothing lists is granted. |
 | C, all or nothing | `all_or_nothing` | A request is issued every scope it names, or refused whole with `invalid_scope`. A delegation (RFC 8693) that names no scope is issued none. | A named scope is dropped silently where a layer narrows (delegation, the self-mint grants, an enforced person ceiling). A delegation that names no scope is refused. |
 | D, one code | `one_code` | Every scope refusal answers `invalid_scope`. | A scope refusal answers `invalid_scope`, `insufficient_scope` (outside the identity's `allowed_scopes`), `policy_violation` (outside a credential policy), `invalid_grant` (a person ceiling at the token endpoint) or `access_denied` (a CIBA policy refusal, or a person ceiling sent to a push client). |
 

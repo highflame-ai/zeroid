@@ -15,6 +15,12 @@ func policy(name string, allowed, userGrant []string) *domain.CredentialPolicy {
 	return &domain.CredentialPolicy{Name: name, AllowedScopes: allowed, UserGrantScopes: userGrant}
 }
 
+// rootLayers is the layers of an identity no identity registered, on one
+// policy: its empty allowed_scopes places no restriction.
+func rootLayers(rowScopes []string, p *domain.CredentialPolicy) ceilingLayers {
+	return ceilingLayers{rowScopes: rowScopes, policies: []*domain.CredentialPolicy{p}}
+}
+
 // TestCheckChildCeilings pins the rule that a child identity can hold no scope
 // its parent cannot. Each case names the layers the request supplied
 // (rowNamed, policyNamed); the others were copied from the parent.
@@ -39,93 +45,121 @@ func TestCheckChildCeilings(t *testing.T) {
 	}{
 		{
 			name:     "an open parent allows any child",
-			parent:   childLayers(nil, open),
+			parent:   rootLayers(nil, open),
 			child:    childLayers([]string{"x", "y"}, open),
 			rowNamed: true,
 		},
 		{
 			name:   "an open parent allows an open child",
-			parent: childLayers(nil, open),
+			parent: rootLayers(nil, open),
 			child:  childLayers(nil, open),
 		},
 		{
 			name:   "a child that copied both layers equals its parent",
-			parent: childLayers([]string{"a", "b"}, open),
+			parent: rootLayers([]string{"a", "b"}, open),
 			child:  childLayers([]string{"a", "b"}, open),
 		},
 		{
 			name:     "named allowed_scopes within the parent",
-			parent:   childLayers([]string{"a", "b"}, open),
+			parent:   rootLayers([]string{"a", "b"}, open),
 			child:    childLayers([]string{"a"}, open),
 			rowNamed: true,
 		},
 		{
 			name:     "named allowed_scopes outside the parent names the scope",
-			parent:   childLayers([]string{"a", "b"}, open),
+			parent:   rootLayers([]string{"a", "b"}, open),
 			child:    childLayers([]string{"a", "c"}, open),
 			rowNamed: true,
 			wantErr:  `allowed_scopes lists "c"`,
 		},
 		{
 			name:     "named allowed_scopes is checked against the parent's policy too",
-			parent:   childLayers(nil, onlyA),
+			parent:   rootLayers(nil, onlyA),
 			child:    childLayers([]string{"a", "b"}, onlyA),
 			rowNamed: true,
 			wantErr:  `allowed_scopes lists "b"`,
 		},
 		{
 			name:        "a named policy within the parent",
-			parent:      childLayers([]string{"a", "b"}, open),
+			parent:      rootLayers([]string{"a", "b"}, open),
 			child:       childLayers([]string{"a", "b"}, onlyA),
 			policyNamed: true,
 		},
 		{
 			name:        "a named policy outside the parent names the scope",
-			parent:      childLayers(nil, ab),
+			parent:      rootLayers(nil, ab),
 			child:       childLayers(nil, withD),
 			policyNamed: true,
 			wantErr:     `credential policy "with-d" lists "d"`,
 		},
 		{
 			name:        "a named policy with no ceiling is refused under a restricted parent",
-			parent:      childLayers([]string{"a"}, open),
+			parent:      rootLayers([]string{"a"}, open),
 			child:       childLayers([]string{"a"}, open),
 			policyNamed: true,
 			wantErr:     `credential policy "open" places no scope ceiling`,
 		},
 		{
 			name:        "a named policy with no ceiling is allowed under an open parent",
-			parent:      childLayers(nil, open),
+			parent:      rootLayers(nil, open),
 			child:       childLayers(nil, open),
 			policyNamed: true,
 		},
 		{
-			// The escape this rule exists to stop: a restricted parent, a child
-			// on a policy with no ceiling, and nothing else restricting it.
-			name:     "a child left open under a restricted parent is refused",
-			parent:   childLayers([]string{"a"}, open),
-			child:    childLayers([]string{}, open),
+			// The escape the open check exists to stop: a restricted parent,
+			// layers on a policy with no ceiling, and nothing else restricting
+			// them. A child's own empty allowed_scopes can no longer open it
+			// (below), but the check still guards the intersection.
+			name:     "open layers under a restricted parent are refused",
+			parent:   rootLayers([]string{"a"}, open),
+			child:    rootLayers([]string{}, open),
 			rowNamed: true,
 			wantErr:  "would have no scope ceiling",
 		},
 		{
+			// A child's empty allowed_scopes lists no scope: the child holds
+			// none, whatever its policy lists, so it is within any parent.
+			name:     "a child whose allowed_scopes is empty holds no scope and is within a restricted parent",
+			parent:   rootLayers([]string{"a"}, open),
+			child:    childLayers([]string{}, open),
+			rowNamed: true,
+		},
+		{
+			name:   "a child whose allowed_scopes is empty is within a parent whose own list is empty too",
+			parent: childLayers(nil, ab),
+			child:  childLayers(nil, ab),
+		},
+		{
+			name:     "a parent whose own list is empty lets its child list nothing",
+			parent:   childLayers(nil, open),
+			child:    childLayers([]string{"a"}, open),
+			rowNamed: true,
+			wantErr:  `allowed_scopes lists "a"`,
+		},
+		{
 			// The parent's own policy lists b, but its allowed_scopes removes
 			// it. Copying that policy is fine while the child's allowed_scopes
-			// removes b too; clearing allowed_scopes would expose it.
+			// removes b too; layers without that restriction would expose it.
 			name:     "a copied policy wider than the parent is caught through the intersection",
-			parent:   childLayers([]string{"a"}, ab),
-			child:    childLayers([]string{}, ab),
+			parent:   rootLayers([]string{"a"}, ab),
+			child:    rootLayers([]string{}, ab),
 			rowNamed: true,
 			wantErr:  `the identity could hold "b"`,
 		},
 		{
+			name:     "a child that clears allowed_scopes under a copied wider policy holds no scope",
+			parent:   rootLayers([]string{"a"}, ab),
+			child:    childLayers([]string{}, ab),
+			rowNamed: true,
+		},
+		{
 			name:   "a copied policy wider than the parent is fine while allowed_scopes narrows it",
-			parent: childLayers([]string{"a"}, ab),
+			parent: rootLayers([]string{"a"}, ab),
 			child:  childLayers([]string{"a"}, ab),
 		},
 		{
 			name:        "named user_grant_scopes outside what the parent may hold for a person",
-			parent:      childLayers(nil, forPersonA),
+			parent:      rootLayers(nil, forPersonA),
 			child:       childLayers(nil, forPersonC),
 			policyNamed: true,
 			wantErr:     `credential policy "for-person-c" lists "c" in user_grant_scopes`,
@@ -134,7 +168,7 @@ func TestCheckChildCeilings(t *testing.T) {
 			// The child's own authority (a) fits, but with no user_grant_scopes
 			// it could hold b for a person, which the parent cannot.
 			name:        "a child that could hold more for a person than its parent is refused",
-			parent:      childLayers(nil, forPersonA),
+			parent:      rootLayers(nil, forPersonA),
 			child:       childLayers([]string{"a", "b"}, ab),
 			rowNamed:    true,
 			policyNamed: true,
@@ -450,8 +484,11 @@ func TestCheckWithinToken(t *testing.T) {
 	if err := checkWithinToken(b, childLayers([]string{"read", "write"}, open)); !errors.Is(err, ErrExceedsParentCeiling) {
 		t.Fatalf("a scope beyond the token: %v", err)
 	}
-	if err := checkWithinToken(b, childLayers(nil, open)); !errors.Is(err, ErrExceedsParentCeiling) {
-		t.Fatalf("an open child under a token: %v", err)
+	if err := checkWithinToken(b, rootLayers(nil, open)); !errors.Is(err, ErrExceedsParentCeiling) {
+		t.Fatalf("open layers under a token: %v", err)
+	}
+	if err := checkWithinToken(b, childLayers(nil, open)); err != nil {
+		t.Fatalf("a child whose allowed_scopes is empty holds no scope, within any token: %v", err)
 	}
 	if err := checkWithinToken(b, childLayers([]string{"read"}, policy("p", nil, []string{"write"}))); err != nil {
 		t.Fatalf("user_grant_scopes are bounded by the row, which is within the token: %v", err)
@@ -462,6 +499,9 @@ func TestCheckWithinToken(t *testing.T) {
 	}
 	if s := (&IdentityService{}).inheritedScopes(none); len(s) != 0 {
 		t.Fatalf("a token with no scopes leaves nothing to inherit: %v", s)
+	}
+	if err := checkWithinToken(none, childLayers(nil, open)); err != nil {
+		t.Fatalf("a token with no scopes registers a child that holds none: %v", err)
 	}
 }
 
@@ -500,10 +540,16 @@ func TestCeilingLayersWithin(t *testing.T) {
 	if !stored.within(childLayers([]string{"a", "b"}, open)) || !stored.within(childLayers([]string{"a"}, open)) {
 		t.Fatal("equal or narrower must be within")
 	}
-	if stored.within(childLayers([]string{"a", "c"}, open)) || stored.within(childLayers(nil, open)) {
+	if stored.within(childLayers([]string{"a", "c"}, open)) || stored.within(rootLayers(nil, open)) {
 		t.Fatal("wider or open must not be within")
 	}
-	if !childLayers(nil, open).within(childLayers([]string{"x"}, open)) {
+	if !stored.within(childLayers(nil, open)) || !stored.within(childLayers([]string{}, open)) {
+		t.Fatal("clearing a child's allowed_scopes narrows it to no scope")
+	}
+	if childLayers(nil, open).within(childLayers([]string{"x"}, open)) {
+		t.Fatal("a child that lists no scope is widened by listing one")
+	}
+	if !rootLayers(nil, open).within(childLayers([]string{"x"}, open)) {
 		t.Fatal("anything is within an open identity")
 	}
 }

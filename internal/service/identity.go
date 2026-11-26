@@ -239,11 +239,11 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 				return nil, err
 			}
 		} else {
-			// What both the parent's ceiling and its token allow.
+			// What both the parent's ceiling and its token allow. Nothing
+			// is a valid answer: a child's empty allowed_scopes means it
+			// holds no scope (domain.Identity.ListsNoScope), so a caller
+			// whose token holds none can still register children.
 			req.AllowedScopes = s.inheritedScopes(p)
-			if len(req.AllowedScopes) == 0 {
-				return nil, ceilingError("the calling token holds no scope within the parent's ceiling for the identity to inherit; name allowed_scopes the token holds")
-			}
 		}
 		// A child that names no policy inherits the narrower of the
 		// caller's own and its presented API key's; naming that one is the
@@ -1395,6 +1395,10 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 // no wider than it was (scopes within the stored ones, and a policy that is
 // the stored one or a subset of it) is always allowed: re-sending an
 // unchanged value after a parent was narrowed is not an escalation.
+//
+// Only an identity registered by another identity reaches it in practice: a
+// calling identity writes only to its own children. On such an identity,
+// clearing allowed_scopes narrows it to no scope.
 func (s *IdentityService) checkCeilingWrite(ctx context.Context, stored, next *domain.Identity, rowNamed, policyWritten bool, parent, caller *treeBound) error {
 	storedPolicy, err := s.ResolveCredentialPolicy(ctx, stored)
 	if err != nil {
@@ -1405,6 +1409,11 @@ func (s *IdentityService) checkCeilingWrite(ctx context.Context, stored, next *d
 		return err
 	}
 	priorLayers, nextLayers := childLayers(stored.AllowedScopes, storedPolicy), childLayers(next.AllowedScopes, nextPolicy)
+	if stored.ParentIdentityID == "" {
+		// Not reached today (see above); should it be, an empty list on an
+		// identity with no parent places no restriction.
+		priorLayers.rowNone, nextLayers.rowNone = false, false
+	}
 	samePolicy := sameUUID(storedPolicy.ID, nextPolicy.ID)
 	if priorLayers.within(nextLayers) {
 		if samePolicy {
