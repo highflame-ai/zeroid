@@ -19,8 +19,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -28,6 +30,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,6 +42,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	zeroid "github.com/highflame-ai/zeroid"
+	aauthpkg "github.com/highflame-ai/zeroid/internal/aauth"
 	"github.com/highflame-ai/zeroid/internal/mockidp"
 	"github.com/highflame-ai/zeroid/pkg/authjwt"
 )
@@ -96,6 +101,10 @@ func newAAuthFed(t *testing.T, grantTypes ...string) *aauthFed {
 	return &aauthFed{workloadFed: w}
 }
 
+// aauthDialOverrides routes host:port to a local listener address for the
+// Agent Provider's outbound requests (person servers).
+var aauthDialOverrides sync.Map
+
 // newAAuthServer is newDBFederationServer with the Agent Provider on.
 func newAAuthServer(t *testing.T) (*zeroid.Server, *httptest.Server) {
 	t.Helper()
@@ -127,8 +136,18 @@ func newAAuthServer(t *testing.T) (*zeroid.Server, *httptest.Server) {
 		AAuth:       zeroid.AAuthConfig{Enabled: true, SigningKeyPath: keyPath, Name: "ZeroID test AP", LogoURI: "https://zeroid.test/logo.svg"},
 	}
 	insecure := &http.Client{
-		Timeout:   5 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			// A person server is a host without a port; tests serve one on a
+			// local listener and route its host there.
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if to, ok := aauthDialOverrides.Load(addr); ok {
+					addr = to.(string)
+				}
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+		},
 	}
 	srv, err := zeroid.NewServer(cfg,
 		zeroid.WithExternalIssuerHTTPClient(insecure),
@@ -858,5 +877,240 @@ func TestAAuthSubagents(t *testing.T) {
 		sub := off.subagent(t, k, res.body["agent_token"].(string), newAgentKey(t), "x")
 		assert.Equal(t, http.StatusForbidden, sub.status, "body=%v", sub.body)
 		assert.Equal(t, "denied", sub.body["error"])
+	})
+}
+
+// fakePS is a person server at https://ps.zeroid.test that verifies every
+// revocation's signature against the Agent Provider's published key and
+// records what it was asked to revoke.
+type fakePS struct {
+	mode      atomic.Value // "ok", "defer", "fail", "none" (no revocation_endpoint), "unsupported"
+	mu        sync.Mutex
+	revoked   map[string]int64 // jti -> exp
+	polled    int
+	sigErrors []string
+	apJWKS    func() []byte
+	apIssuer  string
+	posts     int
+}
+
+const fakePSHost = "ps.zeroid.test"
+
+func newFakePS(t *testing.T, a *aauthFed) *fakePS {
+	t.Helper()
+	ps := &fakePS{revoked: map[string]int64{}, apIssuer: federationIssuer,
+		apJWKS: func() []byte { return a.getRaw(t, "/ap/jwks.json") }}
+	ps.mode.Store("ok")
+	srv := httptest.NewTLSServer(http.HandlerFunc(ps.serve))
+	t.Cleanup(srv.Close)
+	aauthDialOverrides.Store(fakePSHost+":443", srv.Listener.Addr().String())
+	t.Cleanup(func() { aauthDialOverrides.Delete(fakePSHost + ":443") })
+	return ps
+}
+
+func (ps *fakePS) verify(r *http.Request, body []byte) error {
+	_, err := aauthpkg.VerifyRequest(r, body, aauthpkg.VerifyOptions{
+		Now: time.Now(), Authority: fakePSHost, RequireBodyCoverage: true, Schemes: []string{"jwks_uri"},
+		ResolveKey: func(_ string, params map[string]any) (aauthpkg.JWK, error) {
+			if params["id"] != ps.apIssuer || params["dwk"] != "aauth-agent.json" {
+				return aauthpkg.JWK{}, fmt.Errorf("unexpected signer %v", params)
+			}
+			var set struct{ Keys []aauthpkg.JWK }
+			if err := json.Unmarshal(ps.apJWKS(), &set); err != nil {
+				return aauthpkg.JWK{}, err
+			}
+			for _, k := range set.Keys {
+				if k.Kid == params["kid"] {
+					return k, nil
+				}
+			}
+			return aauthpkg.JWK{}, errors.New("no such kid")
+		},
+	})
+	return err
+}
+
+func (ps *fakePS) serve(w http.ResponseWriter, r *http.Request) {
+	mode := ps.mode.Load().(string)
+	body, _ := io.ReadAll(r.Body)
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/.well-known/aauth-person.json":
+		md := map[string]any{"issuer": "https://" + fakePSHost, "jwks_uri": "https://" + fakePSHost + "/jwks.json"}
+		if mode != "none" {
+			md["revocation_endpoint"] = "https://" + fakePSHost + "/revoke"
+		}
+		_ = json.NewEncoder(w).Encode(md)
+	case r.Method == http.MethodPost && r.URL.Path == "/revoke":
+		ps.mu.Lock()
+		defer ps.mu.Unlock()
+		ps.posts++
+		if err := ps.verify(r, body); err != nil {
+			ps.sigErrors = append(ps.sigErrors, err.Error())
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			JTI string `json:"jti"`
+			Exp int64  `json:"exp"`
+		}
+		_ = json.Unmarshal(body, &req)
+		switch mode {
+		case "fail":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		case "unsupported":
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"unsupported_iss"}`))
+			return
+		}
+		ps.revoked[req.JTI] = req.Exp
+		if mode == "defer" {
+			w.Header().Set("Location", "/pending/"+req.JTI)
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/pending/"):
+		ps.mu.Lock()
+		defer ps.mu.Unlock()
+		if err := ps.verify(r, nil); err != nil {
+			ps.sigErrors = append(ps.sigErrors, "poll: "+err.Error())
+			w.WriteHeader(http.StatusNotFound) // another identity polling
+			return
+		}
+		ps.polled++
+		w.WriteHeader(http.StatusOK)
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func (ps *fakePS) state() (map[string]int64, int, []string, int) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	out := map[string]int64{}
+	for k, v := range ps.revoked {
+		out[k] = v
+	}
+	return out, ps.polled, append([]string(nil), ps.sigErrors...), ps.posts
+}
+
+func TestAAuthPersonServer(t *testing.T) {
+	a := newAAuthFed(t, "aauth_agent", "aauth_subagent")
+	ps := newFakePS(t, a)
+	status, body := a.f.call(t, http.MethodPatch, "/credential-policies/"+a.policy,
+		map[string]any{"aauth_person_server": "https://" + fakePSHost}, a.tn.headers)
+	require.Equal(t, http.StatusOK, status, "set the policy's person server: %v", body)
+
+	enroll := func(t *testing.T) (agentKey, string) {
+		t.Helper()
+		k := newAgentKey(t)
+		res := a.bootstrap(t, k, a.assertion(t, nil))
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		return k, res.body["agent_token"].(string)
+	}
+	revoke := func(t *testing.T, token string) {
+		t.Helper()
+		row := a.credential(t, decodeJWTPayload(t, token)["jti"].(string))
+		require.NotNil(t, row)
+		status, body := a.f.call(t, http.MethodPost, "/credentials/"+row["id"].(string)+"/revoke",
+			map[string]any{"reason": "test"}, a.tn.headers)
+		require.Contains(t, []int{http.StatusOK, http.StatusNoContent}, status, "revoke: %v", body)
+	}
+	pass := func(t *testing.T) int {
+		t.Helper()
+		n, err := a.f.srv.RunAAuthPersonServerRevocationsOnce(context.Background())
+		require.NoError(t, err)
+		return n
+	}
+
+	t.Run("policy validation refuses a person server that is not a server identifier", func(t *testing.T) {
+		for _, bad := range []string{"http://ps.example", "https://ps.example/", "https://ps.example:8443", "https://PS.example"} {
+			status, _ := a.f.call(t, http.MethodPatch, "/credential-policies/"+a.policy,
+				map[string]any{"aauth_person_server": bad}, a.tn.headers)
+			assert.Equal(t, http.StatusBadRequest, status, bad)
+		}
+	})
+
+	t.Run("agent and sub-agent tokens carry ps; nothing is sent while they are live", func(t *testing.T) {
+		pk, token := enroll(t)
+		assert.Equal(t, "https://"+fakePSHost, decodeJWTPayload(t, token)["ps"])
+		sub := a.subagent(t, pk, token, newAgentKey(t), "w1")
+		require.Equal(t, http.StatusOK, sub.status, "body=%v", sub.body)
+		assert.Equal(t, "https://"+fakePSHost, decodeJWTPayload(t, sub.body["agent_token"].(string))["ps"], "copied from the parent")
+		pass(t)
+		revoked, _, _, _ := ps.state()
+		assert.NotContains(t, revoked, decodeJWTPayload(t, token)["jti"])
+	})
+
+	t.Run("revoking an agent token revokes it, and its sub-agents, at the person server", func(t *testing.T) {
+		pk, token := enroll(t)
+		sub := a.subagent(t, pk, token, newAgentKey(t), "w2")
+		require.Equal(t, http.StatusOK, sub.status)
+		parentJTI := decodeJWTPayload(t, token)["jti"].(string)
+		childClaims := decodeJWTPayload(t, sub.body["agent_token"].(string))
+
+		revoke(t, token)
+		assert.GreaterOrEqual(t, pass(t), 2)
+		revoked, _, sigErrs, _ := ps.state()
+		assert.Empty(t, sigErrs, "every revocation verifies as signed by the Agent Provider")
+		assert.EqualValues(t, decodeJWTPayload(t, token)["exp"], revoked[parentJTI], "exp is the token's own")
+		assert.EqualValues(t, childClaims["exp"], revoked[childClaims["jti"].(string)], "the cascade reaches the person server too")
+
+		_, _, _, posts := ps.state()
+		pass(t)
+		_, _, _, again := ps.state()
+		assert.Equal(t, posts, again, "a delivered revocation is not sent again")
+	})
+
+	t.Run("a deferred revocation is polled with signed requests", func(t *testing.T) {
+		ps.mode.Store("defer")
+		defer ps.mode.Store("ok")
+		_, token := enroll(t)
+		revoke(t, token)
+		pass(t)
+		revoked, polled, sigErrs, _ := ps.state()
+		assert.Contains(t, revoked, decodeJWTPayload(t, token)["jti"])
+		assert.GreaterOrEqual(t, polled, 1)
+		assert.Empty(t, sigErrs)
+	})
+
+	t.Run("an unavailable person server is retried later; one that takes none is not", func(t *testing.T) {
+		ps.mode.Store("fail")
+		_, token := enroll(t)
+		jti := decodeJWTPayload(t, token)["jti"].(string)
+		revoke(t, token)
+		assert.Equal(t, 0, pass(t), "no terminal outcome")
+		_, _, _, posts := ps.state()
+		pass(t)
+		_, _, _, again := ps.state()
+		assert.Equal(t, posts, again, "backed off: not sent again at once")
+
+		ps.mode.Store("unsupported")
+		_, token2 := enroll(t)
+		revoke(t, token2)
+		assert.Equal(t, 1, pass(t), "unsupported_iss is terminal")
+		revoked, _, _, _ := ps.state()
+		assert.NotContains(t, revoked, jti)
+		ps.mode.Store("ok")
+	})
+
+	t.Run("deactivating the identity revokes its tokens at the person server", func(t *testing.T) {
+		b := newAAuthFed(t, "aauth_agent")
+		psB := newFakePS(t, b)
+		status, body := b.f.call(t, http.MethodPatch, "/credential-policies/"+b.policy,
+			map[string]any{"aauth_person_server": "https://" + fakePSHost}, b.tn.headers)
+		require.Equal(t, http.StatusOK, status, "%v", body)
+		k := newAgentKey(t)
+		res := b.bootstrap(t, k, b.assertion(t, nil))
+		require.Equal(t, http.StatusOK, res.status)
+		status, body = b.f.call(t, http.MethodDelete, "/identities/"+b.agent, nil, b.tn.headers)
+		require.Equal(t, http.StatusOK, status, "deactivate: %v", body)
+		_, err := b.f.srv.RunAAuthPersonServerRevocationsOnce(context.Background())
+		require.NoError(t, err)
+		revoked, _, _, _ := psB.state()
+		assert.Contains(t, revoked, decodeJWTPayload(t, res.body["agent_token"].(string))["jti"])
 	})
 }

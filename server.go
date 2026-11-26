@@ -163,6 +163,9 @@ type Server struct {
 	// Cleanup
 	cleanupWorker *worker.CleanupWorker
 	workerCancel  context.CancelFunc
+	// aauthProvider is the AAuth Agent Provider when aauth.enabled; Start
+	// runs its person-server revocation worker.
+	aauthProvider *aauth.Provider
 
 	// Extensibility
 	mu                 sync.RWMutex
@@ -689,6 +692,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 
 	// AAuth Agent Provider (internal/aauth), on the public router behind
 	// RequestURLMiddleware, which records the authority a signature covers.
+	var aauthProvider *aauth.Provider
 	if cfg.AAuth.Enabled {
 		provider, err := aauth.New(aauth.Config{
 			Issuer:           cfg.Token.Issuer,
@@ -701,11 +705,15 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 				"description": cfg.AAuth.Description, "logo_uri": cfg.AAuth.LogoURI, "logo_dark_uri": cfg.AAuth.LogoDarkURI,
 				"documentation_uri": cfg.AAuth.DocumentationURI, "tos_uri": cfg.AAuth.TOSURI, "policy_uri": cfg.AAuth.PolicyURI,
 			},
-		}, aauth.Deps{OAuth: oauthSvc, Credentials: credentialSvc, Identities: identitySvc, DB: db})
+		}, aauth.Deps{OAuth: oauthSvc, Credentials: credentialSvc, Identities: identitySvc, DB: db,
+			// Person servers are tenant-configured URLs: the same SSRF guard
+			// as issuer discovery, unless the embedder supplies its client.
+			PersonServerClient: personServerClient(options.externalIssuerHTTPClient, cfg.Federation.AllowPrivateEndpoints)})
 		if err != nil {
 			return nil, err
 		}
 		provider.Mount(r)
+		aauthProvider = provider
 		log.Info().Str("issuer", cfg.Token.Issuer).Msg("AAuth Agent Provider enabled")
 	}
 
@@ -788,6 +796,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	idleTimeout := parseDurationOrDefault(cfg.Server.IdleTimeout, 60*time.Second)
 
 	srv := &Server{
+		aauthProvider:          aauthProvider,
 		cfg:                    cfg,
 		db:                     db,
 		router:                 r,
@@ -857,6 +866,9 @@ func (s *Server) Start() error {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	s.workerCancel = workerCancel
 	go s.cleanupWorker.Run(workerCtx)
+	if s.aauthProvider != nil {
+		go s.aauthProvider.RunPersonServerRevocations(workerCtx, 0)
+	}
 
 	// Start HTTP server.
 	errCh := make(chan error, 1)
@@ -1847,6 +1859,26 @@ func (s *Server) Router() chi.Router {
 // the periodic loop. Production callers should let Start manage timing.
 func (s *Server) RunCleanupOnce(ctx context.Context) {
 	s.cleanupWorker.RunOnce(ctx)
+}
+
+// RunAAuthPersonServerRevocationsOnce runs one pass of the AAuth
+// person-server revocation worker and returns how many revocations reached a
+// terminal outcome. Exposed so integration tests can drive it
+// deterministically; Start runs it periodically. A no-op without aauth.
+func (s *Server) RunAAuthPersonServerRevocationsOnce(ctx context.Context) (int, error) {
+	if s.aauthProvider == nil {
+		return 0, nil
+	}
+	return s.aauthProvider.SendPersonServerRevocations(ctx)
+}
+
+// personServerClient is the HTTP client for AAuth person servers: the
+// embedder's external-issuer client when set, else an SSRF-guarded one.
+func personServerClient(embedder *http.Client, allowPrivate bool) *http.Client {
+	if embedder != nil {
+		return embedder
+	}
+	return attestation.NewSSRFGuardedHTTPClient(allowPrivate)
 }
 
 // SetHandler overrides the HTTP handler used by the server.

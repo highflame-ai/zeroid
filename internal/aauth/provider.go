@@ -80,6 +80,9 @@ type Deps struct {
 	Credentials *service.CredentialService
 	Identities  *service.IdentityService
 	DB          *bun.DB
+	// PersonServerClient makes the requests to person servers (metadata,
+	// revocations). Required; the caller passes an SSRF-guarded client.
+	PersonServerClient *http.Client
 }
 
 // Provider is ZeroID's AAuth Agent Provider.
@@ -92,6 +95,7 @@ type Provider struct {
 	identities  *service.IdentityService
 	redemptions *redemptions
 	db          *bun.DB
+	psClient    *http.Client
 	now         func() time.Time
 }
 
@@ -110,7 +114,7 @@ func New(cfg Config, deps Deps) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("aauth: %w", err)
 	}
-	if deps.OAuth == nil || deps.Credentials == nil || deps.Identities == nil || deps.DB == nil {
+	if deps.OAuth == nil || deps.Credentials == nil || deps.Identities == nil || deps.DB == nil || deps.PersonServerClient == nil {
 		return nil, errors.New("aauth: missing dependencies")
 	}
 	if cfg.AgentTokenTTL <= 0 {
@@ -128,6 +132,7 @@ func New(cfg Config, deps Deps) (*Provider, error) {
 		identities:  deps.Identities,
 		redemptions: &redemptions{db: deps.DB},
 		db:          deps.DB,
+		psClient:    deps.PersonServerClient,
 		now:         time.Now,
 	}
 	p.registerBridge(deps.OAuth)
@@ -138,20 +143,7 @@ func New(cfg Config, deps Deps) (*Provider, error) {
 // (https, scheme and host only: no port, path, query, fragment or trailing
 // slash, lower case) and returns its host.
 func ServerIdentifierHost(s string) (string, error) {
-	u, err := url.Parse(s)
-	switch {
-	case err != nil:
-		return "", err
-	case u.Scheme != "https":
-		return "", errors.New("not https")
-	case u.Host == "" || u.Port() != "" || strings.Contains(u.Host, ":"):
-		return "", errors.New("no host, or a port")
-	case u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || strings.HasSuffix(s, "/"):
-		return "", errors.New("more than scheme and host")
-	case s != strings.ToLower(s):
-		return "", errors.New("not lower case")
-	}
-	return u.Host, nil
+	return domain.ValidateServerIdentifier(s)
 }
 
 // Mount registers the Agent Provider's routes. (The bridge grant is
@@ -442,11 +434,15 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 			description: fmt.Sprintf("the identity's credential policy allows tokens of at most %ds; an agent token needs over %ds", ttl, minAgentTokenTTL)})
 	}
 	sub := "aauth:" + identity.ID + "@" + p.authority
+	ps := ""
+	if policy != nil {
+		ps = policy.AAuthPersonServer
+	}
 	// Issued on a detached context: a disconnect after the row commits must
 	// not run cleanup() and release a spend that already minted.
 	ictx, icancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer icancel()
-	issued, _, err := p.creds.IssueCredential(ictx, service.IssueRequest{
+	issued, issuedRow, err := p.creds.IssueCredential(ictx, service.IssueRequest{
 		Identity:         identity,
 		IdentityPolicyID: policyID(policy),
 		TTL:              ttl,
@@ -454,7 +450,7 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		// Recorded on the row as the key the token is bound to (its cnf.jwk).
 		DPoPKeyThumbprint: jkt,
 		AgentTokenSigner: func(jti string, iat, exp time.Time) (string, error) {
-			return p.key.sign(p.cfg.Issuer, sub, key, jti, iat, exp, tokenExtras{})
+			return p.key.sign(p.cfg.Issuer, sub, key, jti, iat, exp, tokenExtras{PS: ps})
 		},
 	})
 	if err != nil {
@@ -464,6 +460,10 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		}
 		cleanup()
 		return "", 0, fmt.Errorf("issuing the agent token: %w", err)
+	}
+	if err := p.trackForPersonServer(ictx, issuedRow, ps); err != nil {
+		cleanup()
+		return "", 0, err
 	}
 	if issued.ExpiresIn <= minAgentTokenTTL {
 		// Clamped further inside issuance (token.max_ttl, or an identity near

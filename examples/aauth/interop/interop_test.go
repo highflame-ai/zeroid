@@ -26,6 +26,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -40,6 +41,8 @@ import (
 
 	aauth "github.com/aauth-dev/aauth-go"
 	"github.com/aauth-dev/aauth-go/agentprovider"
+	"github.com/aauth-dev/aauth-go/personserver"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -54,6 +57,8 @@ import (
 const (
 	zeroidHost   = "zeroid.test"
 	resourceHost = "resource.test"
+	psHost       = "ps.test"
+	personServer = "https://" + psHost
 	issuer       = "https://" + zeroidHost
 	resource     = "https://" + resourceHost
 )
@@ -63,6 +68,9 @@ const (
 // to the in-process servers.
 type env struct {
 	zeroidURL string // ZeroID by name; the client maps it to the in-process server
+	srv       *zeroid.Server
+	policyID  string
+	psStore   *personserver.MemoryStore // aauth-go's person server at ps.test
 	client    *http.Client
 	idp       *mockidp.IdP
 	headers   map[string]string
@@ -160,6 +168,41 @@ func TestAAuthInteropSubagent(t *testing.T) {
 	assert.Contains(t, err.Error(), "status 403")
 }
 
+// TestAAuthInteropRevocationAtPersonServer: an agent with a person server
+// carries ps, and revoking its agent token at ZeroID revokes it at aauth-go's
+// person server, which verifies ZeroID's jwks_uri signature by discovering
+// its key from /.well-known/aauth-agent.json.
+func TestAAuthInteropRevocationAtPersonServer(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.admin(t, http.MethodPatch, "/credential-policies/"+e.policyID,
+		map[string]any{"aauth_person_server": personServer}, http.StatusOK)
+
+	key, err := demo.LoadOrCreateKey(filepath.Join(t.TempDir(), "pod", "agent.key"))
+	require.NoError(t, err)
+	ap := &agentprovider.Client{BaseURL: issuer, HTTPClient: e.client}
+	agent, err := ap.Enroll(ctx, key, map[string]string{"attestation": e.platformToken(t)})
+	require.NoError(t, err)
+	assert.Equal(t, personServer, agent.PS, "aauth-go reads ps from the agent token")
+	token, err := agent.MintToken()
+	require.NoError(t, err)
+	var claims aauth.AgentClaims
+	_, _, err = jwt.NewParser().ParseUnverified(token, &claims)
+	require.NoError(t, err)
+
+	revoked, err := e.psStore.IsRevoked(ctx, issuer, claims.ID)
+	require.NoError(t, err)
+	require.False(t, revoked)
+
+	e.revokeAgentToken(t, token)
+	n, err := e.srv.RunAAuthPersonServerRevocationsOnce(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	revoked, err = e.psStore.IsRevoked(ctx, issuer, claims.ID)
+	require.NoError(t, err)
+	assert.True(t, revoked, "aauth-go's person server recorded ZeroID's revocation under (iss, jti)")
+}
+
 func TestAAuthInteropRefusesAStolenPlatformToken(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
@@ -211,17 +254,16 @@ func newEnv(t *testing.T) *env {
 		Federation:  zeroid.FederationConfig{IssuerStore: "db", AllowPrivateEndpoints: true},
 		AAuth:       zeroid.AAuthConfig{Enabled: true, SigningKeyPath: writeEd25519Key(t, dir), Name: "ZeroID interop"},
 	}
-	idpClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{
-		RootCAs: certPool(idpSrv.Certificate())}}}
-	srv, err := zeroid.NewServer(cfg, zeroid.WithExternalIssuerHTTPClient(idpClient))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = srv.Shutdown(ctx) })
-	zeroidSrv := ca.serve(t, zeroidHost, srv.Router())
-
-	// One client that reaches every host by name over verified TLS.
+	// One client that reaches every host by name over verified TLS: ZeroID,
+	// the resource and the person server under the test CA, and the mock
+	// cluster under its own certificate. ZeroID's outbound requests (issuer
+	// discovery, person servers) use it too. The hosts are mapped before any
+	// request is made.
 	addrs := map[string]string{}
+	roots := ca.pool.Clone()
+	roots.AddCert(idpSrv.Certificate())
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: ca.pool},
+		TLSClientConfig: &tls.Config{RootCAs: roots},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if mapped, ok := addrs[addr]; ok {
 				addr = mapped
@@ -229,14 +271,32 @@ func newEnv(t *testing.T) *env {
 			return (&net.Dialer{}).DialContext(ctx, network, addr)
 		},
 	}}
+	srv, err := zeroid.NewServer(cfg, zeroid.WithExternalIssuerHTTPClient(client))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = srv.Shutdown(ctx) })
+	zeroidSrv := ca.serve(t, zeroidHost, srv.Router())
 	addrs[zeroidHost+":443"] = zeroidSrv.Listener.Addr().String()
+
+	// aauth-go's person server, which receives ZeroID's revocations.
+	_, psKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	psStore := personserver.NewMemoryStore()
+	ps, err := personserver.New(personserver.Config{
+		Issuer: personServer, Key: psKey, SubjectKey: make([]byte, 32), Store: psStore, HTTPClient: client,
+		Decider: personserver.DeciderFunc(func(context.Context, *personserver.TokenRequest) (personserver.Decision, error) {
+			return personserver.Decision{}, errors.New("this person server only takes revocations")
+		}),
+	})
+	require.NoError(t, err)
+	psSrv := ca.serve(t, psHost, ps)
+	addrs[psHost+":443"] = psSrv.Listener.Addr().String()
 
 	res, err := demo.NewResource(demo.ResourceConfig{Resource: resource, AgentProviders: []string{issuer}, ZeroIDIssuer: issuer, HTTPClient: client})
 	require.NoError(t, err)
 	resourceSrv := ca.serve(t, resourceHost, res)
 	addrs[resourceHost+":443"] = resourceSrv.Listener.Addr().String()
 
-	e := &env{zeroidURL: issuer, client: client, idp: idp,
+	e := &env{zeroidURL: issuer, srv: srv, psStore: psStore, client: client, idp: idp,
 		headers: map[string]string{"X-Account-ID": "acct-interop", "X-Project-ID": "proj-interop"},
 		sub:     "system:serviceaccount:agents:planner"}
 	e.seed(t)
@@ -251,6 +311,7 @@ func (e *env) seed(t *testing.T) {
 		"name": "aauth", "allowed_grant_types": []string{"aauth_agent", "aauth_bridge", "aauth_subagent"},
 		"allowed_scopes": []string{"tools:read"}, "max_ttl_seconds": 3600,
 	}, http.StatusCreated)
+	e.policyID = policy["id"].(string)
 	identity := e.admin(t, http.MethodPost, "/identities", map[string]any{
 		"external_id": "planner", "identity_type": "agent", "trust_level": "unverified",
 		"owner_user_id": "user-1", "credential_policy_id": policy["id"],

@@ -156,6 +156,9 @@ type CreatePolicyRequest struct {
 	RequiredPrincipalType string
 	// UserGrantScopes caps what the identity may hold for a person.
 	UserGrantScopes []string
+	// AAuthPersonServer is the AAuth person server of the agents the policy
+	// governs: an AAuth server identifier, or empty for none.
+	AAuthPersonServer string
 }
 
 // CreatePolicy creates a new credential policy.
@@ -192,6 +195,9 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 	if err := validateRequiredPrincipalType(req.RequiredPrincipalType); err != nil {
 		return nil, err
 	}
+	if err := validateAAuthPersonServer(req.AAuthPersonServer); err != nil {
+		return nil, err
+	}
 
 	policy := &domain.CredentialPolicy{
 		ID:                    uuid.New().String(),
@@ -212,6 +218,7 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 		JWTTyp:                req.JWTTyp,
 		RequiredPrincipalType: req.RequiredPrincipalType,
 		UserGrantScopes:       req.UserGrantScopes,
+		AAuthPersonServer:     req.AAuthPersonServer,
 		CreatedAt:             time.Now(),
 		UpdatedAt:             time.Now(),
 	}
@@ -303,6 +310,8 @@ type UpdatePolicyRequest struct {
 	RequiredPrincipalType *string
 	// UserGrantScopes: nil leaves it unchanged; an empty list clears it.
 	UserGrantScopes []string
+	// AAuthPersonServer: nil leaves it unchanged; "" clears it.
+	AAuthPersonServer *string
 }
 
 // UpdatePolicy updates mutable fields of an existing credential policy.
@@ -367,6 +376,12 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 			return nil, err
 		}
 		policy.RequiredPrincipalType = *req.RequiredPrincipalType
+	}
+	if req.AAuthPersonServer != nil {
+		if err := validateAAuthPersonServer(*req.AAuthPersonServer); err != nil {
+			return nil, err
+		}
+		policy.AAuthPersonServer = *req.AAuthPersonServer
 	}
 	if req.UserGrantScopes != nil {
 		policy.UserGrantScopes = req.UserGrantScopes
@@ -631,6 +646,18 @@ func scopeCeiling(policy *domain.CredentialPolicy, req EnforcePolicyRequest) []s
 // may set today. "owner" needs the personal-agent profile (the agent's owner
 // bound to a linked IdP identity), which ships later, so it is refused rather
 // than stored as a requirement nothing can satisfy correctly.
+// validateAAuthPersonServer accepts an AAuth server identifier or empty. The
+// value becomes the ps claim and the host ZeroID sends revocations to.
+func validateAAuthPersonServer(v string) error {
+	if v == "" {
+		return nil
+	}
+	if _, err := domain.ValidateServerIdentifier(v); err != nil {
+		return fmt.Errorf("%w: aauth_person_server must be an AAuth server identifier (https, host only, lower case): %v", ErrInvalidPolicyField, err)
+	}
+	return nil
+}
+
 func validateRequiredPrincipalType(v string) error {
 	switch v {
 	case domain.RequirePrincipalAny, domain.RequirePrincipalUser:

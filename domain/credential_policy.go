@@ -1,6 +1,9 @@
 package domain
 
 import (
+	"errors"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/uptrace/bun"
@@ -99,9 +102,15 @@ type CredentialPolicy struct {
 	// extra cap: the person's own grant bounds the chain. Applied only where
 	// that grant is itself bounded (a delegated user chain, ID-JAG,
 	// authorization_code and refresh); see IssueRequest.UserGrantBounded.
-	UserGrantScopes []string  `bun:"user_grant_scopes,array" json:"user_grant_scopes,omitempty"`
-	CreatedAt       time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt       time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+	UserGrantScopes []string `bun:"user_grant_scopes,array" json:"user_grant_scopes,omitempty"`
+	// AAuthPersonServer is the AAuth person server of the agents this policy
+	// governs: the ps claim of the agent tokens they are issued, and where
+	// ZeroID revokes those tokens (protocol draft, "Token Revocation"). An
+	// AAuth server identifier (https, host only), or empty for agents with
+	// no person server.
+	AAuthPersonServer string    `bun:"aauth_person_server,type:text,nullzero" json:"aauth_person_server,omitempty"`
+	CreatedAt         time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt         time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
 }
 
 // Access token `typ` header values a credential policy may choose.
@@ -127,4 +136,24 @@ func (p *CredentialPolicy) IsExpired() bool {
 		return false
 	}
 	return !time.Now().Before(*p.ExpiresAt)
+}
+
+// ValidateServerIdentifier checks s against the AAuth server identifier rules
+// (https, scheme and host only: no port, path, query, fragment, userinfo or
+// trailing slash, lower case) and returns its host.
+func ValidateServerIdentifier(s string) (string, error) {
+	u, err := url.Parse(s)
+	switch {
+	case err != nil:
+		return "", err
+	case u.Scheme != "https":
+		return "", errors.New("not https")
+	case u.Host == "" || u.Port() != "" || strings.Contains(u.Host, ":"):
+		return "", errors.New("no host, or a port")
+	case u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || strings.HasSuffix(s, "/") || strings.Contains(s, "?") || strings.Contains(s, "#"):
+		return "", errors.New("more than scheme and host")
+	case s != strings.ToLower(s):
+		return "", errors.New("not lower case")
+	}
+	return u.Host, nil
 }

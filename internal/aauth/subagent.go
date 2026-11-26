@@ -232,7 +232,7 @@ func (p *Provider) subagent(ctx context.Context, parent *agentClaims, body []byt
 		DPoPKeyThumbprint:   childJKT,
 		AgentTokenSigner: func(jti string, iat, exp time.Time) (string, error) {
 			return p.key.sign(p.cfg.Issuer, sub, child, jti, iat, exp,
-				tokenExtras{PS: parent.PS, ParentAgent: parent.Subject})
+				tokenExtras{PS: parent.PS, ParentAgent: parent.Subject}) // ps copied from the parent
 		},
 	})
 	if err != nil {
@@ -259,6 +259,9 @@ func (p *Provider) subagent(ctx context.Context, parent *agentClaims, body []byt
 			return "", 0, fmt.Errorf("re-checking the parent's agent token: %w", err)
 		}
 		return "", 0, sigErr(ErrCodeRevokedJWT, "the parent's agent token was revoked during issuance")
+	}
+	if err := p.trackForPersonServer(bctx, issuedRow, parent.PS); err != nil {
+		return "", 0, err
 	}
 	return issued.AccessToken, issued.ExpiresIn, nil
 }
