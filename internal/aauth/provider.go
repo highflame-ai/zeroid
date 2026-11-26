@@ -68,6 +68,10 @@ type Config struct {
 	// MaxLiveSubagents bounds one parent agent token's live sub-agent
 	// tokens. Zero means DefaultMaxLiveSubagents.
 	MaxLiveSubagents int
+	// RequestsPerMinute bounds one workload subject's /ap/token requests and
+	// one parent's /ap/subagent requests. Zero means
+	// DefaultRequestsPerMinute.
+	RequestsPerMinute int
 	// Metadata are optional display members of the metadata document
 	// (description, logo_uri, logo_dark_uri, documentation_uri, tos_uri,
 	// policy_uri), validated by the caller. Empty values are left out.
@@ -96,6 +100,7 @@ type Provider struct {
 	redemptions *redemptions
 	db          *bun.DB
 	psClient    *http.Client
+	limits      *limiter
 	now         func() time.Time
 }
 
@@ -135,6 +140,7 @@ func New(cfg Config, deps Deps) (*Provider, error) {
 		psClient:    deps.PersonServerClient,
 		now:         time.Now,
 	}
+	p.limits = newLimiter(cfg.RequestsPerMinute, func() time.Time { return p.now() })
 	p.registerBridge(deps.OAuth)
 	return p, nil
 }
@@ -334,6 +340,12 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 			return "", 0, failure
 		}
 		return "", 0, notAccepted(err)
+	}
+
+	// Limited per workload subject once the attestation has verified, and
+	// before anything is claimed or spent: a limited request changes nothing.
+	if ok, wait := p.limits.allow("token:" + wa.Entry.Row.Issuer + "\x00" + wa.Subject); !ok {
+		return "", 0, rateLimited(wait)
 	}
 
 	// Bookkeeping after the claim must outlive the request: a client that

@@ -59,6 +59,12 @@ type aauthFed struct {
 
 func newAAuthFed(t *testing.T, grantTypes ...string) *aauthFed {
 	t.Helper()
+	return newAAuthFedWith(t, nil, grantTypes...)
+}
+
+// newAAuthFedWith is newAAuthFed with mutate applied to the server config.
+func newAAuthFedWith(t *testing.T, mutate func(*zeroid.Config), grantTypes ...string) *aauthFed {
+	t.Helper()
 	if len(grantTypes) == 0 {
 		grantTypes = []string{"aauth_agent", "aauth_bridge", "client_credentials"}
 	}
@@ -68,7 +74,7 @@ func newAAuthFed(t *testing.T, grantTypes ...string) *aauthFed {
 	t.Cleanup(idpSrv.Close)
 	idp.SetBaseURL(idpSrv.URL)
 	f := &dbFederation{idp: idp, idpSrv: idpSrv, members: map[string]string{}}
-	f.srv, f.http = newAAuthServer(t)
+	f.srv, f.http = newAAuthServer(t, mutate)
 
 	w := &workloadFed{f: f, tn: newTITenant(t)}
 	w.policy = createRichCredentialPolicy(t, map[string]any{
@@ -106,7 +112,7 @@ func newAAuthFed(t *testing.T, grantTypes ...string) *aauthFed {
 var aauthDialOverrides sync.Map
 
 // newAAuthServer is newDBFederationServer with the Agent Provider on.
-func newAAuthServer(t *testing.T) (*zeroid.Server, *httptest.Server) {
+func newAAuthServer(t *testing.T, mutate func(*zeroid.Config)) (*zeroid.Server, *httptest.Server) {
 	t.Helper()
 	require.NoError(t, initFederationKeyMaterial())
 	_, apKey, err := ed25519.GenerateKey(rand.Reader)
@@ -134,6 +140,9 @@ func newAAuthServer(t *testing.T) (*zeroid.Server, *httptest.Server) {
 		WIMSEDomain: testWIMSE,
 		Federation:  zeroid.FederationConfig{IssuerStore: "db", AllowPrivateEndpoints: true},
 		AAuth:       zeroid.AAuthConfig{Enabled: true, SigningKeyPath: keyPath, Name: "ZeroID test AP", LogoURI: "https://zeroid.test/logo.svg"},
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	insecure := &http.Client{
 		Timeout: 5 * time.Second,
@@ -687,7 +696,7 @@ func newAAuthFirstContactFed(t *testing.T, settings func(fcTenant) map[string]an
 	t.Cleanup(idpSrv.Close)
 	idp.SetBaseURL(idpSrv.URL)
 	f := &dbFederation{idp: idp, idpSrv: idpSrv, members: map[string]string{}}
-	f.srv, f.http = newAAuthServer(t)
+	f.srv, f.http = newAAuthServer(t, nil)
 
 	tn := newFCTenant(t)
 	createRichCredentialPolicy(t, map[string]any{
@@ -1112,5 +1121,27 @@ func TestAAuthPersonServer(t *testing.T) {
 		require.NoError(t, err)
 		revoked, _, _, _ := psB.state()
 		assert.Contains(t, revoked, decodeJWTPayload(t, res.body["agent_token"].(string))["jti"])
+	})
+}
+
+func TestAAuthRateLimits(t *testing.T) {
+	a := newAAuthFedWith(t, func(c *zeroid.Config) { c.AAuth.RequestsPerMinute = 3 }, "aauth_agent", "aauth_subagent")
+
+	t.Run("one workload subject's enrollments are limited, without spending its attestation", func(t *testing.T) {
+		var last apResponse
+		for i := 0; i < 4; i++ {
+			last = a.bootstrap(t, newAgentKey(t), a.assertion(t, nil))
+		}
+		assert.Equal(t, http.StatusTooManyRequests, last.status, "body=%v", last.body)
+		assert.Equal(t, "rate_limited", last.body["error"])
+		assert.NotEmpty(t, last.headers.Get("Retry-After"))
+		assert.Empty(t, last.headers.Get("Signature-Error"), "the signature verified; this is not a signature failure")
+
+		// Another workload subject has its own limit.
+		other := "system:serviceaccount:agents:" + uid("other")
+		status, body := a.f.bind(t, a.tn, a.rowID, other, a.agent, false)
+		require.Equal(t, http.StatusCreated, status, "bind: %v", body)
+		res := a.bootstrap(t, newAgentKey(t), a.assertion(t, map[string]any{"sub": other}))
+		assert.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
 	})
 }

@@ -121,6 +121,10 @@ type AAuthConfig struct {
 	// MaxLiveSubagents bounds one agent token's live sub-agent tokens
 	// (POST /ap/subagent). 0 means 16.
 	MaxLiveSubagents int `koanf:"max_live_subagents"`
+	// RequestsPerMinute bounds one workload subject's /ap/token requests and
+	// one parent agent's /ap/subagent requests, per ZeroID instance. 0 means
+	// 60.
+	RequestsPerMinute int `koanf:"requests_per_minute"`
 	// Optional display members of /.well-known/aauth-agent.json. A person
 	// server shows the name and logo when a person approves an agent. URLs
 	// must be https.
@@ -1076,6 +1080,9 @@ func (c *Config) Validate() error {
 		if t := c.AAuth.AgentTokenTTLSeconds; t != 0 && (t <= 300 || t > 3600) {
 			return fmt.Errorf("aauth.agent_token_ttl_seconds must be over 300 and at most 3600, got %d", t)
 		}
+		if c.AAuth.RequestsPerMinute < 0 {
+			return fmt.Errorf("aauth.requests_per_minute must be 0 (the default, 60) or more, got %d", c.AAuth.RequestsPerMinute)
+		}
 		if c.AAuth.MaxLiveSubagents < 0 || c.AAuth.MaxLiveSubagents > 1000 {
 			return fmt.Errorf("aauth.max_live_subagents must be 0 (the default, 16) to 1000, got %d", c.AAuth.MaxLiveSubagents)
 		}
@@ -1580,6 +1587,7 @@ var envMapping = map[string]string{
 	"ZEROID_AAUTH_SIGNING_KEY_ID":               "aauth.signing_key_id",
 	"ZEROID_AAUTH_AGENT_TOKEN_TTL_SECONDS":      "aauth.agent_token_ttl_seconds",
 	"ZEROID_AAUTH_NAME":                         "aauth.name",
+	"ZEROID_AAUTH_REQUESTS_PER_MINUTE":          "aauth.requests_per_minute",
 	"ZEROID_AAUTH_MAX_LIVE_SUBAGENTS":           "aauth.max_live_subagents",
 	"ZEROID_AAUTH_DESCRIPTION":                  "aauth.description",
 	"ZEROID_AAUTH_LOGO_URI":                     "aauth.logo_uri",

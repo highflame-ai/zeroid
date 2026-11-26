@@ -110,6 +110,9 @@ func (p *Provider) handleSubagent(w http.ResponseWriter, r *http.Request) {
 			if refusal.status != 0 {
 				status = refusal.status
 			}
+			if refusal.retryAfter > 0 {
+				w.Header().Set("Retry-After", fmt.Sprint(refusal.retryAfter))
+			}
 			writeError(w, status, refusal.code, refusal.description)
 			return
 		}
@@ -128,6 +131,9 @@ func (p *Provider) subagent(ctx context.Context, parent *agentClaims, body []byt
 	// also has a parent row).
 	if parent.ParentAgent != "" {
 		return "", 0, &bootstrapRefusal{code: "denied", description: "a sub-agent may not have sub-agents"}
+	}
+	if ok, wait := p.limits.allow("subagent:" + parent.Subject); !ok {
+		return "", 0, rateLimited(wait)
 	}
 	// The row, not only the signature: a revoked or unknown parent is
 	// refused, fail closed on a storage error.
