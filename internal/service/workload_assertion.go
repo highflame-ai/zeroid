@@ -226,8 +226,7 @@ type WorkloadGrant struct {
 
 // ResolveWorkloadGrant narrows requestedScope to identity's policy and row
 // ceilings. With neither set it refuses: a workload with no scope limit would
-// otherwise be issued whatever the request names, nhi:manage included
-// (highflame-authn#317).
+// otherwise be issued whatever the request names, nhi:manage included.
 func (s *OAuthService) ResolveWorkloadGrant(ctx context.Context, identity *domain.Identity, requestedScope string) (*WorkloadGrant, error) {
 	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
 	if err != nil {

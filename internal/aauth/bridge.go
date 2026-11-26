@@ -16,8 +16,8 @@ import (
 
 // The bridge grant exchanges an AAuth agent token for an OAuth access token,
 // so an agent that holds only an AAuth identity can call a resource that only
-// speaks OAuth (MCP servers today). It is the interim, Highflame-internal
-// edge: AAuth inside, OAuth at the boundary. The AAuth-native edges are a
+// speaks OAuth (MCP servers today). It is a ZeroID extension, not part of
+// AAuth: AAuth inside, OAuth at the boundary, while resources catch up. The AAuth-native edges are a
 // resource that verifies agent tokens itself, and a gateway that does it for
 // one.
 //
