@@ -10,7 +10,7 @@ go 1.27.0
 require (
 	github.com/aauth-dev/aauth-go v0.3.1-0.20261026233316-ae3796e3d778
 	github.com/highflame-ai/zeroid v0.0.0-00010101000000-000000000000
-	github.com/highflame-ai/zeroid/pkg/dpop v1.30.0
+	github.com/highflame-ai/zeroid/pkg/dpop v1.33.0
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
@@ -47,7 +47,7 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.20.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
-	github.com/highflame-ai/zeroid/pkg/jwks v1.30.0 // indirect
+	github.com/highflame-ai/zeroid/pkg/jwks v1.33.0 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/knadh/koanf/maps v0.1.2 // indirect
