@@ -195,10 +195,10 @@ const defaultExternalPrincipalRefreshTokenTTL = 12 * 3600
 var reservedClaims = map[string]bool{
 	// RFC 7519 registered claims
 	"iss": true, "sub": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
-	// RFC 8707 resource binding. Shield reads `resource` as proof that ZeroID
-	// recorded a resource restriction AT THE MINT and enforces INV-IDN-006 on
-	// it — so the claim only means that if ZeroID is the only party who can set
-	// it. Reserving it keeps the presence of the claim load-bearing: a caller
+	// RFC 8707 resource binding. A resource server reads `resource` as proof
+	// that ZeroID recorded a resource restriction AT THE MINT and enforces the
+	// binding on it — so the claim only means that if ZeroID is the only party
+	// who can set it. Reserving it keeps the presence of the claim load-bearing: a caller
 	// must never be able to make a token look resource-bound when it isn't, or
 	// to widen a real binding by overriding it through additional_claims.
 	"resource": true,
@@ -252,9 +252,9 @@ var reservedClaims = map[string]bool{
 	// trusted-service caller that legitimately sets it. That pre-existing gap
 	// is worth its own change rather than being smuggled into this one.
 	"client_id": true,
-	// Step-up approvals (RFC 9396). Shield honours a `highflame_tool_call`
-	// entry in `authorization_details` only on a CIBA-minted token, and only
-	// when its `approval_id` names a challenge Shield raised — but the claim
+	// Step-up approvals (RFC 9396). A policy decision point may honour an
+	// `authorization_details` entry only on a CIBA-minted token, and only
+	// when its `approval_id` names a challenge it raised — but the claim
 	// must still never be writable through additional_claims, or a token
 	// from another grant could carry an approval nobody gave. ZeroID writes
 	// it only on the CIBA path, from the approved request row
@@ -263,9 +263,9 @@ var reservedClaims = map[string]bool{
 	// caller can mint a look-alike.
 	"authorization_details": true,
 	"approval_id":           true,
-	// Agent provenance. Shield projects `origin`, `agent_idp_iss` and
-	// `agent_idp_parent` into context.principal / context.actor, where
-	// policies use them to tell native agents from IdP-registered ones
+	// Agent provenance. A policy decision point may project `origin`,
+	// `agent_idp_iss` and `agent_idp_parent` into its principal and actor
+	// context, where policies use them to tell native agents from IdP-registered ones
 	// (e.g. "forbid unless origin == native", or trusting one IdP tenant).
 	// ZeroID does not mint them yet; until it does from the identity row,
 	// nothing may set them, or a caller with an id_token exchange could
@@ -796,7 +796,7 @@ type TokenRequest struct {
 	// form-encoded request may repeat the parameter (RFC 8707 §2).
 	//
 	// It only ever NARROWS. The values are stamped as the token's `aud` AND as
-	// the reserved `resource` claim that Shield enforces INV-IDN-006 on, and
+	// the reserved `resource` claim that a resource server enforces the binding on, and
 	// grant no authority the grant did not already carry — which is why an
 	// arbitrary caller-supplied identifier is safe to accept without a registry
 	// of known resource servers.
@@ -2818,7 +2818,7 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 	// same posture checkAuthorizeClientPolicy takes above: a programmatic
 	// caller supplying a pre-resolved Client cannot skip a gate, and a
 	// ceiling is a security claim — a value that reaches the "rsc" claim
-	// unvalidated is one Shield will later enforce on.
+	// unvalidated is one a resource server will later enforce on.
 	resources, err := ValidateAuthorizeResource(req.Resources)
 	if err != nil {
 		return "", err
@@ -4481,11 +4481,10 @@ func identityScopeCeilings(policy *domain.CredentialPolicy, identity *domain.Ide
 // When any ceiling restricts and nothing survives, the grant is refused with
 // invalid_scope whether or not the caller named a scope. Minting anyway would
 // produce a token with no `scopes` claim, because IssueCredential omits the
-// claim and skips its own scope checks when the set is empty. Downstream
-// (Shield's checkScopeCeiling) reads an absent claim as "no ceiling to
-// check", so a disjoint pair of ceilings would otherwise mint an
-// unrestricted token. Only an identity with no ceiling anywhere still gets
-// the legacy scopeless token on an omitted request.
+// claim and skips its own scope checks when the set is empty, so a request
+// whose ceilings excluded everything would succeed as if it had asked for
+// nothing. Only an identity with no ceiling anywhere still gets the legacy
+// scopeless token on an omitted request.
 func grantScopes(requestedRaw string, ceilings ...[]string) ([]string, error) {
 	scopes := parseScopeString(requestedRaw)
 	seeded := len(scopes) > 0
@@ -4512,11 +4511,9 @@ func grantScopes(requestedRaw string, ceilings ...[]string) ([]string, error) {
 // narrowing and IssueCredential's "if len(req.Scopes) > 0" claim-omission
 // (credential.go): when a caller explicitly names a scope and every named
 // scope gets intersected away, minting anyway produces a token with no
-// `scopes` claim at all — indistinguishable downstream from a legacy token
-// that predates the scopes feature. Shield's checkScopeCeiling deliberately
-// treats an absent claim as "check not applicable" for that legacy case (see
-// its own comment), so a caller could otherwise escalate past its ceiling
-// simply by naming a scope it does not hold.
+// `scopes` claim at all — indistinguishable to a resource server from a
+// legacy token that predates the scopes feature, and a request that named a
+// scope it does not hold would succeed instead of being refused.
 //
 // Mirrors tokenExchange's existing "len(scopes) == 0 -> invalid_scope"
 // safety net (this file, tokenExchange). Used by IssueAuthCode's single
