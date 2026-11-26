@@ -179,8 +179,10 @@ func (p *Provider) subagent(ctx context.Context, parent *agentClaims, body []byt
 	}
 	sub := "aauth:" + local + "+" + disc + "@" + p.authority
 
-	// ponytail: count then issue, so concurrent requests can pass the cap by
-	// a few; a row lock on the parent if the bound must be exact.
+	// ponytail: best effort. Count then issue, so a burst of concurrent
+	// requests can pass the cap by its concurrency (the per-parent rate limit
+	// bounds that); an advisory lock on the parent jti, held in issuance's
+	// transaction, if the bound must be exact.
 	live, err := p.liveSubagents(ctx, parent.JTI, now)
 	if err != nil {
 		return "", 0, err
@@ -234,8 +236,9 @@ func (p *Provider) subagent(ctx context.Context, parent *agentClaims, body []byt
 		},
 	})
 	if err != nil {
-		if errors.Is(err, service.ErrPolicyViolation) || errors.Is(err, domain.ErrIdentityNotUsable) ||
-			errors.Is(err, domain.ErrIdentityExpired) {
+		if errors.Is(err, service.ErrPolicyViolation) || errors.Is(err, service.ErrScopesNotAllowed) ||
+			errors.Is(err, domain.ErrIdentityNotUsable) || errors.Is(err, domain.ErrIdentityExpired) ||
+			errors.Is(err, domain.ErrCredentialExpired) {
 			return "", 0, &bootstrapRefusal{code: "denied", description: err.Error(), cause: err}
 		}
 		return "", 0, fmt.Errorf("issuing the sub-agent token: %w", err)
