@@ -292,7 +292,7 @@ func TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingT
 	})
 }
 
-// TestProperty_NarrowScopes_SubsetOfBoth: narrowScopes keeps only scopes of the grant, and only those a restricting ceiling lists.
+// TestProperty_NarrowScopes_SubsetOfBoth: narrowScopes keeps only scopes of the grant, and only those a restricting ceiling lists, in the grant's order.
 func TestProperty_NarrowScopes_SubsetOfBoth(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		granted := propScopeList().Draw(t, "granted")
@@ -312,6 +312,11 @@ func TestProperty_NarrowScopes_SubsetOfBoth(t *testing.T) {
 			if slices.Contains(ceiling, s) && !slices.Contains(got, s) {
 				t.Fatalf("narrowScopes(%v, %v) = %v dropped %s, which both allow", granted, ceiling, got, s)
 			}
+		}
+		// It filters the grant, so the order and repeats of what it keeps are
+		// the grant's, and the token's scopes claim does not vary run to run.
+		if want := slices.DeleteFunc(slices.Clone(granted), func(s string) bool { return len(ceiling) > 0 && !slices.Contains(ceiling, s) }); !slices.Equal(got, want) {
+			t.Fatalf("narrowScopes(%v, %v) = %v, want the grant filtered in order, %v", granted, ceiling, got, want)
 		}
 	})
 }
@@ -442,16 +447,17 @@ func TestProperty_RevocationLookupOrder_SearchesEveryKindHintFirst(t *testing.T)
 func TestProperty_MayActPermits_OnlyTheNamedActorUnderOurIssuer(t *testing.T) {
 	const issuer = "https://zeroid.test"
 	actors := []string{"spiffe://zeroid.test/a/p/agent/b", "spiffe://zeroid.test/a/p/agent/c", ""}
-	// Values that differ from an actor or the issuer only in case, or are a
-	// prefix of every actor, so an inexact comparison permits them.
-	nearMisses := []string{"spiffe://zeroid.test/a/p/agent/B", "spiffe://zeroid.test/a/p/agent/", "https://ZeroID.test", "https://elsewhere.test"}
-	// Half the draws are the value that would permit, so the other members
-	// decide the outcome often enough to be tested.
-	claimValue := func(permitting string) *rapid.Generator[any] {
+	// Two draws in five are the value that would permit, so the other members
+	// decide the outcome often enough to be tested, and one is a near miss:
+	// it differs only in case or is a prefix, so an inexact comparison
+	// permits it.
+	claimValue := func(permitting string, nearMisses ...string) *rapid.Generator[any] {
+		str := func(s string) any { return s }
 		return rapid.OneOf(
 			rapid.Just[any](permitting),
 			rapid.Just[any](permitting),
-			rapid.Map(rapid.SampledFrom(slices.Concat(actors, []string{issuer}, nearMisses)), func(s string) any { return s }),
+			rapid.Map(rapid.SampledFrom(nearMisses), str),
+			rapid.Map(rapid.SampledFrom(append(slices.Clone(actors), issuer, "https://elsewhere.test")), str),
 			rapid.SampledFrom([]any{nil, 42.0, true, map[string]any{"sub": actors[0]}, []any{actors[0]}}),
 		)
 	}
@@ -459,10 +465,10 @@ func TestProperty_MayActPermits_OnlyTheNamedActorUnderOurIssuer(t *testing.T) {
 		actor := rapid.SampledFrom(actors).Draw(t, "actor")
 		mayAct := map[string]any{}
 		if rapid.IntRange(0, 3).Draw(t, "hasSub") > 0 {
-			mayAct["sub"] = claimValue(actor).Draw(t, "sub")
+			mayAct["sub"] = claimValue(actor, "spiffe://zeroid.test/a/p/agent/B", "spiffe://zeroid.test/a/p/agent/").Draw(t, "sub")
 		}
 		if rapid.Bool().Draw(t, "hasIss") {
-			mayAct["iss"] = claimValue(issuer).Draw(t, "iss")
+			mayAct["iss"] = claimValue(issuer, "https://ZeroID.test", "https://zeroid.test/").Draw(t, "iss")
 		}
 
 		sub, _ := mayAct["sub"].(string)

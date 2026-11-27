@@ -21,11 +21,20 @@ func propS256Reference(verifier string) string {
 }
 
 // propCodeVerifier draws an RFC 7636 §4.1 verifier, 43 to 128 unreserved
-// characters, and sometimes any string at all.
+// characters, and sometimes one with whitespace added at an end, or any
+// string at all.
 func propCodeVerifier() *rapid.Generator[string] {
 	unreserved := []rune("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+	valid := rapid.StringOfN(rapid.SampledFrom(unreserved), 43, 128, -1)
 	return rapid.OneOf(
-		rapid.StringOfN(rapid.SampledFrom(unreserved), 43, 128, -1),
+		valid,
+		rapid.Custom(func(t *rapid.T) string {
+			pad := rapid.SampledFrom([]string{" ", "\t", "\n"}).Draw(t, "pad")
+			if rapid.Bool().Draw(t, "leading") {
+				return pad + valid.Draw(t, "padded")
+			}
+			return valid.Draw(t, "padded") + pad
+		}),
 		rapid.String(),
 	)
 }
@@ -46,7 +55,7 @@ func propFlipCase(t *rapid.T, s, label string) string {
 	return s[:i] + string(s[i]^0x20) + s[i+1:]
 }
 
-// TestProperty_VerifyCodeChallenge_AcceptsExactlyS256: verifyCodeChallenge accepts a challenge iff it equals the reference S256 of the verifier, so plain, padded, standard-alphabet, case-folded, truncated, extended and altered challenges are all refused.
+// TestProperty_VerifyCodeChallenge_AcceptsExactlyS256: verifyCodeChallenge accepts a challenge iff it equals the reference S256 of the verifier, so plain, padded, standard-alphabet, case-folded, truncated, extended and altered challenges, and the challenge of the verifier with its whitespace trimmed, are all refused.
 func TestProperty_VerifyCodeChallenge_AcceptsExactlyS256(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		verifier := propCodeVerifier().Draw(t, "verifier")
@@ -54,7 +63,7 @@ func TestProperty_VerifyCodeChallenge_AcceptsExactlyS256(t *testing.T) {
 		sum := sha256.Sum256([]byte(verifier))
 
 		var challenge string
-		switch rapid.IntRange(0, 9).Draw(t, "form") {
+		switch rapid.IntRange(0, 10).Draw(t, "form") {
 		case 0:
 			challenge = want
 		case 1:
@@ -77,6 +86,8 @@ func TestProperty_VerifyCodeChallenge_AcceptsExactlyS256(t *testing.T) {
 			challenge = want[:rapid.IntRange(0, len(want)-1).Draw(t, "cut")]
 		case 9:
 			challenge = want + rapid.SampledFrom([]string{"A", "-", "_", "=", " "}).Draw(t, "suffix")
+		case 10:
+			challenge = propS256Reference(strings.TrimSpace(verifier))
 		}
 
 		if got := verifyCodeChallenge(verifier, challenge); got != (challenge == want) {

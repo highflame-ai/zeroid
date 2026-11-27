@@ -267,6 +267,8 @@ func propRequestNear(t *rapid.T, policy *domain.CredentialPolicy) EnforcePolicyR
 		if policy.RequiredAttestation != "" {
 			req.AttestationLevel = propJustBelow(t, propAttestations, policy.RequiredAttestation, propAttestationRank, []string{"", "tpm", "Hardware"}, "near.attestation")
 		}
+	case 12:
+		req.Scopes = append(slices.Clone(req.Scopes), propScope().Draw(t, "near.extra_scope"))
 	}
 	return req
 }
