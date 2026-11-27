@@ -30,7 +30,23 @@ func propCodeVerifier() *rapid.Generator[string] {
 	)
 }
 
-// TestProperty_VerifyCodeChallenge_AcceptsExactlyS256: verifyCodeChallenge accepts a challenge iff it equals the reference S256 of the verifier, so plain, padded, standard-alphabet and altered challenges are all refused.
+// propFlipCase changes the case of one letter of s, or returns s when it has
+// none.
+func propFlipCase(t *rapid.T, s, label string) string {
+	var letters []int
+	for i := 0; i < len(s); i++ {
+		if c := s[i] | 0x20; 'a' <= c && c <= 'z' {
+			letters = append(letters, i)
+		}
+	}
+	if len(letters) == 0 {
+		return s
+	}
+	i := rapid.SampledFrom(letters).Draw(t, label)
+	return s[:i] + string(s[i]^0x20) + s[i+1:]
+}
+
+// TestProperty_VerifyCodeChallenge_AcceptsExactlyS256: verifyCodeChallenge accepts a challenge iff it equals the reference S256 of the verifier, so plain, padded, standard-alphabet, case-folded, truncated, extended and altered challenges are all refused.
 func TestProperty_VerifyCodeChallenge_AcceptsExactlyS256(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		verifier := propCodeVerifier().Draw(t, "verifier")
@@ -38,7 +54,7 @@ func TestProperty_VerifyCodeChallenge_AcceptsExactlyS256(t *testing.T) {
 		sum := sha256.Sum256([]byte(verifier))
 
 		var challenge string
-		switch rapid.IntRange(0, 6).Draw(t, "form") {
+		switch rapid.IntRange(0, 9).Draw(t, "form") {
 		case 0:
 			challenge = want
 		case 1:
@@ -55,6 +71,12 @@ func TestProperty_VerifyCodeChallenge_AcceptsExactlyS256(t *testing.T) {
 			challenge = propS256Reference(propCodeVerifier().Draw(t, "otherVerifier"))
 		case 6:
 			challenge = rapid.String().Draw(t, "random")
+		case 7:
+			challenge = propFlipCase(t, want, "caseFlip")
+		case 8:
+			challenge = want[:rapid.IntRange(0, len(want)-1).Draw(t, "cut")]
+		case 9:
+			challenge = want + rapid.SampledFrom([]string{"A", "-", "_", "=", " "}).Draw(t, "suffix")
 		}
 
 		if got := verifyCodeChallenge(verifier, challenge); got != (challenge == want) {
