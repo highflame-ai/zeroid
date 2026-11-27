@@ -23,11 +23,86 @@ func NewCredentialRepository(db *bun.DB) *CredentialRepository {
 // Create inserts a new issued credential. Participates in a caller-provided
 // transaction via postgres.WithTx(ctx, tx); falls through to a single
 // auto-commit insert otherwise.
+//
+// A delegated credential (ParentJTI set) is inserted only while its parent
+// and every credential above it are unrevoked: the chain is locked FOR SHARE
+// in the insert's transaction and re-read under the lock, and a revoked one
+// is ErrRevokedLineage. revoke_credential_cascade locks the token it revokes
+// before it walks the tokens below it (migration 073), so the two serialize:
+// either the revocation commits first and this insert is refused, or the
+// revocation waits for the insert to commit, and its walk then finds the new
+// credential and revokes it too.
 func (r *CredentialRepository) Create(ctx context.Context, cred *domain.IssuedCredential) error {
-	db := dbOrTx(ctx, r.db)
-	_, err := db.NewInsert().Model(cred).Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create credential: %w", err)
+	insert := func(ctx context.Context, db bun.IDB) error {
+		if cred.ParentJTI != "" {
+			if err := lockUnrevokedLineage(ctx, db, cred.ParentJTI); err != nil {
+				return err
+			}
+		}
+		if _, err := db.NewInsert().Model(cred).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to create credential: %w", err)
+		}
+		return nil
+	}
+	if cred.ParentJTI == "" {
+		return insert(ctx, dbOrTx(ctx, r.db))
+	}
+	if tx, ok := txFromContext(ctx); ok {
+		return insert(ctx, tx)
+	}
+	return r.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		return insert(ctx, tx)
+	})
+}
+
+// lockLineageSQL follows parent_jti up from one credential, as
+// credentialLineageSQL does, then locks every credential it reached FOR
+// SHARE, the root first. The rows are locked in the sorted order (LockRows
+// runs above the Sort), so every issuance takes them top-down, and one
+// waiting on a row has locked nothing below it. A row updated by a
+// transaction that committed while this one waited is returned as it now
+// is (READ COMMITTED re-reads a locked row), so is_revoked is current.
+const lockLineageSQL = `
+WITH RECURSIVE lineage(id, jti, parent_jti, depth) AS (
+	SELECT id, jti, parent_jti, 1
+	FROM issued_credentials
+	WHERE jti = ?
+	UNION ALL
+	SELECT ic.id, ic.jti, ic.parent_jti, lineage.depth + 1
+	FROM issued_credentials ic
+	JOIN lineage ON ic.jti = lineage.parent_jti
+	WHERE lineage.depth <= ?
+) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
+SELECT ic.is_revoked, lineage.depth, lineage.is_cycle
+FROM issued_credentials ic
+JOIN lineage ON ic.id = lineage.id
+ORDER BY lineage.depth DESC
+FOR SHARE OF ic`
+
+// lockUnrevokedLineage locks the credential parentJTI and every credential it
+// was delegated from for the rest of db's transaction, and returns
+// ErrRevokedLineage if any of them is revoked. A chain that loops or is longer
+// than MaxLineageDepth is ErrBrokenLineage, and a parent that does not exist
+// is an error: the caller read it moments ago.
+func lockUnrevokedLineage(ctx context.Context, db bun.IDB, parentJTI string) error {
+	var rows []struct {
+		IsRevoked bool `bun:"is_revoked"`
+		Depth     int  `bun:"depth"`
+		IsCycle   bool `bun:"is_cycle"`
+	}
+	if err := db.NewRaw(lockLineageSQL, parentJTI, MaxLineageDepth).Scan(ctx, &rows); err != nil {
+		return fmt.Errorf("lock the delegation chain above the new credential: %w", err)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("lock the delegation chain above the new credential: parent credential %s does not exist", parentJTI)
+	}
+	for _, row := range rows {
+		if row.IsCycle || row.Depth > MaxLineageDepth {
+			return ErrBrokenLineage
+		}
+		if row.IsRevoked {
+			return ErrRevokedLineage
+		}
 	}
 	return nil
 }

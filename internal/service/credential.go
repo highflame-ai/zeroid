@@ -1371,6 +1371,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 
 	if err := s.repo.Create(ctx, cred); err != nil {
+		if errors.Is(err, postgres.ErrRevokedLineage) {
+			return nil, nil, fmt.Errorf("%w: %w", domain.ErrCredentialAlreadyRevoked, err)
+		}
 		return nil, nil, fmt.Errorf("failed to persist credential: %w", err)
 	}
 

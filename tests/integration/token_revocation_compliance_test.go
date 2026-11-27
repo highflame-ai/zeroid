@@ -12,6 +12,8 @@
 package integration_test
 
 import (
+	"context"
+	"database/sql"
 	"net/http"
 	"testing"
 
@@ -78,6 +80,61 @@ func TestRFC7009_S2_2_RevokeIsIdempotent(t *testing.T) {
 	assert.Equal(t, http.StatusOK, r2.StatusCode,
 		"second revocation of same token MUST also 200 (idempotent)")
 	_ = r2.Body.Close()
+}
+
+// ── RFC 7009 §2.1 — Tokens delegated from the revoked token ───────────────
+
+func TestRFC7009_S2_1_TokenStoredDuringRevocationIsRevoked(t *testing.T) {
+	// RFC 7009 §2.1: "the revocation of a particular token may cause the
+	//   revocation of related tokens"; ZeroID revokes every token delegated
+	//   from it, and "the token cannot be used again after the revocation".
+	//   A token an exchange was storing below the revoked token when the
+	//   revocation began MUST be revoked by it.
+	//
+	// The test parks the exchange at its INSERT by holding issued_credentials
+	// in SHARE mode, which lets the exchange lock the rows above its token
+	// but not write its own. It then revokes the subject_token over RFC 7009,
+	// waits until the revocation is waiting for the exchange's transaction,
+	// and releases the table.
+	tn := newTenant(t, "")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+	root, _ := tn.workloadRoot(t, policyID, scopes)
+	actor := rlNewActor(t, tn, policyID, scopes)
+	ctx := context.Background()
+
+	tx, err := testDB.BeginTx(ctx, &sql.TxOptions{})
+	require.NoError(t, err)
+	defer tx.Rollback() //nolint:errcheck
+	_, err = tx.ExecContext(ctx, `LOCK TABLE issued_credentials IN SHARE MODE`)
+	require.NoError(t, err)
+
+	type result struct {
+		status int
+		body   map[string]any
+	}
+	done := make(chan result, 1)
+	go func() {
+		status, body := rlExchange(t, actor, scopes, root)
+		done <- result{status, body}
+	}()
+	t.Logf("exchange parked on: %.200s", rlWaitForLockWait(t, "issued_credentials", []string{"relation"}, done))
+
+	revoked := make(chan struct{})
+	go func() { rlRevoke(t, root); close(revoked) }()
+	t.Logf("revocation waits for the exchange: %.200s",
+		rlWaitForLockWait(t, "revoke_credential_cascade", []string{"transactionid", "tuple"}, revoked))
+
+	require.NoError(t, tx.Rollback())
+	r := <-done
+	<-revoked
+	require.Equal(t, http.StatusOK, r.status,
+		"the exchange locked its subject_token before the revocation, so it completes: %v", r.body)
+	child := r.body["access_token"].(string)
+	assert.True(t, rlRowRevoked(t, rlJTI(t, child)),
+		"the token stored while the revocation waited MUST be revoked with its subject_token")
+	assert.Equal(t, false, introspect(t, child)["active"])
+	assert.Empty(t, rlLiveBelowRevoked(t, tn))
 }
 
 // The post-condition that a revoked token introspects as `active=false`
