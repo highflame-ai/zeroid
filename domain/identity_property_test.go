@@ -41,8 +41,8 @@ var propStatuses = []IdentityStatus{
 	IdentityStatusSuspended, IdentityStatusDeactivated, IdentityStatusExpired,
 }
 
-// propStatus is mostly one of the six statuses, so a run covers most of the
-// 36 valid pairs, and otherwise a near-miss or arbitrary string.
+// propStatus is mostly one of the six statuses, and otherwise a near-miss or
+// arbitrary string.
 func propStatus() *rapid.Generator[IdentityStatus] {
 	valid := rapid.SampledFrom(propStatuses)
 	return rapid.OneOf(
@@ -64,6 +64,16 @@ func TestProperty_IdentityStatus_OnlyActiveIsUsable(t *testing.T) {
 
 // TestProperty_IdentityStatus_TransitionsMatchTheLifecycleDoc: CanTransitionTo allows exactly the documented transitions plus the two the doc leaves to its "…", and nothing from or to an invalid status.
 func TestProperty_IdentityStatus_TransitionsMatchTheLifecycleDoc(t *testing.T) {
+	// The 36 pairs of valid statuses are checked one by one: drawn at random,
+	// a single wrong edge went unseen on about one run in twenty.
+	for _, from := range propStatuses {
+		for _, to := range propStatuses {
+			e := lifecycleEdge{from, to}
+			if got, want := from.CanTransitionTo(to), documentedTransitions[e] || undocumentedTransitions[e]; got != want {
+				t.Fatalf("%q.CanTransitionTo(%q) = %v, want %v", from, to, got, want)
+			}
+		}
+	}
 	rapid.Check(t, func(t *rapid.T) {
 		e := lifecycleEdge{propStatus().Draw(t, "from"), propStatus().Draw(t, "to")}
 		want := documentedTransitions[e] || undocumentedTransitions[e]
