@@ -83,6 +83,39 @@ func TestCredentialPolicy_MaxDelegationDepthRangeOnUpdate(t *testing.T) {
 	}
 }
 
+// TestCredentialPolicy_PatchKeepsStoredOutOfRangeDepth: a policy stored with
+// an out-of-range max_delegation_depth (written before the range existed)
+// stays editable. A PATCH that omits the field works, and so does one that
+// sends the stored value back unchanged, as a client that PATCHes every
+// field of its edit form does. Setting a new out-of-range value is refused.
+func TestCredentialPolicy_PatchKeepsStoredOutOfRangeDepth(t *testing.T) {
+	tn := newTenant(t, "")
+	id := tn.policyWith(t, []string{"data:read"}, map[string]any{"max_delegation_depth": 3})
+	setInDB(t, "credential_policies", id, "max_delegation_depth = ?", 25)
+	patch := func(body map[string]any) (int, map[string]any) {
+		resp := doRequest(t, http.MethodPatch, adminPath("/credential-policies/"+id), body, tn.headers)
+		out := decode(t, resp)
+		_ = resp.Body.Close()
+		return resp.StatusCode, out
+	}
+
+	status, body := patch(map[string]any{"description": "omits the depth"})
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.EqualValues(t, 25, body["max_delegation_depth"], "an omitted depth is left as stored")
+
+	status, body = patch(map[string]any{"description": "repeats the depth", "max_delegation_depth": 25})
+	require.Equal(t, http.StatusOK, status, "repeating the stored value changes nothing and is not refused: %v", body)
+	assert.Equal(t, "repeats the depth", body["description"])
+	assert.EqualValues(t, 25, body["max_delegation_depth"])
+
+	status, body = patch(map[string]any{"max_delegation_depth": 20})
+	assert.Equal(t, http.StatusBadRequest, status, "a new out-of-range value is refused: %v", body)
+
+	status, body = patch(map[string]any{"max_delegation_depth": delegationDepthLimit})
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.EqualValues(t, delegationDepthLimit, body["max_delegation_depth"])
+}
+
 // exchangeWithKey exchanges subject for the actor that holds key, and returns
 // the response status and body.
 func exchangeWithKey(t *testing.T, subject string, key *ecdsa.PrivateKey, actorURI string, scopes []string) (int, map[string]any) {

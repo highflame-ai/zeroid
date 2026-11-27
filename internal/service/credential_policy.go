@@ -356,7 +356,10 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 		}
 		policy.RequiredAttestation = *req.RequiredAttestation
 	}
-	if req.MaxDelegationDepth != nil {
+	// The stored value sent back unchanged is not validated: a policy written
+	// before the range was enforced stays editable by a client that sends
+	// every field of its form, and EnforcePolicy holds it to the limit anyway.
+	if req.MaxDelegationDepth != nil && *req.MaxDelegationDepth != policy.MaxDelegationDepth {
 		if err := validateMaxDelegationDepth(*req.MaxDelegationDepth); err != nil {
 			return nil, err
 		}

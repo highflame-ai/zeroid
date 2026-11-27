@@ -517,7 +517,8 @@ that would exceed it **MUST** be rejected. `delegation_depth` is emitted as a
 claim only when &gt; 0 (Section 4.3).
 
 `max_delegation_depth` ranges from 0, which allows no delegation, to 15. Creating
-or updating a policy with a value outside that range is a `400`. Fifteen is the
+a policy with a value outside that range, or updating one to such a value, is a
+`400`. An update that sends the stored value back unchanged is accepted. Fifteen is the
 deepest chain whose `act` claim names every actor: the delegates, then the root
 grant's client, 16 in all (Section 4.1). Issuance also refuses any token past
 depth 15 with `policy_violation`, whatever its policies allow, so a policy stored

@@ -60,7 +60,7 @@ type UpdatePolicyInput struct {
 		AllowedScopes       []string `json:"allowed_scopes,omitempty" doc:"Permitted scopes"`
 		RequiredTrustLevel  *string  `json:"required_trust_level,omitempty" doc:"Required trust level"`
 		RequiredAttestation *string  `json:"required_attestation,omitempty" doc:"Required attestation level"`
-		MaxDelegationDepth  *int     `json:"max_delegation_depth,omitempty" doc:"Max delegation depth, from 0 (no delegation) to 15. A value outside that range is a 400."`
+		MaxDelegationDepth  *int     `json:"max_delegation_depth,omitempty" doc:"Max delegation depth, from 0 (no delegation) to 15. Changing it to a value outside that range is a 400; sending the stored value back unchanged is accepted."`
 		IsActive            *bool    `json:"is_active,omitempty" doc:"Active status"`
 		// ExpiresAt tri-state: omit to leave unchanged, "" to clear (no expiry),
 		// RFC3339 string to set.
