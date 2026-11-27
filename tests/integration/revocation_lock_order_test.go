@@ -341,6 +341,135 @@ func TestOverlappingCascadesDoNotDeadlock(t *testing.T) {
 	}
 }
 
+// TestCrossDelegatedCascadesDoNotDeadlock revokes two trees at once whose
+// tokens are each inside the other's walk, in two shapes:
+//
+//   - "mutual": two agents that delegate to each other. X's root R1 → M1 of Y,
+//     and Y's root R2 → M2 of X. X's cascade walks R1, M1 and M2; Y's walks
+//     R2, M2 and M1.
+//   - "returns": a chain that comes back to the agent it started from. R of X
+//     → M of Y → K of X, raced against RFC 7009's cascade of M.
+//
+// A cascade that locks only its own tokens before it walks takes M2 (or K)
+// in its first statement, while the other cascade holds M1 (or M) and its
+// walk then wants M2 (or K). Each waits for the other, every time.
+//
+// A transaction holds the shared tokens FOR SHARE, as an issuance below them
+// would, until both cascades wait on it, so both start from the same point.
+// Each cascade runs in a transaction of the test's, where it is not retried.
+func TestCrossDelegatedCascadesDoNotDeadlock(t *testing.T) {
+	repo := postgres.NewCredentialRepository(testDB)
+	inTx := func(fn func(ctx context.Context) error) error {
+		return testDB.RunInTx(context.Background(), nil, func(ctx context.Context, tx bun.Tx) error {
+			return fn(postgres.WithTx(ctx, tx))
+		})
+	}
+	identityCascade := func(identityID string) func(ctx context.Context) error {
+		return func(ctx context.Context) error {
+			_, err := repo.RevokeAllActiveForIdentity(ctx, identityID, "cross_delegation_test")
+			return err
+		}
+	}
+	leaves := func(tn hrdTenant, parentJTI string) {
+		_, err := testDB.ExecContext(context.Background(), `
+			INSERT INTO issued_credentials (id, account_id, project_id, jti, subject, expires_at, parent_jti, grant_type)
+			SELECT gen_random_uuid(), ?, ?, gen_random_uuid()::text, 'cross', NOW() + interval '1 hour', ?, 'token_exchange'
+			FROM generate_series(1, 50)`, tn.account, tn.project, parentJTI)
+		require.NoError(t, err)
+	}
+	// Each shape builds its tree and returns the tokens to hold and the two
+	// cascades to race.
+	shapes := map[string]func(tn hrdTenant, policyID string) (held []string, a, b func(ctx context.Context) error){
+		"mutual": func(tn hrdTenant, policyID string) ([]string, func(ctx context.Context) error, func(ctx context.Context) error) {
+			xID, yID := rlIdentity(t, tn, policyID), rlIdentity(t, tn, policyID)
+			_, r1 := rlCred(t, tn, "", xID, "cross")
+			_, r2 := rlCred(t, tn, "", yID, "cross")
+			_, m1 := rlCred(t, tn, r1, yID, "cross")
+			_, m2 := rlCred(t, tn, r2, xID, "cross")
+			leaves(tn, m1)
+			leaves(tn, m2)
+			return []string{m1, m2}, identityCascade(xID), identityCascade(yID)
+		},
+		"returns": func(tn hrdTenant, policyID string) ([]string, func(ctx context.Context) error, func(ctx context.Context) error) {
+			xID, yID := rlIdentity(t, tn, policyID), rlIdentity(t, tn, policyID)
+			_, r := rlCred(t, tn, "", xID, "cross")
+			mID, m := rlCred(t, tn, r, yID, "cross")
+			_, k := rlCred(t, tn, m, xID, "cross")
+			leaves(tn, k)
+			return []string{m, k}, identityCascade(xID), func(ctx context.Context) error {
+				_, err := repo.Revoke(ctx, mID, tn.account, tn.project, "cross_delegation_test")
+				return err
+			}
+		},
+	}
+	for name, build := range shapes {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			const trials = 5
+			var failures []string
+			for i := range trials {
+				tn := newTenant(t, "")
+				held, a, b := build(tn, tn.policy(t, []string{"data:read"}))
+
+				hold, err := testDB.BeginTx(ctx, nil)
+				require.NoError(t, err)
+				defer hold.Rollback() //nolint:errcheck
+				_, err = hold.ExecContext(ctx, `SELECT 1 FROM issued_credentials WHERE jti IN (?) FOR SHARE`, bun.List(held))
+				require.NoError(t, err)
+
+				errs := make([]error, 2)
+				var wg sync.WaitGroup
+				for j, fn := range []func(ctx context.Context) error{a, b} {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						errs[j] = inTx(fn)
+					}()
+				}
+				loWaitForWaiters(t, "revoke_credential", 2)
+				require.NoError(t, hold.Commit())
+				wg.Wait()
+
+				for j, err := range errs {
+					if err != nil {
+						failures = append(failures, fmt.Sprintf("trial %d cascade %d: %v", i, j, err))
+					}
+				}
+				var live int
+				require.NoError(t, testDB.NewRaw(`
+					SELECT count(*) FROM issued_credentials
+					WHERE account_id = ? AND project_id = ? AND NOT is_revoked`, tn.account, tn.project).Scan(ctx, &live))
+				if live != 0 {
+					failures = append(failures, fmt.Sprintf("trial %d: %d tokens left live", i, live))
+				}
+				if len(failures) > 0 {
+					break
+				}
+			}
+			assert.Empty(t, failures, "two cascades whose trees each reach into the other's MUST NOT deadlock")
+		})
+	}
+}
+
+// loWaitForWaiters polls until n backends whose current query contains
+// queryLike wait on a lock, and fails the test after 15 seconds.
+func loWaitForWaiters(t *testing.T, queryLike string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting int
+		require.NoError(t, testDB.NewRaw(`
+			SELECT count(DISTINCT l.pid) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE NOT l.granted AND a.query LIKE ? AND a.pid <> pg_backend_pid()`,
+			"%"+queryLike+"%").Scan(context.Background(), &waiting))
+		if waiting >= n {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("fewer than %d queries like %q waited on a lock within 15s", n, queryLike)
+}
+
 // TestDelegatedIssuedAtMovedAfterParentKeepsSignedIat runs a real token
 // exchange below a token stored by a replica whose clock was five seconds
 // ahead of this one. The child's stored issued_at is moved to a microsecond
