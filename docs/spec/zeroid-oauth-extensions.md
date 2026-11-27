@@ -1113,7 +1113,9 @@ is a ZeroID-defined extension.
 
 `severity` ∈ { `low`, `medium`, `high`, `critical` }. A signal of severity
 `high` or `critical` triggers credential revocation (and cascade per
-Section 5.7).
+Section 5.7). If that revocation fails, the signal is still recorded and
+delivered to subscribers, and `POST /signals/ingest` answers `500`. Sending
+the signal again runs the revocation again and records a second signal.
 
 ### 9.3 Signal shape and scoping
 
