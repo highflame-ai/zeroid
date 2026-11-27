@@ -328,5 +328,6 @@ func issuanceRefusal(err error) bool {
 		errors.Is(err, errScopeRulesRefusal) ||
 		errors.Is(err, domain.ErrIdentityExpired) ||
 		errors.Is(err, domain.ErrIdentityNotUsable) ||
-		errors.Is(err, domain.ErrCredentialExpired)
+		errors.Is(err, domain.ErrCredentialExpired) ||
+		errors.Is(err, domain.ErrCredentialAlreadyRevoked)
 }

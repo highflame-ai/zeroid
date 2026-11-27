@@ -124,6 +124,19 @@ func TestAuthVerify_RevokedToken(t *testing.T) {
 	assert.Equal(t, expectedWWWAuth("invalid_token"), resp.Header.Get("WWW-Authenticate"))
 }
 
+// TestAuthVerify_TokenDelegatedFromRevokedToken checks that verify rejects a
+// token whose own row is unrevoked but which was delegated from a revoked
+// token.
+func TestAuthVerify_TokenDelegatedFromRevokedToken(t *testing.T) {
+	f := rlRevokedParentFixture(t)
+	for name, token := range map[string]string{"child": f.child, "grandchild": f.grandchild} {
+		resp := get(t, "/oauth2/token/verify", map[string]string{"Authorization": "Bearer " + token})
+		_ = resp.Body.Close()
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode, name)
+		assert.Equal(t, expectedWWWAuth("invalid_token"), resp.Header.Get("WWW-Authenticate"), name)
+	}
+}
+
 // TestAuthVerify_ResponseBodyOnSuccess checks that the 200 response body is
 // the expected {"active":true} JSON — nginx auth_request ignores it but
 // explicit clients may depend on it.

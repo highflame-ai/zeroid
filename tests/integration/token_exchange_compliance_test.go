@@ -202,6 +202,20 @@ func TestRFC8693_RevokedSubjectTokenRejected(t *testing.T) {
 	assert.Equal(t, "invalid_grant", body["error"])
 }
 
+// ── RFC 8693 — Subject delegated from a revoked token ─────────────────────
+
+func TestRFC8693_SubjectDelegatedFromRevokedTokenRejected(t *testing.T) {
+	// RFC 8693 inherits RFC 6749 §5.2: "invalid_grant ... The provided
+	//   authorization grant ... is invalid, expired, revoked". A subject_token
+	//   delegated from a revoked token is revoked with it, so it MUST NOT mint
+	//   a successor, even where the store still holds its own row unrevoked.
+	f := rlRevokedParentFixture(t)
+	status, body := rlExchange(t, rlNewActor(t, f.tn, f.policyID, f.scopes), f.scopes, f.child)
+	require.Equal(t, http.StatusBadRequest, status,
+		"token_exchange from a token below a revoked one MUST be rejected: %v", body)
+	assert.Equal(t, "invalid_grant", body["error"])
+}
+
 // ── RFC 8693 — Actor signed by wrong key rejected ──────────────────────────
 
 func TestRFC8693_ActorTokenSignedByWrongKeyRejected(t *testing.T) {
