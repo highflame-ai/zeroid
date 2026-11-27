@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"pgregory.net/rapid"
@@ -292,6 +293,11 @@ func TestProperty_EnforcePolicy_UnknownTrustLevelFailsClosed(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		policy := propPolicy(t, "policy")
 		policy.RequiredTrustLevel = rapid.SampledFrom(propTrustLevels[1:]).Draw(t, "required")
+		// A policy with no grant types refuses on that axis first, which would
+		// hide whether the trust check ran.
+		if len(policy.AllowedGrantTypes) == 0 {
+			policy.AllowedGrantTypes = []string{rapid.SampledFrom(propGrantTypes).Draw(t, "grant_type")}
+		}
 		// Passes every other axis, so the refusal can only be the trust check's.
 		req := propAdmittedRequest(t, policy)
 		req.TrustLevel = domain.TrustLevel(rapid.OneOf(
@@ -299,8 +305,9 @@ func TestProperty_EnforcePolicy_UnknownTrustLevelFailsClosed(t *testing.T) {
 			rapid.String(),
 		).Filter(func(s string) bool { return domain.TrustLevelRank(s) < 0 }).Draw(t, "trust"))
 
-		if err := svc.EnforcePolicy(t.Context(), policy, req); !errors.Is(err, ErrPolicyViolation) {
-			t.Fatalf("unknown trust level %q under %q: %v, want a policy violation", req.TrustLevel, policy.RequiredTrustLevel, err)
+		err := svc.EnforcePolicy(t.Context(), policy, req)
+		if !errors.Is(err, ErrPolicyViolation) || !strings.Contains(err.Error(), "identity trust level") {
+			t.Fatalf("unknown trust level %q under %q: %v, want the trust check's policy violation", req.TrustLevel, policy.RequiredTrustLevel, err)
 		}
 	})
 }
