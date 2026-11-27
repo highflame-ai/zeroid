@@ -148,6 +148,16 @@ func TestRFC7009_S2_1_RevokingRevokedTokenAgainRevokesTokensLeftBelowIt(t *testi
 	assert.True(t, rlRowRevoked(t, rlJTI(t, f.child)), "the child is revoked by the second revocation")
 	assert.True(t, rlRowRevoked(t, rlJTI(t, f.grandchild)), "so is the grandchild")
 	assert.Empty(t, rlLiveBelowRevoked(t, f.tn))
+	// Each token the second revocation reached gets its one revocation
+	// event, so a deny-set fed by the notifier learns of it; the root, which
+	// it did not revoke again, gets none.
+	for name, token := range map[string]string{"child": f.child, "grandchild": f.grandchild} {
+		events := revocationCapture.forJTI(rlJTI(t, token))
+		if assert.Len(t, events, 1, name) {
+			assert.Equal(t, "oauth2_revocation", events[0].Reason, name)
+		}
+	}
+	assert.Empty(t, revocationCapture.forJTI(rlJTI(t, f.root)), "the root was revoked without the cascade, and not again")
 }
 
 // The post-condition that a revoked token introspects as `active=false`
