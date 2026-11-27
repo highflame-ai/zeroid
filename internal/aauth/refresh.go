@@ -253,7 +253,8 @@ func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (s
 	case !now.Before(e.ExpiresAt):
 		return "", 0, notEnrolled("the enrollment has expired")
 	}
-	if err := p.rootLive(ctx, e.RootJTI); err != nil {
+	root, err := p.rootLive(ctx, e.RootJTI)
+	if err != nil {
 		return "", 0, err
 	}
 
@@ -317,6 +318,7 @@ func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (s
 		TTL:               ttl,
 		GrantType:         domain.GrantTypeAAuthAgent,
 		ParentJTI:         e.RootJTI, // revoking the first token while it lives revokes every refresh
+		MissionID:         root.MissionID, // every refresh stays in the enrollment's delegation tree
 		DPoPKeyThumbprint: ephemeralJKT,
 		AgentTokenSigner: func(jti string, iat, exp time.Time) (string, error) {
 			return p.key.sign(p.cfg.Issuer, sub, d.ephemeral, jti, iat, exp, tokenExtras{PS: ps})
@@ -336,7 +338,7 @@ func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (s
 	// revoke the new token unless the root is confirmed live, fail closed.
 	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if err := p.rootLive(bctx, e.RootJTI); err != nil {
+	if _, err := p.rootLive(bctx, e.RootJTI); err != nil {
 		if rErr := p.creds.RevokeCredential(bctx, issuedRow.ID, issuedRow.AccountID, issuedRow.ProjectID,
 			"enrollment not confirmed live after refresh"); rErr != nil {
 			log.Error().Err(rErr).Str("jti", issuedRow.JTI).Msg("aauth: could not revoke a refreshed token whose enrollment was not confirmed live")
@@ -355,11 +357,12 @@ func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (s
 // so the first token (which lives minutes) cannot be revoked for most of the
 // enrollment's life, but the agent's current token can. Revoking it cuts off
 // the durable key; the workload enrolls again with a platform token.
-func (p *Provider) rootLive(ctx context.Context, rootJTI string) error {
-	if _, err := p.creds.CredentialByJTI(ctx, rootJTI); errors.Is(err, sql.ErrNoRows) {
-		return notEnrolled("the enrollment's first agent token is gone")
+func (p *Provider) rootLive(ctx context.Context, rootJTI string) (*domain.IssuedCredential, error) {
+	root, err := p.creds.CredentialByJTI(ctx, rootJTI)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, notEnrolled("the enrollment's first agent token is gone")
 	} else if err != nil {
-		return fmt.Errorf("reading the enrollment's first agent token: %w", err)
+		return nil, fmt.Errorf("reading the enrollment's first agent token: %w", err)
 	}
 	revoked, err := p.db.NewSelect().Table("issued_credentials").
 		Where("is_revoked").
@@ -369,12 +372,12 @@ func (p *Provider) rootLive(ctx context.Context, rootJTI string) error {
 		}).
 		Exists(ctx)
 	if err != nil {
-		return fmt.Errorf("checking the enrollment's agent tokens: %w", err)
+		return nil, fmt.Errorf("checking the enrollment's agent tokens: %w", err)
 	}
 	if revoked {
-		return notEnrolled("an agent token of this enrollment was revoked")
+		return nil, notEnrolled("an agent token of this enrollment was revoked")
 	}
-	return nil
+	return root, nil
 }
 
 // enroll records key's enrollment after a platform-token issuance, when the

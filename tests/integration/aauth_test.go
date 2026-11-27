@@ -1209,7 +1209,11 @@ func TestAAuthRefresh(t *testing.T) {
 		claims := decodeJWTPayload(t, res.body["agent_token"].(string))
 		assert.Equal(t, decodeJWTPayload(t, root)["sub"], claims["sub"], "the agent identifier is stable across refreshes")
 		assert.Equal(t, eph.x, claims["cnf"].(map[string]any)["jwk"].(map[string]any)["x"])
-		assert.Equal(t, "aauth_agent", a.credential(t, claims["jti"].(string))["grant_type"])
+		refreshedRow := a.credential(t, claims["jti"].(string))
+		assert.Equal(t, "aauth_agent", refreshedRow["grant_type"])
+		rootRow := a.credential(t, decodeJWTPayload(t, root)["jti"].(string))
+		require.NotEmpty(t, rootRow["mission_id"])
+		assert.Equal(t, rootRow["mission_id"], refreshedRow["mission_id"], "a refresh stays in the enrollment's delegation tree")
 
 		// The refreshed token is a full agent token: it bridges, with the
 		// ephemeral key as its DPoP key.
