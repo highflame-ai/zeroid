@@ -58,7 +58,7 @@ func TestProperty_VerifyCodeChallenge_AcceptsExactlyS256(t *testing.T) {
 		case 0:
 			challenge = want
 		case 1:
-			challenge = verifier // plain, which OAuth 2.1 removes
+			challenge = verifier // plain, which /authorize refuses
 		case 2:
 			challenge = base64.URLEncoding.EncodeToString(sum[:]) // padded
 		case 3:
