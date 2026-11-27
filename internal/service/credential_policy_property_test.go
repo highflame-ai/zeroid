@@ -153,14 +153,14 @@ func propNarrowerPolicy(t *rapid.T, wider *domain.CredentialPolicy) *domain.Cred
 	}
 }
 
-// propPerturbedNarrowing draws a narrowing of wider with one of its eight
-// axes then redrawn freely (one draw in nine redraws none), so EnforceSubset
-// sees both policies it must pass and near-misses it must refuse, far more
-// often than two independent draws give.
+// propPerturbedNarrowing draws a narrowing of wider with, most of the time,
+// one axis then redrawn freely or pushed one step past wider's, so
+// EnforceSubset sees both policies it must pass and near-misses it must
+// refuse, far more often than two independent draws give.
 func propPerturbedNarrowing(t *rapid.T, wider *domain.CredentialPolicy) *domain.CredentialPolicy {
 	p := propNarrowerPolicy(t, wider)
 	free := propPolicy(t, "free")
-	switch rapid.IntRange(0, 8).Draw(t, "perturbed_axis") {
+	switch rapid.IntRange(0, 15).Draw(t, "perturbed_axis") {
 	case 0:
 		p.MaxTTLSeconds = free.MaxTTLSeconds
 	case 1:
@@ -177,8 +177,41 @@ func propPerturbedNarrowing(t *rapid.T, wider *domain.CredentialPolicy) *domain.
 		p.MaxDelegationDepth = free.MaxDelegationDepth
 	case 7:
 		p.RequiredPrincipalType = free.RequiredPrincipalType
+	case 8:
+		p.MaxTTLSeconds = wider.MaxTTLSeconds + 1
+	case 9:
+		p.MaxDelegationDepth = wider.MaxDelegationDepth + 1
+	case 10:
+		if wider.RequiredTrustLevel != "" {
+			p.RequiredTrustLevel = propJustBelow(t, propTrustLevels, wider.RequiredTrustLevel, propTrustRank, []string{""}, "perturbed.trust")
+		}
+	case 11:
+		if wider.RequiredAttestation != "" {
+			p.RequiredAttestation = propJustBelow(t, propAttestations, wider.RequiredAttestation, propAttestationRank, []string{""}, "perturbed.attestation")
+		}
+	case 12:
+		p.AllowedScopes = append(slices.Clone(p.AllowedScopes), propScopeNearMiss(t, wider.AllowedScopes, "perturbed.scope"))
+	case 13:
+		p.AllowedGrantTypes = append(slices.Clone(p.AllowedGrantTypes), rapid.SampledFrom(propGrantTypes).Draw(t, "perturbed.grant_type"))
 	}
 	return p
+}
+
+// propScopeNearMiss draws a scope that is often just outside of: one of its
+// members in another case, or with "s" as U+017F, which case folding maps to
+// "s". Otherwise, or when of is empty, it draws any scope.
+func propScopeNearMiss(t *rapid.T, of []string, label string) string {
+	if len(of) == 0 || rapid.Bool().Draw(t, label+".any") {
+		return propScope().Draw(t, label)
+	}
+	s := rapid.SampledFrom(of).Draw(t, label+".of")
+	var variants []string
+	for _, v := range []string{strings.ToUpper(s), strings.ToLower(s), strings.ReplaceAll(strings.ToLower(s), "s", "ſ")} {
+		if v != s {
+			variants = append(variants, v)
+		}
+	}
+	return rapid.SampledFrom(variants).Draw(t, label+".variant")
 }
 
 func propEnforceRequest(t *rapid.T) EnforcePolicyRequest {
@@ -268,7 +301,7 @@ func propRequestNear(t *rapid.T, policy *domain.CredentialPolicy) EnforcePolicyR
 			req.AttestationLevel = propJustBelow(t, propAttestations, policy.RequiredAttestation, propAttestationRank, []string{"", "tpm", "Hardware"}, "near.attestation")
 		}
 	case 12:
-		req.Scopes = append(slices.Clone(req.Scopes), propScope().Draw(t, "near.extra_scope"))
+		req.Scopes = append(slices.Clone(req.Scopes), propScopeNearMiss(t, propScopeCeiling(policy, req), "near.extra_scope"))
 	}
 	return req
 }
@@ -369,6 +402,42 @@ func TestProperty_EnforceSubset_AcceptsEveryAxisWiseNarrowing(t *testing.T) {
 
 		if err := svc.EnforceSubset(narrower, wider); err != nil {
 			t.Fatalf("EnforceSubset(%+v, %+v) = %v", narrower, wider, err)
+		}
+	})
+}
+
+// propNoBroader is EnforceSubset's axis list as its doc comment states it,
+// after the principal requirement it checks first (any < user). user_grant_scopes
+// is not on the list.
+func propNoBroader(narrower, wider *domain.CredentialPolicy) bool {
+	principalRank := map[string]int{domain.RequirePrincipalAny: 0, domain.RequirePrincipalUser: 1}
+	switch {
+	case principalRank[narrower.RequiredPrincipalType] < principalRank[wider.RequiredPrincipalType],
+		len(wider.AllowedScopes) > 0 && !propSubset(narrower.AllowedScopes, wider.AllowedScopes),
+		!propSubset(narrower.AllowedGrantTypes, wider.AllowedGrantTypes),
+		narrower.MaxTTLSeconds > wider.MaxTTLSeconds,
+		narrower.MaxDelegationDepth > wider.MaxDelegationDepth,
+		wider.RequiredTrustLevel != "" && propTrustRank(narrower.RequiredTrustLevel) < propTrustRank(wider.RequiredTrustLevel),
+		wider.RequiredAttestation != "" && propAttestationRank(narrower.RequiredAttestation) < propAttestationRank(wider.RequiredAttestation):
+		return false
+	}
+	return true
+}
+
+// TestProperty_EnforceSubset_PassesExactlyTheAxisWiseNarrowings: EnforceSubset passes a policy iff it is no broader than the wider one on every axis its doc comment lists.
+func TestProperty_EnforceSubset_PassesExactlyTheAxisWiseNarrowings(t *testing.T) {
+	svc := &CredentialPolicyService{}
+	rapid.Check(t, func(t *rapid.T) {
+		wider := propPolicy(t, "wider")
+		for range 8 {
+			narrower := propPerturbedNarrowing(t, wider)
+			err := svc.EnforceSubset(narrower, wider)
+			if want := propNoBroader(narrower, wider); (err == nil) != want {
+				t.Fatalf("EnforceSubset(%+v, %+v) = %v, want passed=%v", narrower, wider, err, want)
+			}
+			if err != nil && !errors.Is(err, ErrPolicySubsetViolation) {
+				t.Fatalf("refusal is %v, want ErrPolicySubsetViolation", err)
+			}
 		}
 	})
 }

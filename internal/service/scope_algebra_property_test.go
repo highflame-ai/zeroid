@@ -462,24 +462,28 @@ func TestProperty_MayActPermits_OnlyTheNamedActorUnderOurIssuer(t *testing.T) {
 		)
 	}
 	rapid.Check(t, func(t *rapid.T) {
-		actor := rapid.SampledFrom(actors).Draw(t, "actor")
-		mayAct := map[string]any{}
-		if rapid.IntRange(0, 3).Draw(t, "hasSub") > 0 {
-			mayAct["sub"] = claimValue(actor, "spiffe://zeroid.test/a/p/agent/B", "spiffe://zeroid.test/a/p/agent/").Draw(t, "sub")
-		}
-		if rapid.Bool().Draw(t, "hasIss") {
-			mayAct["iss"] = claimValue(issuer, "https://ZeroID.test", "https://zeroid.test/").Draw(t, "iss")
-		}
+		// A near miss decides the outcome only when every other member
+		// permits, so each check tries several claims.
+		for range 8 {
+			actor := rapid.SampledFrom(actors).Draw(t, "actor")
+			mayAct := map[string]any{}
+			if rapid.IntRange(0, 3).Draw(t, "hasSub") > 0 {
+				mayAct["sub"] = claimValue(actor, "spiffe://zeroid.test/a/p/agent/B", "spiffe://zeroid.test/a/p/agent/").Draw(t, "sub")
+			}
+			if rapid.Bool().Draw(t, "hasIss") {
+				mayAct["iss"] = claimValue(issuer, "https://ZeroID.test", "https://zeroid.test/").Draw(t, "iss")
+			}
 
-		sub, _ := mayAct["sub"].(string)
-		issOK := true
-		if v, ok := mayAct["iss"]; ok {
-			s, _ := v.(string)
-			issOK = s == issuer
-		}
-		want := sub != "" && sub == actor && issOK
-		if got := mayActPermits(mayAct, actor, issuer); got != want {
-			t.Fatalf("mayActPermits(%v, %q) = %v, want %v", mayAct, actor, got, want)
+			sub, _ := mayAct["sub"].(string)
+			issOK := true
+			if v, ok := mayAct["iss"]; ok {
+				s, _ := v.(string)
+				issOK = s == issuer
+			}
+			want := sub != "" && sub == actor && issOK
+			if got := mayActPermits(mayAct, actor, issuer); got != want {
+				t.Fatalf("mayActPermits(%v, %q) = %v, want %v", mayAct, actor, got, want)
+			}
 		}
 	})
 }
