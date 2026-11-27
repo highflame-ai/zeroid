@@ -182,9 +182,9 @@ func ServerIdentifierHost(s string) (string, error) {
 // Mount registers the Agent Provider's routes. (The bridge grant is
 // registered on the token endpoint by New.)
 func (p *Provider) Mount(r chi.Router) {
-	r.Post(PathToken, p.handleToken)
-	r.Post(PathSubagent, p.handleSubagent)
-	r.Post(PathRefresh, p.handleRefresh)
+	r.Post(PathToken, observed("token", p.handleToken))
+	r.Post(PathSubagent, observed("subagent", p.handleSubagent))
+	r.Post(PathRefresh, observed("refresh", p.handleRefresh))
 	r.Get(PathJWKS, p.handleJWKS)
 	r.Get(PathMetadata, p.handleMetadata)
 }

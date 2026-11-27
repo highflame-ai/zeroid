@@ -89,6 +89,16 @@ var (
 	// credential from an issuer row with first_contact on, naming an agent no
 	// binding mapped. Attributes: account_id, grant_type, mode, outcome.
 	FederationFirstContact metric.Int64Counter
+
+	// AAuthRequests counts AAuth Agent Provider requests. Attributes:
+	// endpoint (token, subagent, refresh), outcome (issued, refused,
+	// rate_limited, signature_error, error) and code (the AAuth error or
+	// Signature-Error code, "" when issued).
+	AAuthRequests metric.Int64Counter
+	// AAuthPSRevocations counts attempts to revoke agent tokens at person
+	// servers. Attribute: outcome (revoked, revocation_unsupported,
+	// rejected, retry).
+	AAuthPSRevocations metric.Int64Counter
 )
 
 func init() {
@@ -144,6 +154,12 @@ func registerInstruments(m metric.Meter) {
 	)
 	FederationFirstContact, _ = m.Int64Counter("zeroid.federation.first_contact",
 		metric.WithDescription("First-contact attempts on issuer rows, by mode and outcome"),
+	)
+	AAuthRequests, _ = m.Int64Counter("zeroid.aauth.requests",
+		metric.WithDescription("AAuth Agent Provider requests, by endpoint, outcome and error code"),
+	)
+	AAuthPSRevocations, _ = m.Int64Counter("zeroid.aauth.ps_revocations",
+		metric.WithDescription("Agent token revocations sent to person servers, by outcome"),
 	)
 }
 

@@ -14,9 +14,12 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/attestation"
+	"github.com/highflame-ai/zeroid/internal/telemetry"
 )
 
 // Revoking agent tokens at the agent's person server (protocol draft, "Token
@@ -206,7 +209,12 @@ func (p *Provider) sendToPersonServer(ctx context.Context, ps string, rows []pen
 func (p *Provider) recordPSOutcome(ctx context.Context, r pendingPSRevocation, outcome string, err error) (bool, error) {
 	now := p.now()
 	var retry *errPSRetry
+	counted := outcome
 	if errors.As(err, &retry) {
+		counted = "retry"
+	}
+	telemetry.AAuthPSRevocations.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", counted)))
+	if retry != nil {
 		wait := psBackoff(r.Attempts)
 		if retry.retryAfter > wait {
 			wait = retry.retryAfter
