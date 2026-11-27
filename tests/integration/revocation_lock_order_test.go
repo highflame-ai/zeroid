@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun"
@@ -337,4 +339,49 @@ func TestOverlappingCascadesDoNotDeadlock(t *testing.T) {
 			assert.Empty(t, failures, "two cascades over overlapping trees MUST NOT deadlock")
 		})
 	}
+}
+
+// TestDelegatedIssuedAtMovedAfterParentKeepsSignedIat runs a real token
+// exchange below a token stored by a replica whose clock was five seconds
+// ahead of this one. The child's stored issued_at is moved to a microsecond
+// after its parent's, so the cascades lock the parent first. The token itself
+// does not change: introspection answers the signed iat, not the stored
+// value.
+func TestDelegatedIssuedAtMovedAfterParentKeepsSignedIat(t *testing.T) {
+	ctx := context.Background()
+	tn := newTenant(t, "")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+	root, _ := tn.workloadRoot(t, policyID, scopes)
+	rootJTI := rlJTI(t, root)
+	_, err := testDB.ExecContext(ctx,
+		`UPDATE issued_credentials SET issued_at = issued_at + interval '5 seconds' WHERE jti = ?`, rootJTI)
+	require.NoError(t, err)
+
+	status, body := rlExchange(t, rlNewActor(t, tn, policyID, scopes), scopes, root)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	child := body["access_token"].(string)
+	childJTI := rlJTI(t, child)
+
+	var rows []struct {
+		JTI      string    `bun:"jti"`
+		IssuedAt time.Time `bun:"issued_at"`
+	}
+	require.NoError(t, testDB.NewRaw(`SELECT jti, issued_at FROM issued_credentials WHERE jti IN (?, ?)`,
+		rootJTI, childJTI).Scan(ctx, &rows))
+	require.Len(t, rows, 2)
+	stored := map[string]time.Time{}
+	for _, r := range rows {
+		stored[r.JTI] = r.IssuedAt
+	}
+	assert.Equal(t, stored[rootJTI].Add(time.Microsecond), stored[childJTI],
+		"the child is stored as issued a microsecond after its parent")
+
+	parsed, err := jwt.ParseInsecure([]byte(child))
+	require.NoError(t, err)
+	signedIat, ok := parsed.IssuedAt()
+	require.True(t, ok)
+	assert.Less(t, signedIat.Unix(), stored[childJTI].Unix()-3, "the signed iat is this replica's clock")
+	assert.Equal(t, float64(signedIat.Unix()), introspect(t, child)["iat"],
+		"introspection answers the token's own iat")
 }
