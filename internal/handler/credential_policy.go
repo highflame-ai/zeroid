@@ -25,7 +25,7 @@ type CreatePolicyInput struct {
 		AllowedScopes         []string   `json:"allowed_scopes,omitempty" doc:"Permitted OAuth scopes"`
 		RequiredTrustLevel    string     `json:"required_trust_level,omitempty" doc:"Minimum trust level required"`
 		RequiredAttestation   string     `json:"required_attestation,omitempty" doc:"Minimum attestation level required"`
-		MaxDelegationDepth    int        `json:"max_delegation_depth,omitempty" doc:"Maximum delegation chain depth: how many token exchanges a chain may take, from 0 (no delegation, the default) to 15. A value outside that range is a 400. 15 is the deepest chain whose act claim names every actor."`
+		MaxDelegationDepth    int        `json:"max_delegation_depth,omitempty" doc:"Maximum delegation chain depth: how many times a chain may be delegated to a new actor (a re-scope by the current actor does not count), from 0 (no delegation, the default) to 15. A value outside that range is a 400. 15 is the deepest chain whose act claim names every actor."`
 		Source                string     `json:"source,omitempty" doc:"Provenance of an auto-derived policy (e.g. 'discovery'); omit for user-authored policies"`
 		SourceKey             string     `json:"source_key,omitempty" doc:"Stable dedup identity within the source; when set, create is idempotent by (source, source_key)"`
 		ExpiresAt             *time.Time `json:"expires_at,omitempty" doc:"RFC3339 timestamp after which the policy is no longer valid"`
