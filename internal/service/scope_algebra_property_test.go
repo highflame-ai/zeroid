@@ -34,7 +34,12 @@ func propScopeList() *rapid.Generator[[]string] {
 
 // propScopeRequest is a raw `scope` parameter: the list joined with any mix of
 // the whitespace parseScopeString splits on, so "omitted" also covers "  ".
+// A quarter of the draws are exactly "", the parameter left out, which the
+// joined form alone reaches only about one draw in twenty.
 func propScopeRequest(t *rapid.T, label string) string {
+	if rapid.IntRange(0, 3).Draw(t, label+"-absent") == 0 {
+		return ""
+	}
 	scopes := rapid.SliceOfN(propScope(), 0, 5).Draw(t, label)
 	space := rapid.SampledFrom([]string{" ", "  ", "\t", " \t "})
 	var b strings.Builder
