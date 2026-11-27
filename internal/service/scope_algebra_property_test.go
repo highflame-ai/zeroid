@@ -198,7 +198,7 @@ func TestProperty_RequireGrantableScope_RefusesExactlyANamedRequestLeftEmpty(t *
 	})
 }
 
-// TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingTerm: a delegation denial is always invalid_scope, and names each requested scope under the first term that excludes it and no other.
+// TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingTerm: a delegation denial is always invalid_scope, names each requested scope under the first term that excludes it and no other, and names user_grant_scopes as the policy field exactly when userGrant is set.
 func TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingTerm(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		requested := rapid.SliceOfNDistinct(propScope(), 0, 5, rapid.ID[string]).Draw(t, "requested")
@@ -230,6 +230,7 @@ func TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingT
 			return slices.Contains(strings.Fields(rest[:strings.Index(rest, "]")]), s)
 		}
 		excludes := func(c []string, s string) bool { return len(c) > 0 && !slices.Contains(c, s) }
+		policyBlamed := false
 		for _, s := range requested {
 			want := ""
 			switch {
@@ -237,6 +238,7 @@ func TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingT
 				want = "held"
 			case excludes(actorPolicy, s):
 				want = "permitted"
+				policyBlamed = true
 			case actorRowNone || excludes(actorRow, s):
 				want = "registered"
 			}
@@ -245,6 +247,13 @@ func TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingT
 					t.Fatalf("scope %s: blamed under %q = %v, want blamed only under %q; denial %q", s, term, got, want, desc)
 				}
 			}
+		}
+		// The policy term names the field to widen: user_grant_scopes when
+		// actorPolicy is that list, the policy's allowed_scopes otherwise.
+		const plainTerm = "the actor's credential policy does not permit ["
+		const userGrantTerm = "the actor's credential policy's user_grant_scopes does not permit ["
+		if policyBlamed && (strings.Contains(desc, userGrantTerm) != userGrant || strings.Contains(desc, plainTerm) == userGrant) {
+			t.Fatalf("userGrant=%v, yet the policy term does not name the matching field: %q", userGrant, desc)
 		}
 	})
 }
