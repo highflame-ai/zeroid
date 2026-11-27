@@ -137,6 +137,19 @@ func TestRFC7009_S2_1_TokenStoredDuringRevocationIsRevoked(t *testing.T) {
 	assert.Empty(t, rlLiveBelowRevoked(t, tn))
 }
 
+func TestRFC7009_S2_1_RevokingRevokedTokenAgainRevokesTokensLeftBelowIt(t *testing.T) {
+	// RFC 7009 §2.1: "the revocation of a particular token may cause the
+	//   revocation of related tokens"; RFC 7009 §2.2: an already-revoked token
+	//   is a valid revocation request. Revoking an already-revoked token again
+	//   MUST revoke any token delegated from it that is still live, so a
+	//   store left with one can be repaired.
+	f := rlRevokedParentFixture(t)
+	rlRevoke(t, f.root)
+	assert.True(t, rlRowRevoked(t, rlJTI(t, f.child)), "the child is revoked by the second revocation")
+	assert.True(t, rlRowRevoked(t, rlJTI(t, f.grandchild)), "so is the grandchild")
+	assert.Empty(t, rlLiveBelowRevoked(t, f.tn))
+}
+
 // The post-condition that a revoked token introspects as `active=false`
 // lives in RFC 7662 §2.2's compliance suite — see
 // `TestRFC7662_S2_2_RevokedTokenIsInactive` in

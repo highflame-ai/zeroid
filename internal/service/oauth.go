@@ -4111,6 +4111,12 @@ func (s *OAuthService) revokeAccessToken(ctx context.Context, tokenStr string, s
 // revokeParsed revokes the credential behind an already signature-verified
 // access token. Unknown, already-revoked and expired tokens are success (RFC
 // 7009 §2.2); an error means the lookup or the revocation failed server-side.
+//
+// An already-revoked or expired token still goes through the cascade, which
+// revokes nothing but the live tokens delegated from it. Older releases could
+// store a token below one whose revocation was running, and skipping a
+// revoked token here left no way to reach it; revoking the parent again now
+// does.
 func (s *OAuthService) revokeParsed(ctx context.Context, parsed jwt.Token) error {
 	jti, _ := parsed.JwtID()
 	if jti == "" {
@@ -4125,14 +4131,11 @@ func (s *OAuthService) revokeParsed(ctx context.Context, parsed jwt.Token) error
 		return fmt.Errorf("revocation: look up access token: %w", err)
 	}
 
-	// Already revoked or expired — success per RFC 7009.
-	if cred.IsRevoked || time.Now().After(cred.ExpiresAt) {
-		return nil
-	}
-
 	// Tenant is taken from the credential record — not caller-supplied headers.
 	err = s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "oauth2_revocation")
-	if err != nil && !errors.Is(err, ErrCredentialNotFound) { // not found ⇒ revoked concurrently
+	// Not found ⇒ nothing left live to revoke: the token was already revoked
+	// or expired (with every token below it), or was revoked concurrently.
+	if err != nil && !errors.Is(err, ErrCredentialNotFound) {
 		return fmt.Errorf("revocation: revoke access token: %w", err)
 	}
 	return nil
