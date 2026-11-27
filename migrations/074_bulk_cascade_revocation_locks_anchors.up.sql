@@ -21,8 +21,13 @@
 -- statement with a new snapshot, finds its token; or the issuance waits, and
 -- then finds its anchor revoked and is refused. The anchors are locked
 -- parents first (delegation_depth never falls down a chain, and a token is
--- issued after its parent), so the cascade never holds a token below one an
--- issuance holds while waiting for it.
+-- stored as issued after its parent), so the cascade never holds a token
+-- below one an issuance holds while waiting for it. issued_at comes from the
+-- issuing replica's clock, which can be behind the one that issued the
+-- parent, so CredentialRepository.Create moves a delegated token's issued_at
+-- to just after its parent's when it is not later: a parent and child of the
+-- same identity at the same depth (a re-scoping exchange, a CIBA grant) are
+-- ordered by issued_at alone.
 --
 -- Revoked anchors are not locked: an issuance below one is refused whatever
 -- the cascade does. Expired, unrevoked ones are, since the walk passes

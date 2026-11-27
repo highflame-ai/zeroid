@@ -33,11 +33,24 @@ func NewCredentialRepository(db *bun.DB) *CredentialRepository {
 // serialize: either the revocation commits first and this insert is refused,
 // or the revocation waits for the insert to commit, and its walk then finds
 // the new credential and revokes it too.
+//
+// A delegated credential is also stored as issued after its parent: an
+// IssuedAt that is not at least a microsecond later than the parent's (the
+// replica that issued the parent had a clock ahead of this one) is moved to
+// a microsecond after it. The bulk cascades lock their anchors ordered by
+// (delegation_depth, issued_at, id) and rely on that order putting a parent
+// first; a parent and child at the same depth (a re-scoping exchange, a CIBA
+// grant) are told apart by issued_at alone. The signed token's iat is not
+// changed.
 func (r *CredentialRepository) Create(ctx context.Context, cred *domain.IssuedCredential) error {
 	insert := func(ctx context.Context, db bun.IDB) error {
 		if cred.ParentJTI != "" {
-			if err := lockUnrevokedLineage(ctx, db, cred.ParentJTI); err != nil {
+			parentIssuedAt, err := lockUnrevokedLineage(ctx, db, cred.ParentJTI)
+			if err != nil {
 				return err
+			}
+			if !cred.IssuedAt.IsZero() && cred.IssuedAt.Sub(parentIssuedAt) < time.Microsecond {
+				cred.IssuedAt = parentIssuedAt.Add(time.Microsecond)
 			}
 		}
 		if _, err := db.NewInsert().Model(cred).Exec(ctx); err != nil {
@@ -74,38 +87,44 @@ WITH RECURSIVE lineage(id, jti, parent_jti, depth) AS (
 	JOIN lineage ON ic.jti = lineage.parent_jti
 	WHERE lineage.depth <= ?
 ) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
-SELECT ic.is_revoked, lineage.depth, lineage.is_cycle
+SELECT ic.is_revoked, ic.issued_at, lineage.depth, lineage.is_cycle
 FROM issued_credentials ic
 JOIN lineage ON ic.id = lineage.id
 ORDER BY lineage.depth DESC
 FOR SHARE OF ic`
 
 // lockUnrevokedLineage locks the credential parentJTI and every credential it
-// was delegated from for the rest of db's transaction, and returns
-// ErrRevokedLineage if any of them is revoked. A chain that loops or is longer
-// than MaxLineageDepth is ErrBrokenLineage, and a parent that does not exist
-// is an error: the caller read it moments ago.
-func lockUnrevokedLineage(ctx context.Context, db bun.IDB, parentJTI string) error {
+// was delegated from for the rest of db's transaction, returns
+// ErrRevokedLineage if any of them is revoked, and otherwise returns the
+// parent's issued_at. A chain that loops or is longer than MaxLineageDepth is
+// ErrBrokenLineage, and a parent that does not exist is an error: the caller
+// read it moments ago.
+func lockUnrevokedLineage(ctx context.Context, db bun.IDB, parentJTI string) (time.Time, error) {
 	var rows []struct {
-		IsRevoked bool `bun:"is_revoked"`
-		Depth     int  `bun:"depth"`
-		IsCycle   bool `bun:"is_cycle"`
+		IsRevoked bool      `bun:"is_revoked"`
+		IssuedAt  time.Time `bun:"issued_at"`
+		Depth     int       `bun:"depth"`
+		IsCycle   bool      `bun:"is_cycle"`
 	}
 	if err := db.NewRaw(lockLineageSQL, parentJTI, MaxLineageDepth).Scan(ctx, &rows); err != nil {
-		return fmt.Errorf("lock the delegation chain above the new credential: %w", err)
+		return time.Time{}, fmt.Errorf("lock the delegation chain above the new credential: %w", err)
 	}
 	if len(rows) == 0 {
-		return fmt.Errorf("lock the delegation chain above the new credential: parent credential %s does not exist", parentJTI)
+		return time.Time{}, fmt.Errorf("lock the delegation chain above the new credential: parent credential %s does not exist", parentJTI)
 	}
+	var parentIssuedAt time.Time
 	for _, row := range rows {
 		if row.IsCycle || row.Depth > MaxLineageDepth {
-			return ErrBrokenLineage
+			return time.Time{}, ErrBrokenLineage
 		}
 		if row.IsRevoked {
-			return ErrRevokedLineage
+			return time.Time{}, ErrRevokedLineage
+		}
+		if row.Depth == 1 {
+			parentIssuedAt = row.IssuedAt
 		}
 	}
-	return nil
+	return parentIssuedAt, nil
 }
 
 // GetByID retrieves a credential by its UUID.
