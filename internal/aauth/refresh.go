@@ -239,9 +239,6 @@ func notEnrolled(reason string) error {
 // refresh issues an agent token for d's ephemeral key on its durable key's
 // enrollment.
 func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (string, int, error) {
-	if ok, wait := p.limits.allow("refresh:" + d.durableJKT); !ok {
-		return "", 0, rateLimited(wait)
-	}
 	var e enrollment
 	err := p.db.NewRaw(`SELECT durable_jkt, identity_id, account_id, project_id, issuer_id, subject, root_jti, expires_at
 		FROM aauth_enrollments WHERE durable_jkt = ?`, d.durableJKT).Scan(ctx, &e)
@@ -252,6 +249,12 @@ func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (s
 		return "", 0, fmt.Errorf("reading the enrollment: %w", err)
 	case !now.Before(e.ExpiresAt):
 		return "", 0, notEnrolled("the enrollment has expired")
+	}
+	// Limited once the key is known to be enrolled: a self-signed naming JWT
+	// from a fresh key costs one primary-key read and is refused, and never
+	// occupies a limiter slot.
+	if ok, wait := p.limits.allow("refresh:" + e.DurableJKT); !ok {
+		return "", 0, rateLimited(wait)
 	}
 	root, err := p.rootLive(ctx, e.RootJTI)
 	if err != nil {
@@ -336,11 +339,13 @@ func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (s
 	// The root may have been revoked after the check above and before this
 	// row was written, which the revoke's cascade then missed: re-check, and
 	// revoke the new token unless the root is confirmed live, fail closed.
+	// As an internal revocation, so a re-check that failed on a database
+	// error does not itself cut off the durable key.
 	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if _, err := p.rootLive(bctx, e.RootJTI); err != nil {
 		if rErr := p.creds.RevokeCredential(bctx, issuedRow.ID, issuedRow.AccountID, issuedRow.ProjectID,
-			"enrollment not confirmed live after refresh"); rErr != nil {
+			internalRevocation+"enrollment not confirmed live after refresh"); rErr != nil {
 			log.Error().Err(rErr).Str("jti", issuedRow.JTI).Msg("aauth: could not revoke a refreshed token whose enrollment was not confirmed live")
 		}
 		return "", 0, err
@@ -350,6 +355,13 @@ func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (s
 	}
 	return issued.AccessToken, issued.ExpiresIn, nil
 }
+
+// internalRevocation prefixes the reason of every revocation the Agent
+// Provider makes on its own to fail closed (a token issued while a re-check
+// or a write failed). rootLive ignores those: only a revocation someone
+// asked for cuts off a durable key, so a passing database error cannot lock
+// an enrolled workload out.
+const internalRevocation = "aauth-internal: "
 
 // rootLive refuses an enrollment once its first agent token, or any agent
 // token refreshed from it, has been revoked, and fails closed on a storage
@@ -366,6 +378,7 @@ func (p *Provider) rootLive(ctx context.Context, rootJTI string) (*domain.Issued
 	}
 	revoked, err := p.db.NewSelect().Table("issued_credentials").
 		Where("is_revoked").
+		Where("(revoke_reason IS NULL OR revoke_reason NOT LIKE ?)", internalRevocation+"%").
 		WhereGroup(" AND ", func(q *bun.SelectQuery) *bun.SelectQuery {
 			return q.Where("jti = ?", rootJTI).
 				WhereOr("parent_jti = ? AND grant_type = ?", rootJTI, string(domain.GrantTypeAAuthAgent))

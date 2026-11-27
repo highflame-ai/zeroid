@@ -1607,6 +1607,7 @@ var envMapping = map[string]string{
 	"ZEROID_AAUTH_AGENT_TOKEN_TTL_SECONDS":      "aauth.agent_token_ttl_seconds",
 	"ZEROID_AAUTH_NAME":                         "aauth.name",
 	"ZEROID_AAUTH_RETIRED_SIGNING_KEY_PATHS":    "aauth.retired_signing_key_paths",
+	"ZEROID_AAUTH_RETIRED_SIGNING_KEY_IDS":      "aauth.retired_signing_key_ids",
 	"ZEROID_AAUTH_ENROLLMENT_TTL_SECONDS":       "aauth.enrollment_ttl_seconds",
 	"ZEROID_AAUTH_REQUESTS_PER_MINUTE":          "aauth.requests_per_minute",
 	"ZEROID_AAUTH_MAX_LIVE_SUBAGENTS":           "aauth.max_live_subagents",
@@ -1678,6 +1679,17 @@ func loadEnvVars(k *koanf.Koanf) error {
 				return fmt.Errorf("%s=%q: not a valid integer", envVar, value)
 			}
 			if err := k.Set(configPath, intVal); err != nil {
+				return fmt.Errorf("setting %s from %s: %w", configPath, envVar, err)
+			}
+		case strings.HasSuffix(configPath, ".retired_signing_key_paths") ||
+			strings.HasSuffix(configPath, ".retired_signing_key_ids"):
+			// Comma-separated, in the same order for paths and kids; an empty
+			// kid (a,,c) means that key's thumbprint.
+			parts := strings.Split(value, ",")
+			for i := range parts {
+				parts[i] = strings.TrimSpace(parts[i])
+			}
+			if err := k.Set(configPath, parts); err != nil {
 				return fmt.Errorf("setting %s from %s: %w", configPath, envVar, err)
 			}
 		case strings.HasSuffix(configPath, ".sampling_rate"):

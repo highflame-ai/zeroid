@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/uptrace/bun"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
@@ -26,11 +27,13 @@ import (
 // Revocation"). An agent token is revoked by the Agent Provider that issued
 // it, at the person server only: the token's ps. ZeroID records every agent
 // and sub-agent token it issues with a ps claim in aauth_ps_revocations, and
-// a worker sends the revocation once the token's credential is revoked or
-// its identity is no longer active, retrying until the person server records
-// it, says it takes none, or the token expires. Every revocation path
-// (an admin revoke, a cascade, deactivation, suspension, offboarding) ends in
-// one of those states, so none needs its own hook.
+// a worker sends the revocation once ZeroID treats the token as inactive:
+// its credential revoked (an admin revoke, a cascade, deactivation,
+// suspension, offboarding), its identity no longer active, or an identity
+// above it in the registration tree stopped (re-checked through
+// IntrospectToken, the same test introspection applies). It retries until the
+// person server records the revocation, says it takes none, or the token
+// expires.
 
 // PersonServerMetadataDWK is the person server's metadata document.
 const PersonServerMetadataDWK = "aauth-person.json"
@@ -73,7 +76,7 @@ func (p *Provider) trackForPersonServer(ctx context.Context, row *domain.IssuedC
 		return nil
 	}
 	if rErr := p.creds.RevokeCredential(ctx, row.ID, row.AccountID, row.ProjectID,
-		"could not record the agent token for revocation at its person server"); rErr != nil {
+		internalRevocation+"could not record the agent token for revocation at its person server"); rErr != nil {
 		log.Error().Err(rErr).Str("jti", row.JTI).Msg("aauth: could not revoke an agent token that could not be tracked for its person server")
 	}
 	return fmt.Errorf("recording the agent token for its person server: %w", err)
@@ -114,15 +117,39 @@ type pendingPSRevocation struct {
 const psLease = 5 * time.Minute
 
 // psConcurrency bounds the person servers one pass talks to at once. Rows of
-// one person server are sent in turn, so a slow or dead one delays only its
-// own.
+// one person server are sent in turn.
 const psConcurrency = 8
+
+// psPassBudget and psServerBudget bound one pass and one person server's
+// share of it, both well inside psLease: a slow or dead person server holds
+// up the others' next pass by at most psPassBudget, and no row is still being
+// sent when its lease lapses. Rows not reached in time are released for the
+// next pass.
+const (
+	psPassBudget   = 3 * time.Minute
+	psServerBudget = time.Minute
+)
+
+// psCheckInterval is how often a live tracked token's identity chain is
+// re-checked, and psChecksPerPass how many one pass checks.
+//
+// ponytail: one introspection per live tracked token per minute; a
+// tree-walk in SQL, or a hook on ancestor stops, if that gets heavy.
+const (
+	psCheckInterval = time.Minute
+	psChecksPerPass = 500
+)
 
 // SendPersonServerRevocations runs one pass: it claims every tracked,
 // unexpired token whose credential is revoked or whose identity is not
 // active, and which is due, and revokes each at its person server. It
 // returns how many reached a terminal outcome.
 func (p *Provider) SendPersonServerRevocations(ctx context.Context) (int, error) {
+	if err := p.markStoppedChains(ctx); err != nil {
+		log.Warn().Err(err).Msg("aauth: could not re-check the identity chains of tracked agent tokens")
+	}
+	ctx, cancel := context.WithTimeout(ctx, psPassBudget)
+	defer cancel()
 	now := p.now()
 	var due []pendingPSRevocation
 	err := p.db.NewRaw(`UPDATE aauth_ps_revocations SET next_attempt_at = ?
@@ -131,7 +158,7 @@ func (p *Provider) SendPersonServerRevocations(ctx context.Context) (int, error)
 			JOIN issued_credentials ic ON ic.jti = r.jti
 			LEFT JOIN identities i ON i.id = ic.identity_id
 			WHERE r.notified_at IS NULL AND r.next_attempt_at <= ? AND r.expires_at > ?
-			  AND (ic.is_revoked OR i.id IS NULL OR i.status <> ?)
+			  AND (ic.is_revoked OR i.id IS NULL OR i.status <> ? OR r.chain_stopped)
 			ORDER BY r.next_attempt_at
 			LIMIT 100
 			FOR UPDATE OF r SKIP LOCKED)
@@ -171,16 +198,59 @@ func (p *Provider) SendPersonServerRevocations(ctx context.Context) (int, error)
 	return done, firstErr
 }
 
+// markStoppedChains finds live tracked tokens that ZeroID nonetheless
+// treats as inactive (an identity above theirs in the registration tree
+// stopped, which revokes nothing and leaves their own identity active), and
+// marks them for revocation at their person server.
+func (p *Provider) markStoppedChains(ctx context.Context) error {
+	now := p.now()
+	var jtis []string
+	err := p.db.NewRaw(`SELECT r.jti FROM aauth_ps_revocations r
+		JOIN issued_credentials ic ON ic.jti = r.jti
+		WHERE r.notified_at IS NULL AND NOT r.chain_stopped AND NOT ic.is_revoked
+		  AND r.expires_at > ? AND r.next_check_at <= ?
+		ORDER BY r.next_check_at
+		LIMIT ?`, now, now, psChecksPerPass).Scan(ctx, &jtis)
+	if err != nil {
+		return err
+	}
+	for _, jti := range jtis {
+		_, active, err := p.creds.IntrospectToken(ctx, jti)
+		if err != nil {
+			continue // checked again next pass
+		}
+		q := `UPDATE aauth_ps_revocations SET next_check_at = ? WHERE jti = ?`
+		args := []any{now.Add(psCheckInterval), jti}
+		if !active {
+			q = `UPDATE aauth_ps_revocations SET chain_stopped = TRUE WHERE jti = ?`
+			args = []any{jti}
+		}
+		if _, err := p.db.NewRaw(q, args...).Exec(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // sendToPersonServer revokes rows, all for ps, discovering its
-// revocation_endpoint once.
+// revocation_endpoint once, within psServerBudget. Rows it does not reach are
+// released for the next pass.
 func (p *Provider) sendToPersonServer(ctx context.Context, ps string, rows []pendingPSRevocation) (int, error) {
-	dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	endpoint, err := p.psRevocationEndpoint(dctx, ps)
-	cancel()
+	ctx, cancel := context.WithTimeout(ctx, psServerBudget)
+	defer cancel()
+	// Outcomes are recorded even when the budget ran out mid-request.
+	wctx := context.WithoutCancel(ctx)
+	var endpoint string
+	err := ctx.Err()
+	if err == nil {
+		dctx, dcancel := context.WithTimeout(ctx, 15*time.Second)
+		endpoint, err = p.psRevocationEndpoint(dctx, ps)
+		dcancel()
+	}
 	done := 0
-	for _, r := range rows {
+	for i, r := range rows {
 		if ctx.Err() != nil {
-			return done, ctx.Err()
+			return done, p.releasePS(wctx, rows[i:])
 		}
 		var outcome string
 		var rErr error
@@ -192,7 +262,7 @@ func (p *Provider) sendToPersonServer(ctx context.Context, ps string, rows []pen
 		default:
 			outcome, rErr = p.revokeAtPersonServer(ctx, endpoint, r)
 		}
-		terminal, uErr := p.recordPSOutcome(ctx, r, outcome, rErr)
+		terminal, uErr := p.recordPSOutcome(wctx, r, outcome, rErr)
 		if uErr != nil {
 			return done, uErr
 		}
@@ -201,6 +271,20 @@ func (p *Provider) sendToPersonServer(ctx context.Context, ps string, rows []pen
 		}
 	}
 	return done, nil
+}
+
+// releasePS gives rows back for the next pass to claim at once.
+func (p *Provider) releasePS(ctx context.Context, rows []pendingPSRevocation) error {
+	jtis := make([]string, len(rows))
+	for i, r := range rows {
+		jtis[i] = r.JTI
+	}
+	_, err := p.db.NewRaw(`UPDATE aauth_ps_revocations SET next_attempt_at = ?
+		WHERE jti IN (?) AND notified_at IS NULL`, p.now(), bun.List(jtis)).Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("releasing person-server revocations not reached: %w", err)
+	}
+	return nil
 }
 
 // recordPSOutcome records one revocation attempt: a terminal outcome, or a

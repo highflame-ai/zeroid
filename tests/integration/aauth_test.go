@@ -1123,6 +1123,43 @@ func TestAAuthPersonServer(t *testing.T) {
 		ps.mode.Store("ok")
 	})
 
+	t.Run("suspending an identity above the agent revokes its tokens at the person server", func(t *testing.T) {
+		c := newAAuthFed(t, "aauth_agent")
+		psC := newFakePS(t, c)
+		status, body := c.f.call(t, http.MethodPatch, "/credential-policies/"+c.policy,
+			map[string]any{"aauth_person_server": "https://" + fakePSHost}, c.tn.headers)
+		require.Equal(t, http.StatusOK, status, "%v", body)
+		resp := post(t, adminPath("/identities"), map[string]any{
+			"external_id": uid("parent"), "identity_type": "agent", "trust_level": "unverified", "owner_user_id": "user-test-owner",
+		}, c.tn.headers)
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+		parent := decode(t, resp)["id"].(string)
+		_ = resp.Body.Close()
+		_, err := testDB.NewUpdate().TableExpr("identities").Set("parent_identity_id = ?", parent).
+			Where("id = ?", c.agent).Exec(context.Background())
+		require.NoError(t, err)
+
+		res := c.bootstrap(t, newAgentKey(t), c.assertion(t, nil))
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		jti := decodeJWTPayload(t, res.body["agent_token"].(string))["jti"].(string)
+		_, err = c.f.srv.RunAAuthPersonServerRevocationsOnce(context.Background())
+		require.NoError(t, err)
+		revoked, _, _, _ := psC.state()
+		require.NotContains(t, revoked, jti, "nothing is sent while the chain is live")
+
+		status, body = c.f.call(t, http.MethodPatch, "/identities/"+parent, map[string]any{"status": "suspended"}, c.tn.headers)
+		require.Equal(t, http.StatusOK, status, "suspend the parent: %v", body)
+		assert.Equal(t, false, c.credential(t, jti)["is_revoked"], "suspending an ancestor revokes nothing")
+		// The chain is re-checked at most once a minute; make this one due.
+		_, err = testDB.NewUpdate().TableExpr("aauth_ps_revocations").Set("next_check_at = NOW()").
+			Where("jti = ?", jti).Exec(context.Background())
+		require.NoError(t, err)
+		_, err = c.f.srv.RunAAuthPersonServerRevocationsOnce(context.Background())
+		require.NoError(t, err)
+		revoked, _, _, _ = psC.state()
+		assert.Contains(t, revoked, jti, "an agent whose ancestor stopped is revoked at its person server")
+	})
+
 	t.Run("deactivating the identity revokes its tokens at the person server", func(t *testing.T) {
 		b := newAAuthFed(t, "aauth_agent")
 		psB := newFakePS(t, b)
@@ -1289,6 +1326,22 @@ func TestAAuthRefresh(t *testing.T) {
 		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
 		eph3 := newAgentKey(t)
 		assert.Equal(t, http.StatusOK, a.refresh(t, eph3, namingJWT(t, durable, eph3, time.Now().Add(5*time.Minute))).status)
+	})
+
+	t.Run("ZeroID's own fail-closed revocations do not cut off the durable key", func(t *testing.T) {
+		durable, _ := enroll(t, a, "")
+		eph := newAgentKey(t)
+		res := a.refresh(t, eph, namingJWT(t, durable, eph, time.Now().Add(5*time.Minute)))
+		require.Equal(t, http.StatusOK, res.status)
+		// As when a re-check after issuance hit a database error.
+		row := a.credential(t, decodeJWTPayload(t, res.body["agent_token"].(string))["jti"].(string))
+		status, body := a.f.call(t, http.MethodPost, "/credentials/"+row["id"].(string)+"/revoke",
+			map[string]any{"reason": "aauth-internal: enrollment not confirmed live after refresh"}, a.tn.headers)
+		require.Contains(t, []int{http.StatusOK, http.StatusNoContent}, status, "revoke: %v", body)
+
+		eph2 := newAgentKey(t)
+		again := a.refresh(t, eph2, namingJWT(t, durable, eph2, time.Now().Add(5*time.Minute)))
+		assert.Equal(t, http.StatusOK, again.status, "body=%v", again.body)
 	})
 
 	t.Run("disabling the binding stops refresh", func(t *testing.T) {

@@ -155,7 +155,7 @@ func (p *Provider) bridgeGrant(ctx context.Context, req service.TokenRequest) (*
 	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if _, err := p.liveAgentRow(bctx, agent.JTI, p.now()); err != nil {
-		if rErr := p.creds.RevokeCredential(bctx, child.ID, child.AccountID, child.ProjectID, "parent agent token not confirmed live after exchange"); rErr != nil {
+		if rErr := p.creds.RevokeCredential(bctx, child.ID, child.AccountID, child.ProjectID, internalRevocation+"parent agent token not confirmed live after exchange"); rErr != nil {
 			log.Error().Err(rErr).Str("jti", child.JTI).Msg("aauth: could not revoke a bridged token whose agent token was not confirmed live")
 		}
 		var oe *service.OAuthError

@@ -10,7 +10,8 @@ import (
 const DefaultRequestsPerMinute = 60
 
 // limiter is a fixed-window request limit per key: a workload subject at
-// /ap/token, a parent agent at /ap/subagent, a durable key at /ap/refresh.
+// /ap/token, a parent agent at /ap/subagent, an enrolled durable key at
+// /ap/refresh, each counted only once the key is known to ZeroID.
 // Keys are identities that have already authenticated, so a caller cannot
 // spread itself over fresh keys (anyone can make an hwk key, so a limit on
 // that would bound nothing), and an unauthenticated flood is left to the

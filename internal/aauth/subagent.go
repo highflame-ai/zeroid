@@ -258,7 +258,7 @@ func (p *Provider) subagent(ctx context.Context, parent *agentClaims, body []byt
 	again, err := p.creds.CredentialByJTI(bctx, parent.JTI)
 	if err != nil || again.IsRevoked {
 		if rErr := p.creds.RevokeCredential(bctx, issuedRow.ID, issuedRow.AccountID, issuedRow.ProjectID,
-			"parent agent token not confirmed live after sub-agent issuance"); rErr != nil {
+			internalRevocation+"parent agent token not confirmed live after sub-agent issuance"); rErr != nil {
 			log.Error().Err(rErr).Str("jti", issuedRow.JTI).Msg("aauth: could not revoke a sub-agent token whose parent was not confirmed live")
 		}
 		if err != nil {

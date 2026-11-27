@@ -1274,3 +1274,20 @@ func TestValidateAAuthMetadataURLs(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadAAuthRetiredKeysFromEnv: rotation is configurable from env alone:
+// comma-separated retired key paths, and their kids in the same order.
+func TestLoadAAuthRetiredKeysFromEnv(t *testing.T) {
+	t.Setenv("ZEROID_AAUTH_RETIRED_SIGNING_KEY_PATHS", "/keys/a.pem, /keys/b.pem")
+	t.Setenv("ZEROID_AAUTH_RETIRED_SIGNING_KEY_IDS", "key-a,")
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.AAuth.RetiredSigningKeyPaths; len(got) != 2 || got[0] != "/keys/a.pem" || got[1] != "/keys/b.pem" {
+		t.Fatalf("retired paths: %q", got)
+	}
+	if got := cfg.AAuth.RetiredSigningKeyIDs; len(got) != 2 || got[0] != "key-a" || got[1] != "" {
+		t.Fatalf("retired kids: %q", got)
+	}
+}
