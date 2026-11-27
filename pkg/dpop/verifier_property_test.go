@@ -107,7 +107,23 @@ func TestProperty_NormalizeHTU_IgnoresQueryFragmentCaseAndDefaultPort(t *testing
 	})
 }
 
-// TestProperty_CheckATH_AcceptsExactlyTheTokenHash: checkATH accepts an ath iff it is base64url(SHA-256(access token)) without padding.
+// propFlipCase changes the case of one letter of s, or returns s when it has
+// none.
+func propFlipCase(t *rapid.T, s, label string) string {
+	var letters []int
+	for i := 0; i < len(s); i++ {
+		if c := s[i] | 0x20; 'a' <= c && c <= 'z' {
+			letters = append(letters, i)
+		}
+	}
+	if len(letters) == 0 {
+		return s
+	}
+	i := rapid.SampledFrom(letters).Draw(t, label)
+	return s[:i] + string(s[i]^0x20) + s[i+1:]
+}
+
+// TestProperty_CheckATH_AcceptsExactlyTheTokenHash: checkATH accepts an ath iff it is base64url(SHA-256(access token)) without padding, so a case-folded, truncated or extended hash is refused.
 func TestProperty_CheckATH_AcceptsExactlyTheTokenHash(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		token := rapid.String().Draw(t, "token")
@@ -116,7 +132,7 @@ func TestProperty_CheckATH_AcceptsExactlyTheTokenHash(t *testing.T) {
 		want := strings.TrimRight(strings.NewReplacer("+", "-", "/", "_").Replace(base64.StdEncoding.EncodeToString(sum[:])), "=")
 
 		var ath string
-		switch rapid.IntRange(0, 6).Draw(t, "form") {
+		switch rapid.IntRange(0, 9).Draw(t, "form") {
 		case 0:
 			ath = want
 		case 1:
@@ -133,6 +149,12 @@ func TestProperty_CheckATH_AcceptsExactlyTheTokenHash(t *testing.T) {
 			ath = base64.RawURLEncoding.EncodeToString(other[:])
 		case 6:
 			ath = rapid.String().Draw(t, "random")
+		case 7:
+			ath = propFlipCase(t, want, "caseFlip")
+		case 8:
+			ath = want[:rapid.IntRange(1, len(want)-1).Draw(t, "cut")]
+		case 9:
+			ath = want + rapid.SampledFrom([]string{"A", "-", "_", "=", " "}).Draw(t, "suffix")
 		}
 
 		err := checkATH(ath, token)
