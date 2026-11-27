@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -28,7 +29,36 @@ var (
 	}
 	propPrincipalRequirements = []string{domain.RequirePrincipalAny, domain.RequirePrincipalUser}
 	propPrincipalTypes        = []domain.PrincipalType{"", domain.PrincipalUser, domain.PrincipalWorkload, domain.PrincipalUnknown}
+
+	// The URN a request may name a short grant type by (RFC 7523 §2.1,
+	// RFC 8693 §2.1). EnforcePolicy compares the short form.
+	propGrantTypeURN = map[string]string{
+		string(domain.GrantTypeJWTBearer):     "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		string(domain.GrantTypeTokenExchange): "urn:ietf:params:oauth:grant-type:token-exchange",
+	}
+
+	// The rank orders, written out rather than read from TrustLevelRank and
+	// attestationLevelRank, so a generator that draws "at least as strong" does
+	// not inherit a rank bug from the code under test. An unknown trust level
+	// ranks below every known one; an unknown attestation level counts as none.
+	propTrustRanks = map[string]int{
+		string(domain.TrustLevelUnverified): 0, string(domain.TrustLevelVerifiedThirdParty): 1, string(domain.TrustLevelFirstParty): 2,
+	}
+	propAttestationRanks = map[string]int{
+		string(domain.AttestationLevelSoftware): 1, string(domain.AttestationLevelPlatform): 2, string(domain.AttestationLevelHardware): 3,
+	}
 )
+
+func propTrustRank(level string) int {
+	if r, ok := propTrustRanks[level]; ok {
+		return r
+	}
+	return -1
+}
+
+func propAttestationRank(level string) int {
+	return propAttestationRanks[level]
+}
 
 func propPolicy(t *rapid.T, label string) *domain.CredentialPolicy {
 	return &domain.CredentialPolicy{
@@ -73,6 +103,30 @@ func propAtLeast(t *rapid.T, levels []string, min string, rank func(string) int,
 	return rapid.SampledFrom(ok).Draw(t, label)
 }
 
+// propJustBelow draws a level ranked one below min's, or one of unknown when
+// min is the weakest level. An empty min has nothing below it.
+func propJustBelow(t *rapid.T, levels []string, min string, rank func(string) int, unknown []string, label string) string {
+	var below []string
+	for _, l := range levels {
+		if l != "" && rank(l) == rank(min)-1 {
+			below = append(below, l)
+		}
+	}
+	if len(below) == 0 {
+		below = unknown
+	}
+	return rapid.SampledFrom(below).Draw(t, label)
+}
+
+// propRequestGrantType is gt as a request names it, by its URN half the time
+// when it has one.
+func propRequestGrantType(t *rapid.T, gt, label string) domain.GrantType {
+	if urn, ok := propGrantTypeURN[gt]; ok && rapid.Bool().Draw(t, label+".urn") {
+		return domain.GrantType(urn)
+	}
+	return domain.GrantType(gt)
+}
+
 // propNarrowerPolicy draws a policy no broader than wider on any axis.
 func propNarrowerPolicy(t *rapid.T, wider *domain.CredentialPolicy) *domain.CredentialPolicy {
 	principal := wider.RequiredPrincipalType
@@ -92,16 +146,17 @@ func propNarrowerPolicy(t *rapid.T, wider *domain.CredentialPolicy) *domain.Cred
 		AllowedGrantTypes:     grants,
 		AllowedScopes:         propNarrowScopeLayer(t, wider.AllowedScopes, "narrower.allowed_scopes"),
 		UserGrantScopes:       propNarrowScopeLayer(t, wider.UserGrantScopes, "narrower.user_grant_scopes"),
-		RequiredTrustLevel:    propAtLeast(t, propTrustLevels, wider.RequiredTrustLevel, domain.TrustLevelRank, "narrower.trust"),
-		RequiredAttestation:   propAtLeast(t, propAttestations, wider.RequiredAttestation, attestationLevelRank, "narrower.attestation"),
+		RequiredTrustLevel:    propAtLeast(t, propTrustLevels, wider.RequiredTrustLevel, propTrustRank, "narrower.trust"),
+		RequiredAttestation:   propAtLeast(t, propAttestations, wider.RequiredAttestation, propAttestationRank, "narrower.attestation"),
 		MaxDelegationDepth:    rapid.IntRange(0, wider.MaxDelegationDepth).Draw(t, "narrower.depth"),
 		RequiredPrincipalType: principal,
 	}
 }
 
-// propPerturbedNarrowing draws a narrowing of wider with one axis then
-// redrawn freely, so EnforceSubset sees both policies it must pass and
-// near-misses it must refuse, far more often than two independent draws give.
+// propPerturbedNarrowing draws a narrowing of wider with one of its eight
+// axes then redrawn freely (one draw in nine redraws none), so EnforceSubset
+// sees both policies it must pass and near-misses it must refuse, far more
+// often than two independent draws give.
 func propPerturbedNarrowing(t *rapid.T, wider *domain.CredentialPolicy) *domain.CredentialPolicy {
 	p := propNarrowerPolicy(t, wider)
 	free := propPolicy(t, "free")
@@ -129,10 +184,10 @@ func propPerturbedNarrowing(t *rapid.T, wider *domain.CredentialPolicy) *domain.
 func propEnforceRequest(t *rapid.T) EnforcePolicyRequest {
 	return EnforcePolicyRequest{
 		TTL:              rapid.IntRange(1, 7200).Draw(t, "req.ttl"),
-		GrantType:        domain.GrantType(rapid.SampledFrom(propGrantTypes).Draw(t, "req.grant_type")),
+		GrantType:        propRequestGrantType(t, rapid.SampledFrom(propGrantTypes).Draw(t, "req.grant_type"), "req.grant_type"),
 		Scopes:           propScopeList().Draw(t, "req.scopes"),
-		TrustLevel:       domain.TrustLevel(rapid.SampledFrom(append(propTrustLevels[1:], "", "root")).Draw(t, "req.trust")),
-		AttestationLevel: rapid.SampledFrom(append(propAttestations, "tpm")).Draw(t, "req.attestation"),
+		TrustLevel:       domain.TrustLevel(rapid.SampledFrom(append(propTrustLevels[1:], "", "root", "First_Party")).Draw(t, "req.trust")),
+		AttestationLevel: rapid.SampledFrom(append(propAttestations, "tpm", "Hardware")).Draw(t, "req.attestation"),
 		DelegationDepth:  rapid.IntRange(0, 6).Draw(t, "req.depth"),
 		PrincipalType:    rapid.SampledFrom(propPrincipalTypes).Draw(t, "req.principal"),
 		UserGrantBounded: rapid.Bool().Draw(t, "req.user_grant_bounded"),
@@ -155,28 +210,28 @@ func propAdmittedRequest(t *rapid.T, policy *domain.CredentialPolicy) EnforcePol
 	req := propEnforceRequest(t)
 	req.TTL = propUpTo(t, 1, policy.MaxTTLSeconds, "admitted.ttl")
 	if len(policy.AllowedGrantTypes) > 0 {
-		req.GrantType = domain.GrantType(rapid.SampledFrom(policy.AllowedGrantTypes).Draw(t, "admitted.grant_type"))
+		req.GrantType = propRequestGrantType(t, rapid.SampledFrom(policy.AllowedGrantTypes).Draw(t, "admitted.grant_type"), "admitted.grant_type")
 	}
 	if policy.RequiredPrincipalType == domain.RequirePrincipalUser {
 		req.PrincipalType = domain.PrincipalUser
 	}
-	if ceiling := scopeCeiling(policy, req); len(ceiling) > 0 {
+	if ceiling := propScopeCeiling(policy, req); len(ceiling) > 0 {
 		req.Scopes = rapid.SliceOfN(rapid.SampledFrom(ceiling), 0, 4).Draw(t, "admitted.scopes")
 	}
 	if policy.RequiredTrustLevel != "" {
-		req.TrustLevel = domain.TrustLevel(propAtLeast(t, propTrustLevels, policy.RequiredTrustLevel, domain.TrustLevelRank, "admitted.trust"))
+		req.TrustLevel = domain.TrustLevel(propAtLeast(t, propTrustLevels, policy.RequiredTrustLevel, propTrustRank, "admitted.trust"))
 	}
 	if policy.RequiredAttestation != "" {
-		req.AttestationLevel = propAtLeast(t, propAttestations, policy.RequiredAttestation, attestationLevelRank, "admitted.attestation")
+		req.AttestationLevel = propAtLeast(t, propAttestations, policy.RequiredAttestation, propAttestationRank, "admitted.attestation")
 	}
 	req.DelegationDepth = propUpTo(t, 0, policy.MaxDelegationDepth, "admitted.depth")
 	return req
 }
 
 // propRequestNear mostly draws a request shaped to pass policy, often with
-// one axis then redrawn freely, and otherwise a free request. Free requests
-// alone are refused on some axis almost always, which leaves the properties
-// below with nothing admitted to check.
+// one axis then redrawn freely or pushed just past its bound, and otherwise a
+// free request. Free requests alone are refused on some axis almost always,
+// which leaves the properties below with nothing admitted to check.
 func propRequestNear(t *rapid.T, policy *domain.CredentialPolicy) EnforcePolicyRequest {
 	free := propEnforceRequest(t)
 	if rapid.IntRange(0, 3).Draw(t, "near") == 0 {
@@ -200,8 +255,70 @@ func propRequestNear(t *rapid.T, policy *domain.CredentialPolicy) EnforcePolicyR
 		req.PrincipalType = free.PrincipalType
 	case 7:
 		req.UserGrantBounded = !req.UserGrantBounded
+	case 8:
+		req.TTL = policy.MaxTTLSeconds + 1
+	case 9:
+		req.DelegationDepth = policy.MaxDelegationDepth + 1
+	case 10:
+		if policy.RequiredTrustLevel != "" {
+			req.TrustLevel = domain.TrustLevel(propJustBelow(t, propTrustLevels, policy.RequiredTrustLevel, propTrustRank, []string{"", "root", "First_Party"}, "near.trust"))
+		}
+	case 11:
+		if policy.RequiredAttestation != "" {
+			req.AttestationLevel = propJustBelow(t, propAttestations, policy.RequiredAttestation, propAttestationRank, []string{"", "tpm", "Hardware"}, "near.attestation")
+		}
 	}
 	return req
+}
+
+// propScopeCeiling is the ceiling EnforcePolicy's scope check documents (D10):
+// user_grant_scopes for a bounded user-subject chain, else allowed_scopes.
+func propScopeCeiling(policy *domain.CredentialPolicy, req EnforcePolicyRequest) []string {
+	if req.UserGrantBounded && req.PrincipalType == domain.PrincipalUser {
+		return policy.UserGrantScopes
+	}
+	return policy.AllowedScopes
+}
+
+// propAdmits is EnforcePolicy's checks as its comments state them, for an
+// active, unexpired policy, written without calling EnforcePolicy's helpers.
+func propAdmits(policy *domain.CredentialPolicy, req EnforcePolicyRequest) bool {
+	gt := string(req.GrantType)
+	for short, urn := range propGrantTypeURN {
+		if gt == urn {
+			gt = short
+		}
+	}
+	ceiling := propScopeCeiling(policy, req)
+	switch {
+	case req.TTL > policy.MaxTTLSeconds,
+		!slices.Contains(policy.AllowedGrantTypes, gt),
+		policy.RequiredPrincipalType == domain.RequirePrincipalUser && req.PrincipalType != domain.PrincipalUser,
+		len(ceiling) > 0 && !propSubset(req.Scopes, ceiling),
+		policy.RequiredTrustLevel != "" && propTrustRank(string(req.TrustLevel)) < propTrustRank(policy.RequiredTrustLevel),
+		policy.RequiredAttestation != "" && propAttestationRank(req.AttestationLevel) < propAttestationRank(policy.RequiredAttestation),
+		req.DelegationDepth > policy.MaxDelegationDepth:
+		return false
+	}
+	return true
+}
+
+// TestProperty_EnforcePolicy_AdmitsExactlyWhatEveryCheckAllows: EnforcePolicy admits a request iff it passes each check its comments list, so a request on a bound is admitted and one a step past it is refused.
+func TestProperty_EnforcePolicy_AdmitsExactlyWhatEveryCheckAllows(t *testing.T) {
+	svc := &CredentialPolicyService{}
+	rapid.Check(t, func(t *rapid.T) {
+		policy := propPolicy(t, "policy")
+		for range 8 {
+			req := propRequestNear(t, policy)
+			err := svc.EnforcePolicy(t.Context(), policy, req)
+			if want := propAdmits(policy, req); (err == nil) != want {
+				t.Fatalf("EnforcePolicy(%+v, %+v) = %v, want admitted=%v", policy, req, err, want)
+			}
+			if err != nil && !errors.Is(err, ErrPolicyViolation) {
+				t.Fatalf("refusal is %v, want ErrPolicyViolation", err)
+			}
+		}
+	})
 }
 
 // TestProperty_EnforcePolicy_NeverAdmitsOutsideItsScopeCeiling: an admitted request names only scopes in scopeCeiling, which is user_grant_scopes exactly for a bounded user-subject chain.
@@ -212,10 +329,7 @@ func TestProperty_EnforcePolicy_NeverAdmitsOutsideItsScopeCeiling(t *testing.T) 
 		req := propRequestNear(t, policy)
 
 		ceiling := scopeCeiling(policy, req)
-		want := policy.AllowedScopes
-		if req.UserGrantBounded && req.PrincipalType == domain.PrincipalUser {
-			want = policy.UserGrantScopes
-		}
+		want := propScopeCeiling(policy, req)
 		if !propSameSet(ceiling, want) || len(ceiling) != len(want) {
 			t.Fatalf("scopeCeiling = %v, want %v", ceiling, want)
 		}
@@ -262,7 +376,7 @@ func TestProperty_EnforceSubset_NeverPassesAPolicyThatAdmitsMore(t *testing.T) {
 	svc := &CredentialPolicyService{}
 	rapid.Check(t, func(t *rapid.T) {
 		wider := propPolicy(t, "wider")
-		// Each narrowing perturbs one axis of nine, so several per wider
+		// Each narrowing perturbs at most one axis, so several per wider
 		// policy are drawn: with one, a check whose single axis EnforceSubset
 		// skipped went untested on about one run in twenty.
 		for range 4 {
@@ -307,7 +421,7 @@ func TestProperty_EnforcePolicy_UnknownTrustLevelFailsClosed(t *testing.T) {
 		req.TrustLevel = domain.TrustLevel(rapid.OneOf(
 			rapid.SampledFrom([]string{"", "root", "First_Party", "first_party ", "verified"}),
 			rapid.String(),
-		).Filter(func(s string) bool { return domain.TrustLevelRank(s) < 0 }).Draw(t, "trust"))
+		).Filter(func(s string) bool { return propTrustRank(s) < 0 }).Draw(t, "trust"))
 
 		err := svc.EnforcePolicy(t.Context(), policy, req)
 		if !errors.Is(err, ErrPolicyViolation) || !strings.Contains(err.Error(), "identity trust level") {
