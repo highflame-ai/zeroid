@@ -43,21 +43,24 @@ func propHTUParts(t *rapid.T) propHTU {
 	// Percent-escapes are drawn whole: a lone '%' is not a URI, and
 	// normalizeHTU returns what it cannot parse unchanged, by design. The
 	// path's escapes encode characters that are not unreserved, so RFC 3986
-	// §6.2.2.2 does not allow decoding them and the path must come out as is.
+	// §6.2.2.2 does not allow decoding them.
+	//
+	// The path is drawn already in normal form, so no RFC 3986 normalization
+	// may change it: never empty (§6.2.3 lets "" become "/") and with no "."
+	// or ".." segment (§6.2.2.3 removes those). Empty segments are drawn,
+	// since "/a/" and "/a//b" are not "/a" and "/a/b".
 	segment := rapid.Map(rapid.SliceOfN(rapid.SampledFrom([]string{"a", "b", "c", "X", "Y", "Z", "0", "1", "9", "-", ".", "_", "~", "%2F", "%25", "%20"}), 1, 8), func(parts []string) string {
 		return strings.Join(parts, "")
-	})
-	var path strings.Builder
-	for _, s := range rapid.SliceOfN(segment, 0, 4).Draw(t, "path") {
-		path.WriteString("/" + s)
-	}
+	}).Filter(func(s string) bool { return s != "." && s != ".." })
+	segments := rapid.SliceOfN(rapid.OneOf(segment, segment, segment, rapid.Just("")), 1, 4).Draw(t, "path")
+	path := "/" + strings.Join(segments, "/")
 	queryPart := rapid.SliceOfN(rapid.SampledFrom([]string{"a", "X", "0", "=", "&", "-", ".", "~", "/", "?", "%2F", "%41"}), 0, 8)
 	joined := func(label string) string { return strings.Join(queryPart.Draw(t, label), "") }
 	return propHTU{
 		scheme:   rapid.SampledFrom([]string{"http", "https"}).Draw(t, "scheme"),
 		host:     rapid.StringOfN(rapid.SampledFrom(lower), 1, 10, -1).Draw(t, "host") + ".test",
 		port:     rapid.SampledFrom([]string{"", ":80", ":443", ":8080", ":8443"}).Draw(t, "port"),
-		path:     path.String(),
+		path:     path,
 		query:    joined("query"),
 		fragment: joined("fragment"),
 	}
@@ -78,7 +81,7 @@ func TestProperty_NormalizeHTU_Idempotent(t *testing.T) {
 	})
 }
 
-// TestProperty_NormalizeHTU_IgnoresQueryFragmentCaseAndDefaultPort: RFC 9449 §4.3 compares htu without query and fragment, after RFC 3986 §6.2.2.1 case and §6.2.3 default-port normalization (only the scheme's own default port), and keeps the path as is.
+// TestProperty_NormalizeHTU_IgnoresQueryFragmentCaseAndDefaultPort: RFC 9449 §4.3 compares htu without query and fragment, after RFC 3986 §6.2.2.1 case and §6.2.3 default-port normalization (only the scheme's own default port), and keeps a path already in normal form as is.
 func TestProperty_NormalizeHTU_IgnoresQueryFragmentCaseAndDefaultPort(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		u := propHTUParts(t)
