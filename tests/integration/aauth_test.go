@@ -1350,3 +1350,82 @@ func TestAAuthKeyRotation(t *testing.T) {
 	assert.Equal(t, set.Keys[0]["kid"], decodeJWTHeader(t, res.body["agent_token"].(string))["kid"], "new tokens use the new key")
 	assert.NotEqual(t, oldKid, set.Keys[0]["kid"])
 }
+
+// TestAAuthPersonServerReplicas: two ZeroID instances on one database run a
+// revocation pass at the same moment; each revocation reaches the person
+// server once.
+func TestAAuthPersonServerReplicas(t *testing.T) {
+	var keyPath string
+	a := newAAuthFedWith(t, func(c *zeroid.Config) { keyPath = c.AAuth.SigningKeyPath }, "aauth_agent")
+	ps := newFakePS(t, a)
+	status, body := a.f.call(t, http.MethodPatch, "/credential-policies/"+a.policy,
+		map[string]any{"aauth_person_server": "https://" + fakePSHost}, a.tn.headers)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+
+	const n = 6
+	for i := 0; i < n; i++ {
+		res := a.bootstrap(t, newAgentKey(t), a.assertion(t, nil))
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		row := a.credential(t, decodeJWTPayload(t, res.body["agent_token"].(string))["jti"].(string))
+		status, body := a.f.call(t, http.MethodPost, "/credentials/"+row["id"].(string)+"/revoke",
+			map[string]any{"reason": "test"}, a.tn.headers)
+		require.Contains(t, []int{http.StatusOK, http.StatusNoContent}, status, "revoke: %v", body)
+	}
+
+	// A second instance: the same database and signing key.
+	replica, _ := newAAuthServer(t, func(c *zeroid.Config) { c.AAuth.SigningKeyPath = keyPath })
+	var wg sync.WaitGroup
+	done := make([]int, 2)
+	for i, srv := range []*zeroid.Server{a.f.srv, replica} {
+		wg.Add(1)
+		go func(i int, srv *zeroid.Server) {
+			defer wg.Done()
+			got, err := srv.RunAAuthPersonServerRevocationsOnce(context.Background())
+			assert.NoError(t, err)
+			done[i] = got
+		}(i, srv)
+	}
+	wg.Wait()
+	revoked, _, sigErrs, posts := ps.state()
+	assert.Empty(t, sigErrs)
+	assert.Len(t, revoked, n)
+	assert.Equal(t, n, posts, "each revocation was sent once, not once per instance")
+	assert.Equal(t, n, done[0]+done[1])
+}
+
+// TestAAuthConcurrency: parallel enrollments and sub-agent requests all
+// succeed, with no server errors.
+func TestAAuthConcurrency(t *testing.T) {
+	a := newAAuthFedWith(t, func(c *zeroid.Config) { c.AAuth.RequestsPerMinute = 1000; c.AAuth.MaxLiveSubagents = 1000 },
+		"aauth_agent", "aauth_subagent")
+	const n = 40
+	statuses := make([]int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			statuses[i] = a.bootstrap(t, newAgentKey(t), a.assertion(t, nil)).status
+		}(i)
+	}
+	wg.Wait()
+	for i, s := range statuses {
+		assert.Equal(t, http.StatusOK, s, "enrollment %d", i)
+	}
+
+	pk := newAgentKey(t)
+	res := a.bootstrap(t, pk, a.assertion(t, nil))
+	require.Equal(t, http.StatusOK, res.status)
+	parent := res.body["agent_token"].(string)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			statuses[i] = a.subagent(t, pk, parent, newAgentKey(t), fmt.Sprintf("p%d", i)).status
+		}(i)
+	}
+	wg.Wait()
+	for i, s := range statuses {
+		assert.Equal(t, http.StatusOK, s, "sub-agent %d", i)
+	}
+}
