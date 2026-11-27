@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -44,7 +46,15 @@ func NewSignalService(repo *postgres.SignalRepository, credentialSvc *Credential
 	}
 }
 
-// IngestSignal records a new CAE signal and fans it out to subscribers.
+// ErrSignalAutoRevokeFailed is returned, with the stored signal, when a high
+// or critical signal was recorded but revoking its identity's credentials
+// failed. Ingesting the signal again runs the revocation again.
+var ErrSignalAutoRevokeFailed = errors.New("the signal was recorded, but revoking the identity's credentials failed")
+
+// IngestSignal records a new CAE signal and fans it out to subscribers. For a
+// high or critical signal it first revokes every credential of the identity;
+// if that fails, the signal is still recorded and fanned out, and the error
+// (ErrSignalAutoRevokeFailed) is returned with it.
 func (s *SignalService) IngestSignal(ctx context.Context, accountID, projectID, identityID string, signalType domain.SignalType, severity domain.SignalSeverity, source string, payload map[string]any) (*domain.CAESignal, error) {
 	signal := &domain.CAESignal{
 		ID:         uuid.New().String(),
@@ -70,6 +80,10 @@ func (s *SignalService) IngestSignal(ctx context.Context, accountID, projectID, 
 		Msg("CAE signal ingested")
 
 	// Auto-revoke all active credentials for high/critical severity signals.
+	// A failed revocation is returned with the stored signal, after the
+	// fan-out: the signal happened, but the caller must not take it as
+	// handled while the identity's tokens are still live.
+	//
 	// Gate the destructive cascade on a tenant-scoped identity lookup: the
 	// signal row itself is scoped by the caller's tenant, but the underlying
 	// RevokeAllActiveForIdentity repo call takes only an identity UUID. A
@@ -77,8 +91,15 @@ func (s *SignalService) IngestSignal(ctx context.Context, accountID, projectID, 
 	// otherwise revoke that tenant's credentials by UUID guess. The signal
 	// is still stored so the audit trail of the attempt lives in the
 	// caller's tenant log.
+	var revokeErr error
 	if identityID != "" && (severity == domain.SignalSeverityHigh || severity == domain.SignalSeverityCritical) {
-		if _, err := s.identityRepo.GetByID(ctx, identityID, accountID, projectID); err != nil {
+		if _, err := s.identityRepo.GetByID(ctx, identityID, accountID, projectID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			// The signal row's foreign key says the identity exists, so
+			// this is a failure to read it, not a foreign identity.
+			log.Error().Err(err).Str("signal_id", signal.ID).Str("identity_id", identityID).
+				Msg("could not look up the signal's identity; nothing was auto-revoked")
+			revokeErr = fmt.Errorf("%w: look up identity: %w", ErrSignalAutoRevokeFailed, err)
+		} else if err != nil {
 			log.Warn().
 				Err(err).
 				Str("signal_id", signal.ID).
@@ -90,7 +111,9 @@ func (s *SignalService) IngestSignal(ctx context.Context, accountID, projectID, 
 			reason := fmt.Sprintf("auto-revoked by CAE signal %s (severity: %s)", signal.ID, severity)
 			n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identityID, reason)
 			if err != nil {
-				log.Error().Err(err).Str("identity_id", identityID).Msg("Failed to auto-revoke credentials on high/critical signal")
+				log.Error().Err(err).Str("identity_id", identityID).Str("signal_id", signal.ID).
+					Msg("Failed to auto-revoke credentials on high/critical signal")
+				revokeErr = fmt.Errorf("%w: %w", ErrSignalAutoRevokeFailed, err)
 			} else if n > 0 {
 				log.Info().
 					Int64("revoked_count", n).
@@ -116,7 +139,7 @@ func (s *SignalService) IngestSignal(ctx context.Context, accountID, projectID, 
 		}
 	}
 
-	return signal, nil
+	return signal, revokeErr
 }
 
 // Subscribe registers a new real-time subscriber for CAE signals.

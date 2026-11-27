@@ -2,10 +2,14 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/highflame-ai/zeroid/domain"
 )
@@ -216,16 +220,11 @@ type RevokedCredential struct {
 // total number of credentials revoked.
 func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) ([]RevokedCredential, error) {
 	now := time.Now()
-	var rows []RevokedCredential
-	db := dbOrTx(ctx, r.db)
-	if err := db.NewRaw(
+	rows, err := r.runCascade(ctx, now,
 		"SELECT jti, identity_id, account_id, project_id, expires_at FROM revoke_credentials_cascade(?, ?, ?)",
-		identityID, now, reason,
-	).Scan(ctx, &rows); err != nil {
+		identityID, now, reason)
+	if err != nil {
 		return nil, fmt.Errorf("failed to cascade-revoke credentials for identity %s: %w", identityID, err)
-	}
-	for i := range rows {
-		rows[i].RevokedAt = now
 	}
 	return rows, nil
 }
@@ -243,18 +242,66 @@ func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, i
 // timestamp; len(result) is the total number revoked.
 func (r *CredentialRepository) RevokeAllActiveForOwner(ctx context.Context, ownerUserID, accountID, reason string) ([]RevokedCredential, error) {
 	now := time.Now()
-	var rows []RevokedCredential
-	db := dbOrTx(ctx, r.db)
-	if err := db.NewRaw(
+	rows, err := r.runCascade(ctx, now,
 		"SELECT jti, identity_id, account_id, project_id, expires_at FROM revoke_credentials_by_owner(?, ?, ?, ?)",
-		ownerUserID, accountID, now, reason,
-	).Scan(ctx, &rows); err != nil {
+		ownerUserID, accountID, now, reason)
+	if err != nil {
 		return nil, fmt.Errorf("failed to cascade-revoke credentials for owner %s in account %s: %w", ownerUserID, accountID, err)
 	}
-	for i := range rows {
-		rows[i].RevokedAt = now
-	}
 	return rows, nil
+}
+
+// CascadeRevocationAttempts is how many times a cascade revocation runs when
+// PostgreSQL aborts it as a deadlock victim or a serialization failure.
+const CascadeRevocationAttempts = 3
+
+// runCascade runs one call of a cascade revocation function and stamps the
+// rows it returns with revokedAt. A cascade that PostgreSQL aborts as a
+// deadlock victim (40P01) or a serialization failure (40001) revoked nothing,
+// so it is run again, up to CascadeRevocationAttempts times in all. The
+// cascades lock parents before children (migrations 073 and 074), but two of
+// them can still deadlock. That order rests on issued_at, which rows stored
+// before Create moved it can have inverted. And when a delegation chain
+// passes through the same identity twice, that identity's cascade locks a
+// token below one that another cascade holds before it walks. A failure of
+// any other kind is returned at once.
+//
+// Inside a caller's transaction the abort has already rolled the transaction
+// back, so the error is returned for the caller to retry the whole of it.
+func (r *CredentialRepository) runCascade(ctx context.Context, revokedAt time.Time, query string, args ...any) ([]RevokedCredential, error) {
+	_, inTx := txFromContext(ctx)
+	db := dbOrTx(ctx, r.db)
+	for attempt := 1; ; attempt++ {
+		var rows []RevokedCredential
+		err := db.NewRaw(query, args...).Scan(ctx, &rows)
+		if err == nil {
+			for i := range rows {
+				rows[i].RevokedAt = revokedAt
+			}
+			return rows, nil
+		}
+		if inTx || attempt == CascadeRevocationAttempts || !isTransientTxError(err) {
+			return nil, err
+		}
+		log.Warn().Err(err).Int("attempt", attempt).Msg("cascade revocation aborted by the database; running it again")
+		select {
+		case <-ctx.Done():
+			return nil, errors.Join(err, ctx.Err())
+		case <-time.After(time.Duration(attempt*attempt)*25*time.Millisecond + time.Duration(rand.Int64N(int64(25*time.Millisecond)))):
+		}
+	}
+}
+
+// isTransientTxError reports whether err is a PostgreSQL deadlock (40P01) or
+// serialization failure (40001): the transaction was rolled back and running
+// it again can succeed.
+func isTransientTxError(err error) bool {
+	var pgErr pgdriver.Error
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	code := pgErr.Field('C')
+	return code == "40P01" || code == "40001"
 }
 
 // Revoke marks a credential as revoked and cascades the revocation to every
@@ -315,16 +362,11 @@ func (r *CredentialRepository) ListActiveByRefreshFamily(ctx context.Context, fa
 
 func (r *CredentialRepository) Revoke(ctx context.Context, id, accountID, projectID, reason string) ([]RevokedCredential, error) {
 	now := time.Now()
-	var rows []RevokedCredential
-	db := dbOrTx(ctx, r.db)
-	if err := db.NewRaw(
+	rows, err := r.runCascade(ctx, now,
 		"SELECT jti, identity_id, account_id, project_id, expires_at FROM revoke_credential_cascade(?, ?, ?, ?, ?)",
-		id, accountID, projectID, now, reason,
-	).Scan(ctx, &rows); err != nil {
+		id, accountID, projectID, now, reason)
+	if err != nil {
 		return nil, fmt.Errorf("failed to cascade-revoke credential %s: %w", id, err)
-	}
-	for i := range rows {
-		rows[i].RevokedAt = now
 	}
 	return rows, nil
 }

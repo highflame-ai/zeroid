@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -13,6 +14,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
+	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // ── Signal types ────────────────────────────────────────────────────────────
@@ -98,6 +100,10 @@ func (a *API) ingestSignalOp(ctx context.Context, input *IngestSignalInput) (*Si
 		input.Body.Source,
 		input.Body.Payload,
 	)
+	if errors.Is(err, service.ErrSignalAutoRevokeFailed) {
+		// Logged by the service. Retrying the signal revokes again.
+		return nil, huma.Error500InternalServerError("the signal was recorded, but revoking the identity's credentials failed; send it again")
+	}
 	if err != nil {
 		log.Error().Err(err).Str("signal_type", input.Body.SignalType).Msg("failed to ingest signal")
 		return nil, huma.Error500InternalServerError("failed to ingest signal")
