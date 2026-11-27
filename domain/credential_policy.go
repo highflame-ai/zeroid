@@ -20,8 +20,8 @@ const (
 	// Set generously so out-of-the-box multi-hop agent chains
 	// (orchestrator → sub-agent → tool-agent → …) succeed without custom
 	// policies. Tenants that require stricter delegation limits attach a
-	// narrower policy explicitly. The revocation cascade caps traversal
-	// at 50 independently (migration 007).
+	// narrower policy explicitly. A policy may set 0 (no delegation) up to
+	// MaxDelegationDepthLimit.
 	DefaultMaxDelegationDepth = 5
 )
 

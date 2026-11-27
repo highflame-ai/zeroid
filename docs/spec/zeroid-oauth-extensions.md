@@ -315,7 +315,9 @@ claims — are specified in Sections 4.3, 4.4, and 4.8.
   rather than trusting either alone. Prior actors carry only `sub`. On an exchange from a
   root grant, the root token's `client_id` becomes the first prior actor. The
   chain is capped at 16 actors for token size; past it the deepest prior actors
-  are dropped, which §4.1 allows because they are informational.
+  are dropped, which §4.1 allows because they are informational. A token at
+  `delegation_depth` d names at most d+1 actors, and depth is held to 15
+  (Section 5.2), so an exchanged token's chain fits the cap and none is dropped.
 - A root grant has no `act`. An `api_key` token in particular carries none: the
   key's creator is not acting, and stays identity metadata in `owner_user_id`.
 
@@ -513,6 +515,13 @@ Each exchange increments `delegation_depth` by 1 relative to the subject token.
 The actor's credential policy `max_delegation_depth` caps the chain: an exchange
 that would exceed it **MUST** be rejected. `delegation_depth` is emitted as a
 claim only when &gt; 0 (Section 4.3).
+
+`max_delegation_depth` ranges from 0, which allows no delegation, to 15. Creating
+or updating a policy with a value outside that range is a `400`. Fifteen is the
+deepest chain whose `act` claim names every actor: the delegates, then the root
+grant's client, 16 in all (Section 4.1). Issuance also refuses any token past
+depth 15 with `policy_violation`, whatever its policies allow, so a policy stored
+with a larger value before the range was enforced is held to 15.
 
 Under the `rfc8693` profile, an exchange whose actor already **is** the subject
 token's current actor (its `act.sub`, ADR 0043 D2) is a re-scoping, not a

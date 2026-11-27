@@ -73,6 +73,14 @@ func (t PrincipalType) IsValid() bool {
 // and the current actor.
 const MaxActorChainDepth = 16
 
+// MaxDelegationDepthLimit is the largest max_delegation_depth a credential
+// policy may set, and the deepest delegation_depth issuance allows whatever a
+// stored policy says. A token at depth d names up to d+1 actors in its `act`
+// claim (every delegate, then the client of the root grant), so a chain held
+// to this depth always fits within MaxActorChainDepth and its `act` claim
+// names every actor.
+const MaxDelegationDepthLimit = MaxActorChainDepth - 1
+
 // Actor is one entry in a token's RFC 8693 §4.1 `act` chain. Only workloads
 // appear as actors: agents, and gateways that exchange on a caller's behalf.
 // The person is always `sub`, never an actor.

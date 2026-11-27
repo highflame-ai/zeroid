@@ -192,6 +192,9 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 	if err := validateRequiredPrincipalType(req.RequiredPrincipalType); err != nil {
 		return nil, err
 	}
+	if err := validateMaxDelegationDepth(req.MaxDelegationDepth); err != nil {
+		return nil, err
+	}
 
 	policy := &domain.CredentialPolicy{
 		ID:                    uuid.New().String(),
@@ -354,6 +357,9 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 		policy.RequiredAttestation = *req.RequiredAttestation
 	}
 	if req.MaxDelegationDepth != nil {
+		if err := validateMaxDelegationDepth(*req.MaxDelegationDepth); err != nil {
+			return nil, err
+		}
 		policy.MaxDelegationDepth = *req.MaxDelegationDepth
 	}
 	if req.JWTTyp != nil {
@@ -487,12 +493,35 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 		}
 	}
 
-	// 6. Delegation depth <= policy.max_delegation_depth
+	// 6. Delegation depth <= policy.max_delegation_depth, and never past
+	// domain.MaxDelegationDepthLimit: a policy stored before that limit was
+	// enforced on writes may hold a larger value, and a deeper token's act
+	// claim could not name every actor in its chain.
 	if req.DelegationDepth > policy.MaxDelegationDepth {
 		return fmt.Errorf("%w: delegation depth %d exceeds policy maximum %d", ErrPolicyViolation, req.DelegationDepth, policy.MaxDelegationDepth)
 	}
+	if req.DelegationDepth > domain.MaxDelegationDepthLimit {
+		return errDelegationDepthLimit(req.DelegationDepth)
+	}
 
 	return nil
+}
+
+// validateMaxDelegationDepth holds a policy's max_delegation_depth to 0 (no
+// delegation) through domain.MaxDelegationDepthLimit.
+func validateMaxDelegationDepth(depth int) error {
+	if depth < 0 || depth > domain.MaxDelegationDepthLimit {
+		return fmt.Errorf("%w: max_delegation_depth %d is out of range (must be 0 to %d)",
+			ErrInvalidPolicyField, depth, domain.MaxDelegationDepthLimit)
+	}
+	return nil
+}
+
+// errDelegationDepthLimit refuses a token deeper than
+// domain.MaxDelegationDepthLimit, whatever its policies allow.
+func errDelegationDepthLimit(depth int) error {
+	return fmt.Errorf("%w: delegation depth %d exceeds the maximum of %d, past which the act claim cannot name every actor in the chain",
+		ErrPolicyViolation, depth, domain.MaxDelegationDepthLimit)
 }
 
 // principalTypeLabel names a principal type in a policy denial.

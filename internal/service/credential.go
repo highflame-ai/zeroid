@@ -802,6 +802,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 			return nil, nil, err
 		}
 	}
+	// EnforcePolicy holds a chain to the same limit; this covers the grants
+	// no credential policy governs.
+	if req.DelegationDepth > domain.MaxDelegationDepthLimit {
+		return nil, nil, errDelegationDepthLimit(req.DelegationDepth)
+	}
 
 	ttl, ttlRequested, err := s.issueTTL(req)
 	if err != nil {
