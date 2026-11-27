@@ -18,27 +18,42 @@ import (
 // alphabet is small on purpose, so generated requests and ceilings overlap,
 // collide and come out disjoint often enough to reach every branch. Scope
 // names carry a digit so a name can be found in a denial's text without
-// matching the surrounding prose.
+// matching the surrounding prose. Scopes are case-sensitive (RFC 6749 §3.3),
+// so the alphabet also holds "S1" and "ſ1" (U+017F, which Unicode case
+// folding maps to "s"): a comparison that folds case would grant them as s1.
 
-var propScopeAlphabet = []string{"s0", "s1", "s2", "s3", "s4", "s5"}
+var propScopeAlphabet = []string{"s0", "s1", "s2", "s3", "s4", "s5", "S1", "ſ1"}
 
 func propScope() *rapid.Generator[string] {
 	return rapid.SampledFrom(propScopeAlphabet)
 }
 
 // propScopeList is a scope list as a policy or identity row stores one:
-// possibly empty (no restriction), possibly with repeats.
+// possibly empty (no restriction), possibly with repeats. An empty list is
+// nil half the time, because callers pass both and rapid draws only non-nil
+// slices.
 func propScopeList() *rapid.Generator[[]string] {
-	return rapid.SliceOfN(propScope(), 0, 5)
+	return rapid.Custom(func(t *rapid.T) []string {
+		return propNilIfEmpty(t, rapid.SliceOfN(propScope(), 0, 5).Draw(t, "scopes"))
+	})
 }
 
-// propScopeRequest is a raw `scope` parameter: the list joined with any mix of
-// the whitespace parseScopeString splits on, so "omitted" also covers "  ".
-// A quarter of the draws are exactly "", the parameter left out, which the
-// joined form alone reaches only about one draw in twenty.
-func propScopeRequest(t *rapid.T, label string) string {
+func propNilIfEmpty(t *rapid.T, xs []string) []string {
+	if len(xs) == 0 && rapid.Bool().Draw(t, "nil") {
+		return nil
+	}
+	return xs
+}
+
+// propScopeRequest is a raw `scope` parameter and the scopes it names: the
+// list joined with any mix of the whitespace parseScopeString splits on, so
+// "omitted" also covers "  ". A quarter of the draws are exactly "", the
+// parameter left out, which the joined form alone reaches only about one draw
+// in twenty. Properties read the request from named rather than through
+// parseScopeString, so a splitting bug cannot cancel out of both sides.
+func propScopeRequest(t *rapid.T, label string) (raw string, named []string) {
 	if rapid.IntRange(0, 3).Draw(t, label+"-absent") == 0 {
-		return ""
+		return "", nil
 	}
 	scopes := rapid.SliceOfN(propScope(), 0, 5).Draw(t, label)
 	space := rapid.SampledFrom([]string{" ", "  ", "\t", " \t "})
@@ -51,7 +66,7 @@ func propScopeRequest(t *rapid.T, label string) string {
 		b.WriteString(s)
 	}
 	b.WriteString(rapid.SampledFrom([]string{"", " ", "\t "}).Draw(t, label+"-tail"))
-	return b.String()
+	return b.String(), scopes
 }
 
 func propSet(scopes []string) map[string]bool {
@@ -84,14 +99,14 @@ func isInvalidScope(err error) bool {
 // propExpectedGrant is the documented grant, computed as sets: the request (or,
 // when it is omitted, the first restricting ceiling) intersected with every
 // restricting ceiling.
-func propExpectedGrant(requestedRaw string, ceilings [][]string) (granted map[string]bool, restricted bool) {
+func propExpectedGrant(named []string, ceilings [][]string) (granted map[string]bool, restricted bool) {
 	var restricting [][]string
 	for _, c := range ceilings {
 		if len(c) > 0 {
 			restricting = append(restricting, c)
 		}
 	}
-	base := parseScopeString(requestedRaw)
+	base := named
 	if len(base) == 0 && len(restricting) > 0 {
 		base = restricting[0]
 	}
@@ -107,17 +122,27 @@ func propExpectedGrant(requestedRaw string, ceilings [][]string) (granted map[st
 	return granted, len(restricting) > 0
 }
 
+// TestProperty_ParseScopeString_SplitsOnEveryRunOfWhitespace: a scope parameter reads back as exactly the scopes it was joined from, in order and with repeats, whatever whitespace separates or surrounds them.
+func TestProperty_ParseScopeString_SplitsOnEveryRunOfWhitespace(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		raw, named := propScopeRequest(t, "requested")
+		if got := parseScopeString(raw); !slices.Equal(got, named) {
+			t.Fatalf("parseScopeString(%q) = %q, want %q", raw, got, named)
+		}
+	})
+}
+
 // TestProperty_GrantScopes_SubsetOfEveryCeiling: a self-mint grant never holds a scope outside the request it named or outside any ceiling that restricts.
 func TestProperty_GrantScopes_SubsetOfEveryCeiling(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		requested := propScopeRequest(t, "requested")
+		requested, named := propScopeRequest(t, "requested")
 		ceilings := rapid.SliceOfN(propScopeList(), 0, 5).Draw(t, "ceilings")
 
 		got, err := grantScopes(requested, ceilings...)
 		if err != nil {
 			return
 		}
-		if asked := parseScopeString(requested); len(asked) > 0 && !propSubset(got, asked) {
+		if len(named) > 0 && !propSubset(got, named) {
 			t.Fatalf("grant %v holds a scope the request %q did not name", got, requested)
 		}
 		for i, c := range ceilings {
@@ -131,11 +156,11 @@ func TestProperty_GrantScopes_SubsetOfEveryCeiling(t *testing.T) {
 // TestProperty_GrantScopes_IsExactlyTheIntersection: a self-mint grant is the request (or the first restricting ceiling) narrowed by every restricting ceiling, and nothing every layer allows is dropped.
 func TestProperty_GrantScopes_IsExactlyTheIntersection(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		requested := propScopeRequest(t, "requested")
+		requested, named := propScopeRequest(t, "requested")
 		ceilings := rapid.SliceOfN(propScopeList(), 0, 5).Draw(t, "ceilings")
 
 		got, err := grantScopes(requested, ceilings...)
-		want, restricted := propExpectedGrant(requested, ceilings)
+		want, restricted := propExpectedGrant(named, ceilings)
 		if restricted && len(want) == 0 {
 			return // refused; TestProperty_GrantScopes_EmptyUnderACeilingIsRefused covers it
 		}
@@ -151,7 +176,7 @@ func TestProperty_GrantScopes_IsExactlyTheIntersection(t *testing.T) {
 // TestProperty_GrantScopes_EmptyUnderACeilingIsRefused: when any ceiling restricts and nothing survives, the grant is invalid_scope, never an empty grant that would mint a token with no scopes claim.
 func TestProperty_GrantScopes_EmptyUnderACeilingIsRefused(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		requested := propScopeRequest(t, "requested")
+		requested, _ := propScopeRequest(t, "requested")
 		ceilings := rapid.SliceOfN(propScopeList(), 0, 5).Draw(t, "ceilings")
 
 		got, err := grantScopes(requested, ceilings...)
@@ -171,7 +196,7 @@ func TestProperty_GrantScopes_EmptyUnderACeilingIsRefused(t *testing.T) {
 // TestProperty_GrantScopes_CeilingOrderIsIrrelevant: permuting the ceilings changes neither the granted set nor whether the grant is refused.
 func TestProperty_GrantScopes_CeilingOrderIsIrrelevant(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		requested := propScopeRequest(t, "requested")
+		requested, _ := propScopeRequest(t, "requested")
 		ceilings := rapid.SliceOfN(propScopeList(), 0, 5).Draw(t, "ceilings")
 		perm := rapid.Permutation(ceilings).Draw(t, "permuted")
 
@@ -189,11 +214,11 @@ func TestProperty_GrantScopes_CeilingOrderIsIrrelevant(t *testing.T) {
 // TestProperty_RequireGrantableScope_RefusesExactlyANamedRequestLeftEmpty: requireGrantableScope refuses iff the caller named a scope and nothing was granted.
 func TestProperty_RequireGrantableScope_RefusesExactlyANamedRequestLeftEmpty(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		requested := propScopeRequest(t, "requested")
+		requested, named := propScopeRequest(t, "requested")
 		granted := propScopeList().Draw(t, "granted")
 
 		err := requireGrantableScope(requested, granted)
-		wantRefused := len(parseScopeString(requested)) > 0 && len(granted) == 0
+		wantRefused := len(named) > 0 && len(granted) == 0
 		if (err != nil) != wantRefused {
 			t.Fatalf("requireGrantableScope(%q, %v) = %v, want refused=%v", requested, granted, err, wantRefused)
 		}
@@ -203,10 +228,10 @@ func TestProperty_RequireGrantableScope_RefusesExactlyANamedRequestLeftEmpty(t *
 	})
 }
 
-// TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingTerm: a delegation denial is always invalid_scope, names each requested scope under the first term that excludes it and no other, and names user_grant_scopes as the policy field exactly when userGrant is set.
+// TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingTerm: a delegation denial is always invalid_scope, says when no scope was requested, names each requested scope under the first term that excludes it and no other, and names user_grant_scopes as the policy field exactly when userGrant is set.
 func TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingTerm(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		requested := rapid.SliceOfNDistinct(propScope(), 0, 5, rapid.ID[string]).Draw(t, "requested")
+		requested := propNilIfEmpty(t, rapid.SliceOfNDistinct(propScope(), 0, 5, rapid.ID[string]).Draw(t, "requested"))
 		subjectHolds := propSet(propScopeList().Draw(t, "subject"))
 		actorPolicy := propScopeList().Draw(t, "actorPolicy")
 		actorRow := propScopeList().Draw(t, "actorRow")
@@ -217,10 +242,14 @@ func TestProperty_DelegationScopeDenial_AlwaysRefusesAndBlamesTheFirstExcludingT
 		if !isInvalidScope(err) {
 			t.Fatalf("denial is %v, want invalid_scope", err)
 		}
+		desc := err.(*OAuthError).Description
 		if len(requested) == 0 {
+			// token_exchange has no RFC 6749 §3.3 default, and the denial says so.
+			if !strings.Contains(desc, "no scopes were requested") {
+				t.Fatalf("an empty request %#v was not told it named no scope: %q", requested, desc)
+			}
 			return
 		}
-		desc := err.(*OAuthError).Description
 		terms := map[string]string{
 			"held":       "the subject token does not hold [",
 			"permitted":  "does not permit [",
@@ -413,13 +442,16 @@ func TestProperty_RevocationLookupOrder_SearchesEveryKindHintFirst(t *testing.T)
 func TestProperty_MayActPermits_OnlyTheNamedActorUnderOurIssuer(t *testing.T) {
 	const issuer = "https://zeroid.test"
 	actors := []string{"spiffe://zeroid.test/a/p/agent/b", "spiffe://zeroid.test/a/p/agent/c", ""}
+	// Values that differ from an actor or the issuer only in case, or are a
+	// prefix of every actor, so an inexact comparison permits them.
+	nearMisses := []string{"spiffe://zeroid.test/a/p/agent/B", "spiffe://zeroid.test/a/p/agent/", "https://ZeroID.test", "https://elsewhere.test"}
 	// Half the draws are the value that would permit, so the other members
 	// decide the outcome often enough to be tested.
 	claimValue := func(permitting string) *rapid.Generator[any] {
 		return rapid.OneOf(
 			rapid.Just[any](permitting),
 			rapid.Just[any](permitting),
-			rapid.Map(rapid.SampledFrom(append(slices.Clone(actors), issuer, "https://elsewhere.test")), func(s string) any { return s }),
+			rapid.Map(rapid.SampledFrom(slices.Concat(actors, []string{issuer}, nearMisses)), func(s string) any { return s }),
 			rapid.SampledFrom([]any{nil, 42.0, true, map[string]any{"sub": actors[0]}, []any{actors[0]}}),
 		)
 	}
