@@ -40,13 +40,17 @@ func propRandomCase(t *rapid.T, s, label string) string {
 
 func propHTUParts(t *rapid.T) propHTU {
 	lower := []rune("abcdefghijklmnopqrstuvwxyz0123456789")
-	segment := rapid.StringOfN(rapid.SampledFrom([]rune("abcXYZ019-._~")), 1, 8, -1)
+	// Percent-escapes are drawn whole: a lone '%' is not a URI, and
+	// normalizeHTU returns what it cannot parse unchanged, by design. The
+	// path's escapes encode characters that are not unreserved, so RFC 3986
+	// §6.2.2.2 does not allow decoding them and the path must come out as is.
+	segment := rapid.Map(rapid.SliceOfN(rapid.SampledFrom([]string{"a", "b", "c", "X", "Y", "Z", "0", "1", "9", "-", ".", "_", "~", "%2F", "%25", "%20"}), 1, 8), func(parts []string) string {
+		return strings.Join(parts, "")
+	})
 	var path strings.Builder
 	for _, s := range rapid.SliceOfN(segment, 0, 4).Draw(t, "path") {
 		path.WriteString("/" + s)
 	}
-	// Percent-escapes are drawn whole: a lone '%' is not a URI, and
-	// normalizeHTU returns what it cannot parse unchanged, by design.
 	queryPart := rapid.SliceOfN(rapid.SampledFrom([]string{"a", "X", "0", "=", "&", "-", ".", "~", "/", "?", "%2F", "%41"}), 0, 8)
 	joined := func(label string) string { return strings.Join(queryPart.Draw(t, label), "") }
 	return propHTU{
@@ -74,7 +78,7 @@ func TestProperty_NormalizeHTU_Idempotent(t *testing.T) {
 	})
 }
 
-// TestProperty_NormalizeHTU_IgnoresQueryFragmentCaseAndDefaultPort: RFC 9449 §4.3 compares htu without query and fragment, after RFC 3986 §6.2.2 case and default-port normalization, and keeps the path's case.
+// TestProperty_NormalizeHTU_IgnoresQueryFragmentCaseAndDefaultPort: RFC 9449 §4.3 compares htu without query and fragment, after RFC 3986 §6.2.2.1 case and §6.2.3 default-port normalization (only the scheme's own default port), and keeps the path as is.
 func TestProperty_NormalizeHTU_IgnoresQueryFragmentCaseAndDefaultPort(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		u := propHTUParts(t)
@@ -83,7 +87,13 @@ func TestProperty_NormalizeHTU_IgnoresQueryFragmentCaseAndDefaultPort(t *testing
 		if (u.scheme == "https" && u.port == ":443") || (u.scheme == "http" && u.port == ":80") {
 			bare.port = ""
 		}
-		want := normalizeHTU(bare.String())
+		// propHTUParts draws a lower-case scheme and host, so bare is already
+		// in normal form. Computing want from it, not from normalizeHTU, is
+		// what catches a normalizer that folds the other scheme's port too.
+		want := bare.String()
+		if got := normalizeHTU(want); got != want {
+			t.Fatalf("normalizeHTU(%q) = %q, want it unchanged", want, got)
+		}
 
 		variant := u
 		variant.scheme = propRandomCase(t, u.scheme, "schemeCase")
