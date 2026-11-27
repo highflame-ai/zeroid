@@ -29,10 +29,10 @@ func observed(endpoint string, h http.HandlerFunc) http.HandlerFunc {
 }
 
 func classify(rec *responseRecorder) (outcome, code string) {
-	switch {
-	case rec.status == http.StatusOK:
+	switch rec.status {
+	case http.StatusOK:
 		return "issued", ""
-	case rec.status == http.StatusUnauthorized:
+	case http.StatusUnauthorized:
 		// Signature-Error: error=<code>[, ...]
 		v := rec.Header().Get(HeaderSignatureError)
 		if _, after, ok := strings.Cut(v, "error="); ok {
