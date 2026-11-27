@@ -178,6 +178,17 @@ jobs:
         run: |-
           go test $(go list ./... | grep -v '/tests') -race -count=1 -timeout=300s
 
+      # pkg/authjwt, pkg/dpop and pkg/jwks are separate modules, so the root
+      # `go list ./...` above never reaches them. Test each from its own dir.
+      - name: Run Go unit tests in nested modules (race detector)
+        env:
+          CGO_ENABLED: 1
+        shell: bash
+        run: |-
+          for mod in pkg/*/go.mod; do
+            (cd "$(dirname "$mod")" && go test ./... -race -count=1 -timeout=300s)
+          done
+
       - name: Run Go integration tests in tests/
         env:
           CGO_ENABLED: 1

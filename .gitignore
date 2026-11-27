@@ -33,6 +33,8 @@ __pycache__/
 # Test
 *.test
 *.out
+# rapid writes a failing property's input here; rerun it with -rapid.failfile
+testdata/rapid/
 coverage.html
 coverage.txt
 

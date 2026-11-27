@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/lestrrat-go/jwx/v4 v4.4.0
 	github.com/rs/zerolog v1.35.1
+	pgregory.net/rapid v1.3.0
 )
 
 require (
