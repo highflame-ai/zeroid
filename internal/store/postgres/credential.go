@@ -258,13 +258,15 @@ const CascadeRevocationAttempts = 3
 // runCascade runs one call of a cascade revocation function and stamps the
 // rows it returns with revokedAt. A cascade that PostgreSQL aborts as a
 // deadlock victim (40P01) or a serialization failure (40001) revoked nothing,
-// so it is run again, up to CascadeRevocationAttempts times in all. The
-// cascades lock parents before children (migrations 073 and 074), but two of
-// them can still deadlock. That order rests on issued_at, which rows stored
-// before Create moved it can have inverted. And when a delegation chain
-// passes through the same identity twice, that identity's cascade locks a
-// token below one that another cascade holds before it walks. A failure of
-// any other kind is returned at once.
+// so it is run again, up to CascadeRevocationAttempts times in all. Each
+// cascade takes every lock it needs in its first statement, in one order that
+// puts a parent before its child (migrations 073 and 074), but a deadlock is
+// still possible in two cases. The order rests on issued_at, which rows
+// stored before Create moved it can have inverted, so a cascade and an
+// issuance below such a pair can take it in opposite orders. And a token
+// stored while a cascade's first statement waited is locked by its second
+// statement, after tokens that come later in the order. A failure of any
+// other kind is returned at once.
 //
 // Inside a caller's transaction the abort has already rolled the transaction
 // back, so the error is returned for the caller to retry the whole of it.
