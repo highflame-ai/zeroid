@@ -263,10 +263,9 @@ func TestProperty_EnforceSubset_NeverPassesAPolicyThatAdmitsMore(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		wider := propPolicy(t, "wider")
 		narrower := propPerturbedNarrowing(t, wider)
-		// EnforceSubset does not compare user_grant_scopes, and reads an empty
-		// narrower allowed_scopes as a subset of any list. Callers hold both
-		// with the identity-tree ceiling checks (ceilingLayers) and by
-		// enforcing every policy at issuance, so here both are taken as given.
+		// Stated on the axes EnforceSubset's doc comment lists: the narrower
+		// policy keeps the wider one's user_grant_scopes, and a scope list
+		// wherever the wider one has one.
 		narrower.UserGrantScopes = wider.UserGrantScopes
 		if len(wider.AllowedScopes) > 0 && len(narrower.AllowedScopes) == 0 {
 			narrower.AllowedScopes = wider.AllowedScopes[:1]
