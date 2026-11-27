@@ -56,11 +56,11 @@ func TestCascadeAnchorLockMigration(t *testing.T) {
 		return config, body
 	}
 
-	config, body := state()
+	_, body := state()
 	require.Contains(t, body, "FOR NO KEY UPDATE", "migration must be applied by the suite")
 	_, err = tx.ExecContext(ctx, string(down))
 	require.NoError(t, err)
-	config, body = state()
+	config, body := state()
 	assert.NotContains(t, body, "FOR NO KEY UPDATE", "down drops the anchor lock")
 	assert.Contains(t, config, "enable_hashjoin=off", "down keeps the index-walk pin")
 	assert.Contains(t, config, "enable_mergejoin=off", "down keeps the index-walk pin")

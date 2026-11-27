@@ -121,7 +121,7 @@ func rlWaitForLockWait[T any](t *testing.T, queryLike string, lockTypes []string
 			SELECT a.query FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
 			WHERE NOT l.granted AND l.locktype IN (?) AND a.query LIKE ?
 			  AND a.pid <> pg_backend_pid()`,
-			bun.In(lockTypes), "%"+queryLike+"%").Scan(context.Background(), &q))
+			bun.List(lockTypes), "%"+queryLike+"%").Scan(context.Background(), &q))
 		if len(q) > 0 {
 			return q[0]
 		}
