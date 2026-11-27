@@ -60,6 +60,14 @@ type Config struct {
 	SigningKeyPath string
 	// SigningKeyID is the key's kid; empty means its thumbprint.
 	SigningKeyID string
+	// RetiredSigningKeyPaths are earlier signing keys (PKCS#8 private or
+	// PKIX public PEM), still published and accepted so that rotating the
+	// signing key does not invalidate outstanding agent tokens. Keep one for
+	// the longest agent token lifetime after it stops signing, then drop it.
+	// RetiredSigningKeyIDs are their kids, in the same order; a missing or
+	// empty one means the key's thumbprint.
+	RetiredSigningKeyPaths []string
+	RetiredSigningKeyIDs   []string
 	// AgentTokenTTL is the agent token's lifetime, held to the identity's
 	// credential policy. Zero means DefaultAgentTokenTTL.
 	AgentTokenTTL time.Duration
@@ -122,6 +130,18 @@ func New(cfg Config, deps Deps) (*Provider, error) {
 	key, err := loadSigningKey(cfg.SigningKeyPath, cfg.SigningKeyID)
 	if err != nil {
 		return nil, fmt.Errorf("aauth: %w", err)
+	}
+	if len(cfg.RetiredSigningKeyIDs) > len(cfg.RetiredSigningKeyPaths) {
+		return nil, errors.New("aauth: more retired_signing_key_ids than retired_signing_key_paths")
+	}
+	for i, path := range cfg.RetiredSigningKeyPaths {
+		kid := ""
+		if i < len(cfg.RetiredSigningKeyIDs) {
+			kid = cfg.RetiredSigningKeyIDs[i]
+		}
+		if err := key.addRetired(path, kid); err != nil {
+			return nil, fmt.Errorf("aauth: %w", err)
+		}
 	}
 	if deps.OAuth == nil || deps.Credentials == nil || deps.Identities == nil || deps.DB == nil || deps.PersonServerClient == nil {
 		return nil, errors.New("aauth: missing dependencies")

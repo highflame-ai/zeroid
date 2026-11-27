@@ -1316,3 +1316,37 @@ func TestAAuthRefresh(t *testing.T) {
 		assert.Equal(t, "denied", res.body["error"])
 	})
 }
+
+// TestAAuthKeyRotation: ZeroID restarted with a new signing key, the old one
+// retired, still honours agent tokens the old key signed, publishes both, and
+// signs new tokens with the new key.
+func TestAAuthKeyRotation(t *testing.T) {
+	var oldPath string
+	a := newAAuthFedWith(t, func(c *zeroid.Config) { oldPath = c.AAuth.SigningKeyPath }, "aauth_agent", "aauth_bridge")
+	k := newAgentKey(t)
+	res := a.bootstrap(t, k, a.assertion(t, nil))
+	require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+	oldToken := res.body["agent_token"].(string)
+	oldKid := decodeJWTHeader(t, oldToken)["kid"]
+
+	// The same database, a new key, the old one retired.
+	f := &dbFederation{idp: a.f.idp, idpSrv: a.f.idpSrv, idpURL: a.f.idpURL, members: map[string]string{}}
+	f.srv, f.http = newAAuthServer(t, func(c *zeroid.Config) { c.AAuth.RetiredSigningKeyPaths = []string{oldPath} })
+	wf := *a.workloadFed
+	wf.f = f
+	b := &aauthFed{workloadFed: &wf}
+
+	var set struct{ Keys []map[string]any }
+	require.NoError(t, json.Unmarshal(b.getRaw(t, "/ap/jwks.json"), &set))
+	require.Len(t, set.Keys, 2)
+	assert.Equal(t, oldKid, set.Keys[1]["kid"], "the retired key is still published")
+
+	bridged := b.bridge(t, oldToken, &k, nil)
+	assert.Equal(t, http.StatusOK, bridged.status, "an agent token signed before the rotation is still honoured: %v", bridged.body)
+
+	k2 := newAgentKey(t)
+	res = b.bootstrap(t, k2, b.assertion(t, nil))
+	require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+	assert.Equal(t, set.Keys[0]["kid"], decodeJWTHeader(t, res.body["agent_token"].(string))["kid"], "new tokens use the new key")
+	assert.NotEqual(t, oldKid, set.Keys[0]["kid"])
+}

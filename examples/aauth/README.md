@@ -294,7 +294,10 @@ the agent's credential policy.
 
 ZeroID publishes `/.well-known/aauth-agent.json` and its signing keys. It
 answers every error in the AAuth format, signature failures included, and
-limits each agent's requests (`aauth.requests_per_minute`, default 60).
+limits each agent's requests (`aauth.requests_per_minute`, default 60). Its
+signing key can be rotated without breaking outstanding agent tokens: move the
+old key to `aauth.retired_signing_key_paths`, where it stays published and
+accepted until the tokens it signed have expired.
 
 It implements the Agent Provider requirements of the AAuth protocol
 (`draft-hardt-oauth-aauth-protocol-11`) and works with aauth-go, the

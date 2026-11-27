@@ -23,10 +23,14 @@ const (
 )
 
 // signingKey is the Agent Provider's Ed25519 key. It signs agent tokens and
-// nothing else, and is published only at /ap/jwks.json.
+// the Agent Provider's own requests, and is published only at /ap/jwks.json.
+// retired are earlier keys, published and accepted until the tokens they
+// signed have expired, so a key can be replaced without invalidating every
+// outstanding agent token at once.
 type signingKey struct {
-	priv ed25519.PrivateKey
-	jwk  JWK // public, with kid, use and alg
+	priv    ed25519.PrivateKey
+	jwk     JWK   // public, with kid, use and alg
+	retired []JWK // public, with kid, use and alg
 }
 
 // loadSigningKey reads a PKCS#8 PEM Ed25519 private key. kid defaults to the
@@ -48,20 +52,86 @@ func loadSigningKey(path, kid string) (*signingKey, error) {
 	if !ok {
 		return nil, fmt.Errorf("the AAuth signing key is %T, not Ed25519", parsed)
 	}
-	jwk := Ed25519JWK(priv.Public().(ed25519.PublicKey))
-	if kid == "" {
-		if kid, err = jwk.Thumbprint(); err != nil {
-			return nil, err
-		}
+	jwk, err := publishedJWK(priv.Public().(ed25519.PublicKey), kid)
+	if err != nil {
+		return nil, err
 	}
-	jwk.Kid, jwk.Use = kid, "sig"
 	return &signingKey{priv: priv, jwk: jwk}, nil
 }
 
-// jwks is the document served at /ap/jwks.json. Every key carries alg, as
-// the profile requires of a JWKS AAuth reads.
+// addRetired publishes and accepts a retired signing key: a PEM file holding
+// its PKCS#8 private key or its PKIX public key (only the public half is
+// kept). kid defaults to its RFC 7638 thumbprint, and must be the kid the
+// key signed with.
+func (k *signingKey) addRetired(path, kid string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading the retired AAuth signing key %s: %w", path, err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return fmt.Errorf("the retired AAuth signing key %s is not PEM", path)
+	}
+	var pub ed25519.PublicKey
+	if parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+		priv, ok := parsed.(ed25519.PrivateKey)
+		if !ok {
+			return fmt.Errorf("the retired AAuth signing key %s is %T, not Ed25519", path, parsed)
+		}
+		pub = priv.Public().(ed25519.PublicKey)
+	} else if parsed, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
+		p, ok := parsed.(ed25519.PublicKey)
+		if !ok {
+			return fmt.Errorf("the retired AAuth signing key %s is %T, not Ed25519", path, parsed)
+		}
+		pub = p
+	} else {
+		return fmt.Errorf("the retired AAuth signing key %s is neither a PKCS#8 private nor a PKIX public key", path)
+	}
+	jwk, err := publishedJWK(pub, kid)
+	if err != nil {
+		return err
+	}
+	for _, have := range append([]JWK{k.jwk}, k.retired...) {
+		if have.Kid == jwk.Kid || have.X == jwk.X {
+			return fmt.Errorf("the retired AAuth signing key %s repeats a published key or kid %q", path, jwk.Kid)
+		}
+	}
+	k.retired = append(k.retired, jwk)
+	return nil
+}
+
+func publishedJWK(pub ed25519.PublicKey, kid string) (JWK, error) {
+	jwk := Ed25519JWK(pub)
+	if kid == "" {
+		var err error
+		if kid, err = jwk.Thumbprint(); err != nil {
+			return JWK{}, err
+		}
+	}
+	jwk.Kid, jwk.Use = kid, "sig"
+	return jwk, nil
+}
+
+// jwks is the document served at /ap/jwks.json: the current key, then the
+// retired ones. Every key carries alg, as the profile requires of a JWKS
+// AAuth reads.
 func (k *signingKey) jwks() map[string]any {
-	return map[string]any{"keys": []JWK{k.jwk}}
+	return map[string]any{"keys": append([]JWK{k.jwk}, k.retired...)}
+}
+
+// publicKeyFor returns the published key a token's kid names.
+func (k *signingKey) publicKeyFor(kid string) (ed25519.PublicKey, bool) {
+	for _, j := range append([]JWK{k.jwk}, k.retired...) {
+		if j.Kid == kid {
+			pub, err := j.PublicKey()
+			if err != nil {
+				return nil, false
+			}
+			return pub.(ed25519.PublicKey), true
+		}
+	}
+	return nil, false
 }
 
 // errAgentTokenExpired is verify's error for an agent token past its exp.
@@ -133,10 +203,12 @@ func (k *signingKey) verify(raw, issuer string, now time.Time) (*agentClaims, er
 	if typ, _ := hdr.Type(); typ != AgentTokenType {
 		return nil, fmt.Errorf("typ is %q, not %s", typ, AgentTokenType)
 	}
-	if kid, _ := hdr.KeyID(); kid != k.jwk.Kid {
-		return nil, errors.New("not signed by this Agent Provider's key")
+	kid, _ := hdr.KeyID()
+	pub, ok := k.publicKeyFor(kid)
+	if !ok {
+		return nil, errors.New("not signed by a key this Agent Provider publishes")
 	}
-	tok, err := jwt.Parse([]byte(raw), jwt.WithKey(jwa.EdDSAEd25519(), k.priv.Public()), jwt.WithValidate(false))
+	tok, err := jwt.Parse([]byte(raw), jwt.WithKey(jwa.EdDSAEd25519(), pub), jwt.WithValidate(false))
 	if err != nil {
 		return nil, fmt.Errorf("signature: %w", err)
 	}

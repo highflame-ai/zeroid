@@ -707,14 +707,16 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	var aauthProvider *aauth.Provider
 	if cfg.AAuth.Enabled {
 		provider, err := aauth.New(aauth.Config{
-			Issuer:            cfg.Token.Issuer,
-			SigningKeyPath:    cfg.AAuth.SigningKeyPath,
-			SigningKeyID:      cfg.AAuth.SigningKeyID,
-			AgentTokenTTL:     time.Duration(cfg.AAuth.AgentTokenTTLSeconds) * time.Second,
-			Name:              cfg.AAuth.Name,
-			MaxLiveSubagents:  cfg.AAuth.MaxLiveSubagents,
-			RequestsPerMinute: cfg.AAuth.RequestsPerMinute,
-			EnrollmentTTL:     time.Duration(cfg.AAuth.EnrollmentTTLSeconds) * time.Second,
+			Issuer:                 cfg.Token.Issuer,
+			SigningKeyPath:         cfg.AAuth.SigningKeyPath,
+			SigningKeyID:           cfg.AAuth.SigningKeyID,
+			RetiredSigningKeyPaths: cfg.AAuth.RetiredSigningKeyPaths,
+			RetiredSigningKeyIDs:   cfg.AAuth.RetiredSigningKeyIDs,
+			AgentTokenTTL:          time.Duration(cfg.AAuth.AgentTokenTTLSeconds) * time.Second,
+			Name:                   cfg.AAuth.Name,
+			MaxLiveSubagents:       cfg.AAuth.MaxLiveSubagents,
+			RequestsPerMinute:      cfg.AAuth.RequestsPerMinute,
+			EnrollmentTTL:          time.Duration(cfg.AAuth.EnrollmentTTLSeconds) * time.Second,
 			Metadata: map[string]string{
 				"description": cfg.AAuth.Description, "logo_uri": cfg.AAuth.LogoURI, "logo_dark_uri": cfg.AAuth.LogoDarkURI,
 				"documentation_uri": cfg.AAuth.DocumentationURI, "tos_uri": cfg.AAuth.TOSURI, "policy_uri": cfg.AAuth.PolicyURI,

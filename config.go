@@ -112,6 +112,15 @@ type AAuthConfig struct {
 	// SigningKeyID is the key's kid in /ap/jwks.json. Empty means its RFC 7638
 	// thumbprint.
 	SigningKeyID string `koanf:"signing_key_id"`
+	// RetiredSigningKeyPaths are earlier signing keys (PKCS#8 private or PKIX
+	// public PEM): still published at /ap/jwks.json and accepted, never used
+	// to sign. To rotate, move the current key here and set a new
+	// signing_key_path; drop the old key once the longest agent token it
+	// signed has expired. RetiredSigningKeyIDs are their kids in the same
+	// order (empty: the key's thumbprint), and must be the kids they signed
+	// with.
+	RetiredSigningKeyPaths []string `koanf:"retired_signing_key_paths"`
+	RetiredSigningKeyIDs   []string `koanf:"retired_signing_key_ids"`
 	// AgentTokenTTLSeconds is the agent token's lifetime, held to the
 	// identity's credential policy. 0 means 900 (15 minutes). It must be over
 	// 300: an agent refreshes when fewer than five minutes remain.
@@ -1078,6 +1087,9 @@ func (c *Config) Validate() error {
 		if c.AAuth.SigningKeyPath == "" {
 			return fmt.Errorf("aauth.signing_key_path is required when aauth.enabled is true")
 		}
+		if len(c.AAuth.RetiredSigningKeyIDs) > len(c.AAuth.RetiredSigningKeyPaths) {
+			return fmt.Errorf("aauth.retired_signing_key_ids has more entries than aauth.retired_signing_key_paths")
+		}
 		if c.Federation.IssuerStore != "db" {
 			return fmt.Errorf("aauth.enabled needs federation.issuer_store=db: agents bootstrap from workload issuer rows and bindings")
 		}
@@ -1594,6 +1606,7 @@ var envMapping = map[string]string{
 	"ZEROID_AAUTH_SIGNING_KEY_ID":               "aauth.signing_key_id",
 	"ZEROID_AAUTH_AGENT_TOKEN_TTL_SECONDS":      "aauth.agent_token_ttl_seconds",
 	"ZEROID_AAUTH_NAME":                         "aauth.name",
+	"ZEROID_AAUTH_RETIRED_SIGNING_KEY_PATHS":    "aauth.retired_signing_key_paths",
 	"ZEROID_AAUTH_ENROLLMENT_TTL_SECONDS":       "aauth.enrollment_ttl_seconds",
 	"ZEROID_AAUTH_REQUESTS_PER_MINUTE":          "aauth.requests_per_minute",
 	"ZEROID_AAUTH_MAX_LIVE_SUBAGENTS":           "aauth.max_live_subagents",

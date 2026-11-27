@@ -317,7 +317,7 @@ func (p *Provider) refresh(ctx context.Context, d *delegation, now time.Time) (s
 		IdentityPolicyID:  policy.ID,
 		TTL:               ttl,
 		GrantType:         domain.GrantTypeAAuthAgent,
-		ParentJTI:         e.RootJTI, // revoking the first token while it lives revokes every refresh
+		ParentJTI:         e.RootJTI,      // revoking the first token while it lives revokes every refresh
 		MissionID:         root.MissionID, // every refresh stays in the enrollment's delegation tree
 		DPoPKeyThumbprint: ephemeralJKT,
 		AgentTokenSigner: func(jti string, iat, exp time.Time) (string, error) {
