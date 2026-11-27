@@ -128,12 +128,17 @@ func (s *CredentialService) identityChainRefusal(ctx context.Context, id, accoun
 // every one is usable. err is a failure to read, never a refusal.
 func (s *CredentialService) lineageRefusal(ctx context.Context, jti string) (string, error) {
 	ids, err := s.tree.CredentialLineage(ctx, jti)
-	if errors.Is(err, postgres.ErrBrokenLineage) {
+	if errors.Is(err, postgres.ErrBrokenLineage) || errors.Is(err, postgres.ErrLineageTooLong) {
 		return err.Error(), nil
 	}
 	if err != nil {
 		return "", err
 	}
+	return s.lineageIdentitiesRefusal(ctx, ids)
+}
+
+// lineageIdentitiesRefusal is lineageRefusal for a chain already read.
+func (s *CredentialService) lineageIdentitiesRefusal(ctx context.Context, ids []postgres.LineageIdentity) (string, error) {
 	for _, li := range ids {
 		if reason, err := s.identityChainRefusal(ctx, li.IdentityID, li.AccountID, li.ProjectID); reason != "" || err != nil {
 			return reason, err
@@ -145,13 +150,23 @@ func (s *CredentialService) lineageRefusal(ctx context.Context, jti string) (str
 // checkLineageUsable refuses a delegated issuance whose parent credential
 // (parentJTI) speaks for or acts as an identity that is stopped: not active,
 // expired, or below one that is. The actor the new token is issued to is
-// checked separately (checkAncestorsUsable and the status checks). Any
-// failure to read refuses.
+// checked separately (checkAncestorsUsable and the status checks). A parent
+// delegated from more than postgres.MaxLineageDepth credentials is
+// ErrDelegationChainTooLong. Any failure to read refuses.
 func (s *CredentialService) checkLineageUsable(ctx context.Context, parentJTI string) error {
 	if s.tree == nil {
 		return fmt.Errorf("%w: the delegation chain cannot be checked", domain.ErrIdentityNotUsable)
 	}
-	reason, err := s.lineageRefusal(ctx, parentJTI)
+	ids, err := s.tree.CredentialLineage(ctx, parentJTI)
+	var reason string
+	switch {
+	case errors.Is(err, postgres.ErrLineageTooLong):
+		return fmt.Errorf("%w: %w", ErrDelegationChainTooLong, err)
+	case errors.Is(err, postgres.ErrBrokenLineage):
+		reason, err = err.Error(), nil
+	case err == nil:
+		reason, err = s.lineageIdentitiesRefusal(ctx, ids)
+	}
 	if err != nil {
 		log.Warn().Err(err).Str("parent_jti", parentJTI).Msg("issuance: could not read the identities the delegation chain speaks for; refusing")
 		return fmt.Errorf("%w: the delegation chain could not be checked", domain.ErrIdentityNotUsable)
@@ -643,6 +658,11 @@ func (s *CredentialService) resolvePrincipal(req IssueRequest) resolvedPrincipal
 
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
 var ErrScopesNotAllowed = fmt.Errorf("one or more requested scopes are not permitted for this identity")
+
+// ErrDelegationChainTooLong is returned when a token would be delegated from
+// more than postgres.MaxLineageDepth credentials. Its text is the OAuth
+// error_description, so it names the limit and nothing about the chain.
+var ErrDelegationChainTooLong = fmt.Errorf("the delegation chain is longer than %d credentials", postgres.MaxLineageDepth)
 
 // scopeRefusedForIdentityType returns the first scope in scopes that may never
 // be issued to an identity of type t, or "" when all are permitted.

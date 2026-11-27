@@ -276,6 +276,11 @@ func extractOAuthError(err error) (code, description string, status int) {
 	if errors.Is(err, domain.ErrIdentityExpired) {
 		return oautherror.InvalidGrant, "identity_expired", http.StatusBadRequest
 	}
+	// Checked before ErrIdentityNotUsable: a chain past the lineage cap
+	// stops no identity, and saying one is suspended would mislead.
+	if errors.Is(err, service.ErrDelegationChainTooLong) {
+		return oautherror.InvalidGrant, service.ErrDelegationChainTooLong.Error(), http.StatusBadRequest
+	}
 	if errors.Is(err, domain.ErrIdentityNotUsable) {
 		return oautherror.InvalidGrant, "identity is suspended or deactivated", http.StatusBadRequest
 	}

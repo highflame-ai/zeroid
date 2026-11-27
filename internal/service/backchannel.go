@@ -1230,6 +1230,8 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 			return nil, oauthBadRequestCause(oautherror.InvalidScope, "requested scopes are not permitted for the bound identity", err)
 		case errors.Is(err, ErrPolicyViolation):
 			return nil, oauthBadRequestCause(oautherror.AccessDenied, "the bound identity's credential policy refused issuance", err)
+		case errors.Is(err, ErrDelegationChainTooLong):
+			return nil, oauthBadRequestCause(oautherror.InvalidGrant, ErrDelegationChainTooLong.Error(), err)
 		case errors.Is(err, domain.ErrIdentityNotUsable), errors.Is(err, domain.ErrIdentityExpired):
 			return nil, oauthBadRequestCause(oautherror.InvalidGrant, "the bound identity is no longer usable", err)
 		}

@@ -523,6 +523,14 @@ grant's client, 16 in all (Section 4.1). Issuance also refuses any token past
 depth 15 with `policy_violation`, whatever its policies allow, so a policy stored
 with a larger value before the range was enforced is held to 15.
 
+Separately, a token may be delegated from at most 50 credentials, counted along
+`parent_jti` from its parent to the root. Re-scoping (below) and a CIBA approval
+on a requesting chain add a credential without adding depth, so this is a
+different count from `delegation_depth`. An exchange past it is refused with
+`invalid_grant` and `error_description` "the delegation chain is longer than 50
+credentials". The cascade revocation walk follows `parent_jti` the same 50 links
+down, so it reaches every token ZeroID issues.
+
 Under the `rfc8693` profile, an exchange whose actor already **is** the subject
 token's current actor (its `act.sub`, ADR 0043 D2) is a re-scoping, not a
 delegation: the actor replaces itself as the current actor rather than
