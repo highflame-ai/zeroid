@@ -27,11 +27,12 @@ func NewCredentialRepository(db *bun.DB) *CredentialRepository {
 // A delegated credential (ParentJTI set) is inserted only while its parent
 // and every credential above it are unrevoked: the chain is locked FOR SHARE
 // in the insert's transaction and re-read under the lock, and a revoked one
-// is ErrRevokedLineage. revoke_credential_cascade locks the token it revokes
-// before it walks the tokens below it (migration 073), so the two serialize:
-// either the revocation commits first and this insert is refused, or the
-// revocation waits for the insert to commit, and its walk then finds the new
-// credential and revokes it too.
+// is ErrRevokedLineage. Every cascade locks the tokens it starts from before
+// it walks the tokens below them (revoke_credential_cascade since migration
+// 073, the identity and owner cascades since 074, parents first), so the two
+// serialize: either the revocation commits first and this insert is refused,
+// or the revocation waits for the insert to commit, and its walk then finds
+// the new credential and revokes it too.
 func (r *CredentialRepository) Create(ctx context.Context, cred *domain.IssuedCredential) error {
 	insert := func(ctx context.Context, db bun.IDB) error {
 		if cred.ParentJTI != "" {
