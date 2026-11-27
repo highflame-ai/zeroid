@@ -262,25 +262,30 @@ func TestProperty_EnforceSubset_NeverPassesAPolicyThatAdmitsMore(t *testing.T) {
 	svc := &CredentialPolicyService{}
 	rapid.Check(t, func(t *rapid.T) {
 		wider := propPolicy(t, "wider")
-		narrower := propPerturbedNarrowing(t, wider)
-		// Stated on the axes EnforceSubset's doc comment lists: the narrower
-		// policy keeps the wider one's user_grant_scopes, and a scope list
-		// wherever the wider one has one.
-		narrower.UserGrantScopes = wider.UserGrantScopes
-		if len(wider.AllowedScopes) > 0 && len(narrower.AllowedScopes) == 0 {
-			narrower.AllowedScopes = wider.AllowedScopes[:1]
-		}
-		if svc.EnforceSubset(narrower, wider) != nil {
-			return
-		}
-
-		for range 8 {
-			req := propRequestNear(t, narrower)
-			if svc.EnforcePolicy(t.Context(), narrower, req) != nil {
+		// Each narrowing perturbs one axis of nine, so several per wider
+		// policy are drawn: with one, a check whose single axis EnforceSubset
+		// skipped went untested on about one run in twenty.
+		for range 4 {
+			narrower := propPerturbedNarrowing(t, wider)
+			// Stated on the axes EnforceSubset's doc comment lists: the
+			// narrower policy keeps the wider one's user_grant_scopes, and a
+			// scope list wherever the wider one has one.
+			narrower.UserGrantScopes = wider.UserGrantScopes
+			if len(wider.AllowedScopes) > 0 && len(narrower.AllowedScopes) == 0 {
+				narrower.AllowedScopes = wider.AllowedScopes[:1]
+			}
+			if svc.EnforceSubset(narrower, wider) != nil {
 				continue
 			}
-			if err := svc.EnforcePolicy(t.Context(), wider, req); err != nil {
-				t.Fatalf("EnforceSubset passed %+v under %+v, which admits %+v that the wider refuses: %v", narrower, wider, req, err)
+
+			for range 8 {
+				req := propRequestNear(t, narrower)
+				if svc.EnforcePolicy(t.Context(), narrower, req) != nil {
+					continue
+				}
+				if err := svc.EnforcePolicy(t.Context(), wider, req); err != nil {
+					t.Fatalf("EnforceSubset passed %+v under %+v, which admits %+v that the wider refuses: %v", narrower, wider, req, err)
+				}
 			}
 		}
 	})
