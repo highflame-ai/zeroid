@@ -2,10 +2,14 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/highflame-ai/zeroid/domain"
 )
@@ -23,13 +27,108 @@ func NewCredentialRepository(db *bun.DB) *CredentialRepository {
 // Create inserts a new issued credential. Participates in a caller-provided
 // transaction via postgres.WithTx(ctx, tx); falls through to a single
 // auto-commit insert otherwise.
+//
+// A delegated credential (ParentJTI set) is inserted only while its parent
+// and every credential above it are unrevoked: the chain is locked FOR SHARE
+// in the insert's transaction and re-read under the lock, and a revoked one
+// is ErrRevokedLineage. Every cascade locks the tokens it starts from before
+// it walks the tokens below them (revoke_credential_cascade since migration
+// 073, the identity and owner cascades since 074, parents first), so the two
+// serialize: either the revocation commits first and this insert is refused,
+// or the revocation waits for the insert to commit, and its walk then finds
+// the new credential and revokes it too.
+//
+// A delegated credential is also stored as issued after its parent: an
+// IssuedAt that is not at least a microsecond later than the parent's (the
+// replica that issued the parent had a clock ahead of this one) is moved to
+// a microsecond after it. The bulk cascades lock their anchors ordered by
+// (delegation_depth, issued_at, id) and rely on that order putting a parent
+// first; a parent and child at the same depth (a re-scoping exchange, a CIBA
+// grant) are told apart by issued_at alone. The signed token's iat is not
+// changed.
 func (r *CredentialRepository) Create(ctx context.Context, cred *domain.IssuedCredential) error {
-	db := dbOrTx(ctx, r.db)
-	_, err := db.NewInsert().Model(cred).Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create credential: %w", err)
+	insert := func(ctx context.Context, db bun.IDB) error {
+		if cred.ParentJTI != "" {
+			parentIssuedAt, err := lockUnrevokedLineage(ctx, db, cred.ParentJTI)
+			if err != nil {
+				return err
+			}
+			if !cred.IssuedAt.IsZero() && cred.IssuedAt.Sub(parentIssuedAt) < time.Microsecond {
+				cred.IssuedAt = parentIssuedAt.Add(time.Microsecond)
+			}
+		}
+		if _, err := db.NewInsert().Model(cred).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to create credential: %w", err)
+		}
+		return nil
 	}
-	return nil
+	if cred.ParentJTI == "" {
+		return insert(ctx, dbOrTx(ctx, r.db))
+	}
+	if tx, ok := txFromContext(ctx); ok {
+		return insert(ctx, tx)
+	}
+	return r.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		return insert(ctx, tx)
+	})
+}
+
+// lockLineageSQL follows parent_jti up from one credential, as
+// credentialLineageSQL does, then locks every credential it reached FOR
+// SHARE, the root first. The rows are locked in the sorted order (LockRows
+// runs above the Sort), so every issuance takes them top-down, and one
+// waiting on a row has locked nothing below it. A row updated by a
+// transaction that committed while this one waited is returned as it now
+// is (READ COMMITTED re-reads a locked row), so is_revoked is current.
+const lockLineageSQL = `
+WITH RECURSIVE lineage(id, jti, parent_jti, depth) AS (
+	SELECT id, jti, parent_jti, 1
+	FROM issued_credentials
+	WHERE jti = ?
+	UNION ALL
+	SELECT ic.id, ic.jti, ic.parent_jti, lineage.depth + 1
+	FROM issued_credentials ic
+	JOIN lineage ON ic.jti = lineage.parent_jti
+	WHERE lineage.depth <= ?
+) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
+SELECT ic.is_revoked, ic.issued_at, lineage.depth, lineage.is_cycle
+FROM issued_credentials ic
+JOIN lineage ON ic.id = lineage.id
+ORDER BY lineage.depth DESC
+FOR SHARE OF ic`
+
+// lockUnrevokedLineage locks the credential parentJTI and every credential it
+// was delegated from for the rest of db's transaction, returns
+// ErrRevokedLineage if any of them is revoked, and otherwise returns the
+// parent's issued_at. A chain that loops or is longer than MaxLineageDepth is
+// ErrBrokenLineage, and a parent that does not exist is an error: the caller
+// read it moments ago.
+func lockUnrevokedLineage(ctx context.Context, db bun.IDB, parentJTI string) (time.Time, error) {
+	var rows []struct {
+		IsRevoked bool      `bun:"is_revoked"`
+		IssuedAt  time.Time `bun:"issued_at"`
+		Depth     int       `bun:"depth"`
+		IsCycle   bool      `bun:"is_cycle"`
+	}
+	if err := db.NewRaw(lockLineageSQL, parentJTI, MaxLineageDepth).Scan(ctx, &rows); err != nil {
+		return time.Time{}, fmt.Errorf("lock the delegation chain above the new credential: %w", err)
+	}
+	if len(rows) == 0 {
+		return time.Time{}, fmt.Errorf("lock the delegation chain above the new credential: parent credential %s does not exist", parentJTI)
+	}
+	var parentIssuedAt time.Time
+	for _, row := range rows {
+		if row.IsCycle || row.Depth > MaxLineageDepth {
+			return time.Time{}, ErrBrokenLineage
+		}
+		if row.IsRevoked {
+			return time.Time{}, ErrRevokedLineage
+		}
+		if row.Depth == 1 {
+			parentIssuedAt = row.IssuedAt
+		}
+	}
+	return parentIssuedAt, nil
 }
 
 // GetByID retrieves a credential by its UUID.
@@ -121,16 +220,11 @@ type RevokedCredential struct {
 // total number of credentials revoked.
 func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) ([]RevokedCredential, error) {
 	now := time.Now()
-	var rows []RevokedCredential
-	db := dbOrTx(ctx, r.db)
-	if err := db.NewRaw(
+	rows, err := r.runCascade(ctx, now,
 		"SELECT jti, identity_id, account_id, project_id, expires_at FROM revoke_credentials_cascade(?, ?, ?)",
-		identityID, now, reason,
-	).Scan(ctx, &rows); err != nil {
+		identityID, now, reason)
+	if err != nil {
 		return nil, fmt.Errorf("failed to cascade-revoke credentials for identity %s: %w", identityID, err)
-	}
-	for i := range rows {
-		rows[i].RevokedAt = now
 	}
 	return rows, nil
 }
@@ -148,18 +242,68 @@ func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, i
 // timestamp; len(result) is the total number revoked.
 func (r *CredentialRepository) RevokeAllActiveForOwner(ctx context.Context, ownerUserID, accountID, reason string) ([]RevokedCredential, error) {
 	now := time.Now()
-	var rows []RevokedCredential
-	db := dbOrTx(ctx, r.db)
-	if err := db.NewRaw(
+	rows, err := r.runCascade(ctx, now,
 		"SELECT jti, identity_id, account_id, project_id, expires_at FROM revoke_credentials_by_owner(?, ?, ?, ?)",
-		ownerUserID, accountID, now, reason,
-	).Scan(ctx, &rows); err != nil {
+		ownerUserID, accountID, now, reason)
+	if err != nil {
 		return nil, fmt.Errorf("failed to cascade-revoke credentials for owner %s in account %s: %w", ownerUserID, accountID, err)
 	}
-	for i := range rows {
-		rows[i].RevokedAt = now
-	}
 	return rows, nil
+}
+
+// CascadeRevocationAttempts is how many times a cascade revocation runs when
+// PostgreSQL aborts it as a deadlock victim or a serialization failure.
+const CascadeRevocationAttempts = 3
+
+// runCascade runs one call of a cascade revocation function and stamps the
+// rows it returns with revokedAt. A cascade that PostgreSQL aborts as a
+// deadlock victim (40P01) or a serialization failure (40001) revoked nothing,
+// so it is run again, up to CascadeRevocationAttempts times in all. Each
+// cascade takes every lock it needs in its first statement, in one order that
+// puts a parent before its child (migrations 073 and 074), but a deadlock is
+// still possible in two cases. The order rests on issued_at, which rows
+// stored before Create moved it can have inverted, so a cascade and an
+// issuance below such a pair can take it in opposite orders. And a token
+// stored while a cascade's first statement waited is locked by its second
+// statement, after tokens that come later in the order. A failure of any
+// other kind is returned at once.
+//
+// Inside a caller's transaction the abort has already rolled the transaction
+// back, so the error is returned for the caller to retry the whole of it.
+func (r *CredentialRepository) runCascade(ctx context.Context, revokedAt time.Time, query string, args ...any) ([]RevokedCredential, error) {
+	_, inTx := txFromContext(ctx)
+	db := dbOrTx(ctx, r.db)
+	for attempt := 1; ; attempt++ {
+		var rows []RevokedCredential
+		err := db.NewRaw(query, args...).Scan(ctx, &rows)
+		if err == nil {
+			for i := range rows {
+				rows[i].RevokedAt = revokedAt
+			}
+			return rows, nil
+		}
+		if inTx || attempt == CascadeRevocationAttempts || !isTransientTxError(err) {
+			return nil, err
+		}
+		log.Warn().Err(err).Int("attempt", attempt).Msg("cascade revocation aborted by the database; running it again")
+		select {
+		case <-ctx.Done():
+			return nil, errors.Join(err, ctx.Err())
+		case <-time.After(time.Duration(attempt*attempt)*25*time.Millisecond + time.Duration(rand.Int64N(int64(25*time.Millisecond)))):
+		}
+	}
+}
+
+// isTransientTxError reports whether err is a PostgreSQL deadlock (40P01) or
+// serialization failure (40001): the transaction was rolled back and running
+// it again can succeed.
+func isTransientTxError(err error) bool {
+	var pgErr pgdriver.Error
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	code := pgErr.Field('C')
+	return code == "40P01" || code == "40001"
 }
 
 // Revoke marks a credential as revoked and cascades the revocation to every
@@ -220,16 +364,11 @@ func (r *CredentialRepository) ListActiveByRefreshFamily(ctx context.Context, fa
 
 func (r *CredentialRepository) Revoke(ctx context.Context, id, accountID, projectID, reason string) ([]RevokedCredential, error) {
 	now := time.Now()
-	var rows []RevokedCredential
-	db := dbOrTx(ctx, r.db)
-	if err := db.NewRaw(
+	rows, err := r.runCascade(ctx, now,
 		"SELECT jti, identity_id, account_id, project_id, expires_at FROM revoke_credential_cascade(?, ?, ?, ?, ?)",
-		id, accountID, projectID, now, reason,
-	).Scan(ctx, &rows); err != nil {
+		id, accountID, projectID, now, reason)
+	if err != nil {
 		return nil, fmt.Errorf("failed to cascade-revoke credential %s: %w", id, err)
-	}
-	for i := range rows {
-		rows[i].RevokedAt = now
 	}
 	return rows, nil
 }

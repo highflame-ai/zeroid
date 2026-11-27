@@ -127,6 +127,12 @@ const MaxLineageDepth = 50
 // is longer than MaxLineageDepth or loops.
 var ErrBrokenLineage = errors.New("the delegation chain above this credential is too long to check")
 
+// ErrRevokedLineage is returned by CredentialLineage when the credential, or
+// a credential it was delegated from, has been revoked. Revoking a credential
+// revokes every credential delegated from it, so a token below a revoked one
+// is never usable, whatever its own row says.
+var ErrRevokedLineage = errors.New("a token in the delegation chain above this credential has been revoked")
+
 // LineageIdentity is an identity that a credential, or one of the credentials
 // it was delegated from, was issued to, in that credential's own tenant.
 type LineageIdentity struct {
@@ -135,30 +141,32 @@ type LineageIdentity struct {
 	ProjectID  string `bun:"project_id"`
 	Depth      int    `bun:"depth"`
 	IsCycle    bool   `bun:"is_cycle"`
+	IsRevoked  bool   `bun:"is_revoked"`
 }
 
 // credentialLineageSQL follows parent_jti up from one credential, one row per
 // credential, and stops one level past MaxLineageDepth so a longer chain can
 // be told apart from one that ends there.
 const credentialLineageSQL = `
-WITH RECURSIVE lineage(jti, parent_jti, identity_id, account_id, project_id, depth) AS (
-	SELECT jti, parent_jti, identity_id, account_id, project_id, 1
+WITH RECURSIVE lineage(jti, parent_jti, identity_id, account_id, project_id, is_revoked, depth) AS (
+	SELECT jti, parent_jti, identity_id, account_id, project_id, is_revoked, 1
 	FROM issued_credentials
 	WHERE jti = ?
 	UNION ALL
-	SELECT ic.jti, ic.parent_jti, ic.identity_id, ic.account_id, ic.project_id, lineage.depth + 1
+	SELECT ic.jti, ic.parent_jti, ic.identity_id, ic.account_id, ic.project_id, ic.is_revoked, lineage.depth + 1
 	FROM issued_credentials ic
 	JOIN lineage ON ic.jti = lineage.parent_jti
 	WHERE lineage.depth <= ?
 ) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
-SELECT COALESCE(identity_id::text, '') AS identity_id, account_id, project_id, depth, is_cycle FROM lineage`
+SELECT COALESCE(identity_id::text, '') AS identity_id, account_id, project_id, depth, is_cycle, is_revoked FROM lineage`
 
 // CredentialLineage returns the identities that the credential jti and every
 // credential it was delegated from (parent_jti, up to the root) were issued
 // to, each once, in their own tenant. Credentials issued to no identity (a
 // person's session) contribute nothing. A parent row that no longer exists
 // ends the chain. A chain longer than MaxLineageDepth, or one that loops, is
-// ErrBrokenLineage. An unknown jti returns nothing.
+// ErrBrokenLineage. A chain in which any credential, jti's own included, is
+// revoked is ErrRevokedLineage. An unknown jti returns nothing.
 func (r *IdentityRepository) CredentialLineage(ctx context.Context, jti string) ([]LineageIdentity, error) {
 	var rows []LineageIdentity
 	if err := dbOrTx(ctx, r.db).NewRaw(credentialLineageSQL, jti, MaxLineageDepth).Scan(ctx, &rows); err != nil {
@@ -169,6 +177,9 @@ func (r *IdentityRepository) CredentialLineage(ctx context.Context, jti string) 
 	for _, row := range rows {
 		if row.IsCycle || row.Depth > MaxLineageDepth {
 			return nil, ErrBrokenLineage
+		}
+		if row.IsRevoked {
+			return nil, ErrRevokedLineage
 		}
 		if row.IdentityID == "" {
 			continue

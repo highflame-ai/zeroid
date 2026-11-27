@@ -282,6 +282,12 @@ func extractOAuthError(err error) (code, description string, status int) {
 	if errors.Is(err, domain.ErrCredentialExpired) {
 		return oautherror.InvalidGrant, "credential_expired", http.StatusBadRequest
 	}
+	// The token it is delegated from, or one above it, was revoked after the
+	// grant checked it (the chokepoint re-checks under lock). Same
+	// description as the token exchange's own check.
+	if errors.Is(err, domain.ErrCredentialAlreadyRevoked) {
+		return oautherror.InvalidGrant, "subject_token is inactive or has been revoked", http.StatusBadRequest
+	}
 	return oautherror.ServerError, "an unexpected error occurred", http.StatusInternalServerError
 }
 

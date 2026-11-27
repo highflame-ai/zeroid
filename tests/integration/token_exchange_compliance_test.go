@@ -11,10 +11,16 @@
 package integration_test
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"database/sql"
+	"math/big"
 	"net/http"
+	"os"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -199,6 +205,128 @@ func TestRFC8693_RevokedSubjectTokenRejected(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"token_exchange with a revoked subject_token MUST be rejected")
 	body := decode(t, resp)
+	assert.Equal(t, "invalid_grant", body["error"])
+}
+
+// ── RFC 8693 — Subject revoked while the exchange runs ─────────────────────
+
+func TestRFC8693_SubjectRevokedBeforeExchangeStoresTokenRejected(t *testing.T) {
+	// RFC 8693 inherits RFC 6749 §5.2: "invalid_grant ... The provided
+	//   authorization grant ... is invalid, expired, revoked". A subject_token
+	//   revoked after the exchange checked it, but before the exchange stored
+	//   its token, MUST NOT mint a successor delegated token.
+	//
+	// The test parks the exchange after its checks by holding
+	// issued_credentials in EXCLUSIVE mode, which lets the exchange read
+	// credential rows but not lock or write one. While it waits, the test
+	// revokes the subject's tree in the lock's own transaction and commits.
+	tn := newTenant(t, "")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+	root, _ := tn.workloadRoot(t, policyID, scopes)
+	actor := rlNewActor(t, tn, policyID, scopes)
+	ctx := context.Background()
+
+	var rootID string
+	require.NoError(t, testDB.NewRaw(`SELECT id FROM issued_credentials WHERE jti = ?`, rlJTI(t, root)).Scan(ctx, &rootID))
+
+	tx, err := testDB.BeginTx(ctx, &sql.TxOptions{})
+	require.NoError(t, err)
+	defer tx.Rollback() //nolint:errcheck
+	_, err = tx.ExecContext(ctx, `LOCK TABLE issued_credentials IN EXCLUSIVE MODE`)
+	require.NoError(t, err)
+
+	type result struct {
+		status int
+		body   map[string]any
+	}
+	done := make(chan result, 1)
+	go func() {
+		status, body := rlExchange(t, actor, scopes, root)
+		done <- result{status, body}
+	}()
+	waiting := rlWaitForLockWait(t, "issued_credentials", []string{"relation"}, done)
+	t.Logf("exchange parked on: %.200s", waiting)
+
+	_, err = tx.ExecContext(ctx, `SELECT jti FROM revoke_credential_cascade(?, ?, ?, NOW(), 'test')`,
+		rootID, tn.account, tn.project)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	r := <-done
+	assert.Empty(t, rlLiveBelowRevoked(t, tn), "no live token is left below the revoked subject_token")
+	require.Equal(t, http.StatusBadRequest, r.status,
+		"an exchange whose subject_token was revoked before its token was stored MUST be rejected: %v", r.body)
+	assert.Equal(t, "invalid_grant", r.body["error"])
+}
+
+func TestRFC8693_SubjectRevokedConcurrentlyNeverLeavesLiveToken(t *testing.T) {
+	// RFC 8693 inherits RFC 6749 §5.2: "invalid_grant ... The provided
+	//   authorization grant ... is invalid, expired, revoked". An exchange
+	//   racing an RFC 7009 revocation of its subject_token MUST end with the
+	//   exchange rejected or its token revoked with the subject, never with
+	//   a live token below a revoked one.
+	//
+	// No help from the test: the exchange and the revocation run at once,
+	// the revocation after a random delay of up to 12 ms, ZEROID_RACE_TRIALS
+	// times (default 150). The stored row decides a hit, not introspection,
+	// which refuses a token below a revoked one even when the row is live.
+	trials := 150
+	if v := os.Getenv("ZEROID_RACE_TRIALS"); v != "" {
+		n, err := strconv.Atoi(v)
+		require.NoError(t, err, "ZEROID_RACE_TRIALS")
+		trials = n
+	}
+	tn := newTenant(t, "")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+	actor := rlNewActor(t, tn, policyID, scopes)
+
+	var hits, exchanged, rejected, serverErrors int
+	for i := range trials {
+		root, _ := tn.workloadRoot(t, policyID, scopes)
+		n, err := rand.Int(rand.Reader, big.NewInt(12000))
+		require.NoError(t, err)
+		delay := time.Duration(n.Int64()) * time.Microsecond
+
+		var wg sync.WaitGroup
+		var status int
+		var body map[string]any
+		wg.Add(2)
+		go func() { defer wg.Done(); status, body = rlExchange(t, actor, scopes, root) }()
+		go func() { defer wg.Done(); time.Sleep(delay); rlRevoke(t, root) }()
+		wg.Wait()
+
+		switch {
+		case status == http.StatusOK:
+			exchanged++
+			if !rlRowRevoked(t, rlJTI(t, body["access_token"].(string))) {
+				hits++
+				t.Logf("trial %d: live token below the revoked subject_token (revoke delayed %s)", i, delay)
+			}
+		case status >= http.StatusInternalServerError:
+			serverErrors++
+			t.Logf("trial %d: exchange returned %d: %v", i, status, body)
+		default:
+			rejected++
+		}
+	}
+	t.Logf("%d trials: %d exchanged (%d left live below a revoked subject_token), %d rejected, %d server errors",
+		trials, exchanged, hits, rejected, serverErrors)
+	assert.Zero(t, hits, "no exchange leaves a live token below its revoked subject_token")
+	assert.Zero(t, serverErrors, "an exchange racing a revocation is rejected, not failed")
+	assert.Empty(t, rlLiveBelowRevoked(t, tn))
+}
+
+func TestRFC8693_SubjectDelegatedFromRevokedTokenRejected(t *testing.T) {
+	// RFC 8693 inherits RFC 6749 §5.2: "invalid_grant ... The provided
+	//   authorization grant ... is invalid, expired, revoked". A subject_token
+	//   delegated from a revoked token is revoked with it, so it MUST NOT mint
+	//   a successor, even where the store still holds its own row unrevoked.
+	f := rlRevokedParentFixture(t)
+	status, body := rlExchange(t, rlNewActor(t, f.tn, f.policyID, f.scopes), f.scopes, f.child)
+	require.Equal(t, http.StatusBadRequest, status,
+		"token_exchange from a token below a revoked one MUST be rejected: %v", body)
 	assert.Equal(t, "invalid_grant", body["error"])
 }
 

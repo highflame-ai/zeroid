@@ -106,6 +106,16 @@ func TestRFC7662_S2_2_RevokedTokenIsInactive(t *testing.T) {
 		"revoked token MUST introspect as active=false")
 }
 
+func TestRFC7662_S2_2_TokenDelegatedFromRevokedTokenIsInactive(t *testing.T) {
+	// RFC 7662 §2.2: a "true" value for "active" indicates a token that "has
+	//   not been revoked by the resource owner". A token delegated from a
+	//   revoked token is revoked with it, so it MUST introspect as
+	//   active=false, even where the store still holds its own row unrevoked.
+	f := rlRevokedParentFixture(t)
+	assert.Equal(t, false, introspect(t, f.child)["active"], "a token below a revoked one MUST be inactive")
+	assert.Equal(t, false, introspect(t, f.grandchild)["active"], "and so MUST every token below that")
+}
+
 // ── RFC 7662 §2.2 — Required & optional claims ──────────────────────────────
 
 func TestRFC7662_S2_2_ActiveTokenSurfacesScope(t *testing.T) {

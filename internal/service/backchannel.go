@@ -1232,6 +1232,8 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 			return nil, oauthBadRequestCause(oautherror.AccessDenied, "the bound identity's credential policy refused issuance", err)
 		case errors.Is(err, domain.ErrIdentityNotUsable), errors.Is(err, domain.ErrIdentityExpired):
 			return nil, oauthBadRequestCause(oautherror.InvalidGrant, "the bound identity is no longer usable", err)
+		case errors.Is(err, domain.ErrCredentialAlreadyRevoked):
+			return nil, oauthBadRequestCause(oautherror.InvalidGrant, "the requesting token for this request has been revoked", err)
 		}
 		return nil, oauthServerError("failed to issue CIBA-grant token", err)
 	}

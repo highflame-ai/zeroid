@@ -756,6 +756,15 @@ delegated descendants. Cascade is bounded (see migration `007`/`029`).
 Revocation events are observable through the `RevocationNotifier` hook, one event
 per revoked `jti`; ZeroID ships no built-in deny-set transport.
 
+A token whose `parent_jti` chain reaches a revoked credential is inactive at
+introspection, refused by `/oauth2/token/verify`, and refused as a
+`subject_token`, whatever its own row says. A delegated token is stored only
+while every credential above it is unrevoked, checked under lock in the same
+transaction, so an exchange that races its subject's revocation is either
+refused (`invalid_grant`) or is reached and revoked by that revocation's
+cascade. Revoking an already-revoked or expired token through RFC 7009 runs
+the cascade again, revoking any token still live below it.
+
 ### 5.8 Internal service tokens
 
 A deployment's own services call each other, and a deployment's resource
@@ -1104,7 +1113,9 @@ is a ZeroID-defined extension.
 
 `severity` ∈ { `low`, `medium`, `high`, `critical` }. A signal of severity
 `high` or `critical` triggers credential revocation (and cascade per
-Section 5.7).
+Section 5.7). If that revocation fails, the signal is still recorded and
+delivered to subscribers, and `POST /signals/ingest` answers `500`. Sending
+the signal again runs the revocation again and records a second signal.
 
 ### 9.3 Signal shape and scoping
 
