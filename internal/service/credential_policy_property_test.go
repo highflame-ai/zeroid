@@ -271,7 +271,7 @@ func propRequestNear(t *rapid.T, policy *domain.CredentialPolicy) EnforcePolicyR
 		return free
 	}
 	req := propAdmittedRequest(t, policy)
-	switch rapid.IntRange(0, 15).Draw(t, "near.perturbed_axis") {
+	switch rapid.IntRange(0, 19).Draw(t, "near.perturbed_axis") {
 	case 0:
 		req.TTL = free.TTL
 	case 1:
@@ -302,8 +302,21 @@ func propRequestNear(t *rapid.T, policy *domain.CredentialPolicy) EnforcePolicyR
 		}
 	case 12:
 		req.Scopes = append(slices.Clone(req.Scopes), propScopeNearMiss(t, propScopeCeiling(policy, req), "near.extra_scope"))
+	case 13:
+		// A level strong enough, but in a case no rank table knows.
+		if policy.RequiredTrustLevel != "" {
+			req.TrustLevel = domain.TrustLevel(propUpperFirst(propAtLeast(t, propTrustLevels, policy.RequiredTrustLevel, propTrustRank, "near.trust_case")))
+		}
+	case 14:
+		if policy.RequiredAttestation != "" {
+			req.AttestationLevel = propUpperFirst(propAtLeast(t, propAttestations, policy.RequiredAttestation, propAttestationRank, "near.attestation_case"))
+		}
 	}
 	return req
+}
+
+func propUpperFirst(s string) string {
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 // propScopeCeiling is the ceiling EnforcePolicy's scope check documents (D10):
