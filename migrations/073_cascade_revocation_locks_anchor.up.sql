@@ -29,6 +29,15 @@
 -- revoked or expired token must still serialize with issuance below it, so
 -- that a second revocation can sweep a descendant the old code left live.
 --
+-- The walk then locks the live tokens it reached, parents first (ordered by
+-- delegation_depth, issued_at, id, as 074 orders the bulk cascades' anchors),
+-- and only then updates them. The UPDATE alone locks rows in whatever order
+-- its plan reads them. Another cascade holding a token inside this one's
+-- subtree, and waiting for a token below it that this UPDATE had already
+-- taken, deadlocked with it, and PostgreSQL aborted one of the two
+-- revocations. In the sorted order this cascade waits for the other's token
+-- before it takes anything below it.
+--
 -- The SET clauses from 060 are carried forward: CREATE OR REPLACE FUNCTION
 -- replaces the function's settings with the ones it names, and
 -- TestCascadeFunctionsPinIndexWalk fails if they are dropped. The walk keeps
@@ -74,12 +83,21 @@ BEGIN
         WHERE chain.depth < 50
     )
     CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
+    , locked AS (
+        SELECT ic.id
+        FROM issued_credentials ic
+        WHERE ic.id IN (SELECT c.id FROM chain c WHERE NOT c.is_cycle)
+          AND ic.is_revoked = FALSE
+          AND ic.expires_at > p_revoked_at
+        ORDER BY ic.delegation_depth, ic.issued_at, ic.id
+        FOR NO KEY UPDATE OF ic
+    )
     , revoked AS (
         UPDATE issued_credentials ic
         SET is_revoked    = TRUE,
             revoked_at    = p_revoked_at,
             revoke_reason = p_reason
-        WHERE ic.id IN (SELECT c.id FROM chain c WHERE NOT c.is_cycle)
+        WHERE ic.id IN (SELECT l.id FROM locked l)
           AND ic.is_revoked = FALSE
           AND ic.expires_at > p_revoked_at
         RETURNING ic.jti, ic.identity_id, ic.account_id, ic.project_id, ic.expires_at

@@ -33,10 +33,16 @@
 -- the cascade does. Expired, unrevoked ones are, since the walk passes
 -- through them (031).
 --
+-- The walk locks the live tokens it reached in the same order before it
+-- updates them, as 073's does. Two cascades over overlapping trees (an
+-- orchestrator's identity and that of a sub-agent it delegated to, revoked
+-- together) otherwise deadlocked: one held its anchor inside the other's
+-- subtree, while the other's UPDATE had already taken a token below it.
+--
 -- No planner settings: 060 leaves the bulk cascades to the planner, and
 -- TestCascadeFunctionsPinIndexWalk checks it. Everything else is carried over
--- from 031 (identity) and 043 (owner) verbatim. Return types are unchanged,
--- so CREATE OR REPLACE suffices.
+-- from 031 (identity) and 043 (owner). Return types are unchanged, so CREATE
+-- OR REPLACE suffices.
 
 CREATE OR REPLACE FUNCTION revoke_credentials_cascade(
     p_identity_id UUID,
@@ -69,12 +75,21 @@ BEGIN
         WHERE chain.depth < 50
     )
     CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
+    , locked AS (
+        SELECT ic.id
+        FROM issued_credentials ic
+        WHERE ic.id IN (SELECT c.id FROM chain c WHERE NOT c.is_cycle)
+          AND ic.is_revoked = FALSE
+          AND ic.expires_at > p_revoked_at
+        ORDER BY ic.delegation_depth, ic.issued_at, ic.id
+        FOR NO KEY UPDATE OF ic
+    )
     , revoked AS (
         UPDATE issued_credentials ic
         SET is_revoked    = TRUE,
             revoked_at    = p_revoked_at,
             revoke_reason = p_reason
-        WHERE ic.id IN (SELECT c.id FROM chain c WHERE NOT c.is_cycle)
+        WHERE ic.id IN (SELECT l.id FROM locked l)
           AND ic.is_revoked = FALSE
           AND ic.expires_at > p_revoked_at
         RETURNING ic.jti, ic.identity_id, ic.account_id, ic.project_id, ic.expires_at
@@ -136,12 +151,21 @@ BEGIN
         WHERE chain.depth < 50
     )
     CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
+    , locked AS (
+        SELECT ic.id
+        FROM issued_credentials ic
+        WHERE ic.id IN (SELECT c.id FROM chain c WHERE NOT c.is_cycle)
+          AND ic.is_revoked = FALSE
+          AND ic.expires_at > p_revoked_at
+        ORDER BY ic.delegation_depth, ic.issued_at, ic.id
+        FOR NO KEY UPDATE OF ic
+    )
     , revoked AS (
         UPDATE issued_credentials ic
         SET is_revoked    = TRUE,
             revoked_at    = p_revoked_at,
             revoke_reason = p_reason
-        WHERE ic.id IN (SELECT c.id FROM chain c WHERE NOT c.is_cycle)
+        WHERE ic.id IN (SELECT l.id FROM locked l)
           AND ic.is_revoked = FALSE
           AND ic.expires_at > p_revoked_at
         RETURNING ic.jti, ic.identity_id, ic.account_id, ic.project_id, ic.expires_at

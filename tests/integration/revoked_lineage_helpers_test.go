@@ -14,8 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun"
+
+	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // rlActor is an identity with a registered key, so it can present actor
@@ -162,4 +166,36 @@ func rlRevokedParentFixture(t *testing.T) rlRevokedParent {
 	require.False(t, rlRowRevoked(t, rlJTI(t, f.child)))
 	require.False(t, rlRowRevoked(t, rlJTI(t, f.grandchild)))
 	return f
+}
+
+// rlCred stores one credential with the given subject and returns its id and
+// jti. identityID may be "".
+func rlCred(t *testing.T, tn hrdTenant, parentJTI, identityID, subject string) (id, jti string) {
+	t.Helper()
+	jti = uuid.NewString()
+	return rlCredJTI(t, tn, jti, parentJTI, identityID, subject), jti
+}
+
+// rlCredJTI is rlCred for a jti chosen by the caller. It returns the id.
+func rlCredJTI(t *testing.T, tn hrdTenant, jti, parentJTI, identityID, subject string) string {
+	t.Helper()
+	cred := &domain.IssuedCredential{
+		ID: uuid.NewString(), AccountID: tn.account, ProjectID: tn.project,
+		JTI: jti, Subject: subject, IssuedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour), TTLSeconds: 3600,
+		Scopes: []string{}, GrantType: domain.GrantTypeTokenExchange, ParentJTI: parentJTI,
+	}
+	if identityID != "" {
+		cred.IdentityID = &identityID
+	}
+	require.NoError(t, postgres.NewCredentialRepository(testDB).Create(context.Background(), cred))
+	return cred.ID
+}
+
+// rlIdentity registers an identity in the tenant and returns its id.
+func rlIdentity(t *testing.T, tn hrdTenant, policyID string) string {
+	t.Helper()
+	wimse := tn.register(t, uid("retry"), policyID, "", []string{"data:read"})
+	var id string
+	require.NoError(t, testDB.NewRaw(`SELECT id FROM identities WHERE wimse_uri = ?`, wimse).Scan(context.Background(), &id))
+	return id
 }
