@@ -1,11 +1,14 @@
 package integration_test
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -53,4 +56,30 @@ func TestDelegationChain_LineageCapRefusalNamesTheChain(t *testing.T) {
 	// same root is issued.
 	status, body = exchangeWithKey(t, root, key, actor, scopes)
 	assert.Equal(t, http.StatusOK, status, "%v", body)
+
+	// The deepest token issued is reached by revoking the root: the cascade
+	// walk goes as far down as issuance lets the chain grow.
+	require.True(t, introspect(t, token)["active"].(bool), "the deepest token is active before the root is revoked")
+	resp := post(t, "/oauth2/token/revoke", map[string]any{"token": root}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = resp.Body.Close()
+	assert.False(t, introspect(t, token)["active"].(bool), "revoking the root revokes the %dth credential of its chain", postgres.MaxLineageDepth+1)
+}
+
+// TestCascadeFunctionsWalkToMaxLineageDepth reads the cascade revocation
+// functions a migrated database actually runs, so a later migration that
+// redefines one of them, however it spells the definition, cannot change
+// its depth bound without this failing.
+func TestCascadeFunctionsWalkToMaxLineageDepth(t *testing.T) {
+	bound := regexp.MustCompile(`chain\.depth\s*<\s*(\d+)`)
+	for _, fn := range []string{"revoke_credentials_cascade", "revoke_credential_cascade", "revoke_credentials_by_owner"} {
+		var src []string
+		require.NoError(t, testDB.NewRaw("SELECT prosrc FROM pg_proc WHERE proname = ?", fn).Scan(context.Background(), &src), fn)
+		require.Len(t, src, 1, "%s is defined once", fn)
+		matches := bound.FindAllStringSubmatch(src[0], -1)
+		require.NotEmpty(t, matches, "%s: no chain.depth bound found; update this test if the walk changed shape", fn)
+		for _, m := range matches {
+			assert.Equal(t, strconv.Itoa(postgres.MaxLineageDepth), m[1], "%s walks to chain.depth < %s, but MaxLineageDepth is %d", fn, m[1], postgres.MaxLineageDepth)
+		}
+	}
 }

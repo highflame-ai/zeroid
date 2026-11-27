@@ -122,7 +122,9 @@ func ancestorChain(ctx context.Context, db bun.IDB, fromID, accountID, projectID
 // walks (`chain.depth < 50` in the latest migration that defines each
 // revoke_*_cascade / revoke_credentials_by_owner function), so a credential
 // is issued only where revoking its root reaches it.
-// TestMaxLineageDepthMatchesCascadeMigrations fails when they differ. A
+// TestMaxLineageDepthMatchesCascadeMigrations (the migration files) and
+// TestCascadeFunctionsWalkToMaxLineageDepth (a migrated database) fail when
+// they differ. A
 // chain longer than that is ErrLineageTooLong, and callers fail closed on it.
 const MaxLineageDepth = 50
 

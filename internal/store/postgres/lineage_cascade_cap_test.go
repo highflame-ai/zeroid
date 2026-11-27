@@ -32,7 +32,8 @@ func latestFunctionBody(t *testing.T, name string) (body, file string) {
 	files, err := fs.Glob(migrations.FS, "*.up.sql")
 	require.NoError(t, err)
 	sort.Strings(files)
-	start := regexp.MustCompile(`(?i)CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\s+` + regexp.QuoteMeta(name) + `\s*\(`)
+	// The name may be schema-qualified and either part quoted.
+	start := regexp.MustCompile(`(?i)CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\s+(?:"?public"?\s*\.\s*)?"?` + regexp.QuoteMeta(name) + `"?\s*\(`)
 	for _, f := range files {
 		raw, err := fs.ReadFile(migrations.FS, f)
 		require.NoError(t, err)
