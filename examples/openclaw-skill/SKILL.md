@@ -175,7 +175,7 @@ curl -s -X POST "$ZEROID_BASE_URL/oauth2/token" \
 
 The delegated token carries the full chain: `sub` is the sub-agent's WIMSE URI, `act.sub` is the delegating agent's WIMSE URI, and `delegation_depth` increments at each hop. The `actor_token` is a self-signed ES256 JWT assertion proving the sub-agent holds its private key.
 
-Multi-hop delegation is supported — a sub-agent can delegate further to a tool agent. `CredentialPolicy.max_delegation_depth` caps how deep the chain can go.
+Multi-hop delegation is supported — a sub-agent can delegate further to a tool agent. `CredentialPolicy.max_delegation_depth` caps how deep the chain can go, from 0 (no delegation) to 15.
 
 ---
 

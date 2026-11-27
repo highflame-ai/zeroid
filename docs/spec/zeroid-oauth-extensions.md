@@ -315,7 +315,9 @@ claims — are specified in Sections 4.3, 4.4, and 4.8.
   rather than trusting either alone. Prior actors carry only `sub`. On an exchange from a
   root grant, the root token's `client_id` becomes the first prior actor. The
   chain is capped at 16 actors for token size; past it the deepest prior actors
-  are dropped, which §4.1 allows because they are informational.
+  are dropped, which §4.1 allows because they are informational. A token at
+  `delegation_depth` d names at most d+1 actors, and depth is held to 15
+  (Section 5.2), so an exchanged token's chain fits the cap and none is dropped.
 - A root grant has no `act`. An `api_key` token in particular carries none: the
   key's creator is not acting, and stays identity metadata in `owner_user_id`.
 
@@ -513,6 +515,23 @@ Each exchange increments `delegation_depth` by 1 relative to the subject token.
 The actor's credential policy `max_delegation_depth` caps the chain: an exchange
 that would exceed it **MUST** be rejected. `delegation_depth` is emitted as a
 claim only when &gt; 0 (Section 4.3).
+
+`max_delegation_depth` ranges from 0, which allows no delegation, to 15. Creating
+a policy with a value outside that range, or updating one to such a value, is a
+`400`. An update that sends the stored value back unchanged is accepted. Fifteen is the
+deepest chain whose `act` claim names every actor: the delegates, then the root
+grant's client, 16 in all (Section 4.4). Issuance also refuses any token past
+depth 15, whatever its policies allow, so a policy stored with a larger value
+before the range was enforced is held to 15. A token exchange answers
+`policy_violation`; a CIBA approval answers `access_denied`.
+
+Separately, a token may be delegated from at most 50 credentials, counted along
+`parent_jti` from its parent to the root. Re-scoping (below) and a CIBA approval
+on a requesting chain add a credential without adding depth, so this is a
+different count from `delegation_depth`. An exchange or CIBA approval past it is
+refused with `invalid_grant` and `error_description` "the delegation chain is longer than 50
+credentials". The cascade revocation walk follows `parent_jti` the same 50 links
+down, so it reaches every token ZeroID issues.
 
 Under the `rfc8693` profile, an exchange whose actor already **is** the subject
 token's current actor (its `act.sub`, ADR 0043 D2) is a re-scoping, not a
@@ -752,7 +771,8 @@ also out of scope; trusted issuers are configured explicitly.
 Revoking any credential revokes the entire subtree beneath it (all credentials
 whose `parent_jti` chain reaches the revoked `jti`). Revoking an identity
 (deactivation) revokes all of its active credentials and, transitively, their
-delegated descendants. Cascade is bounded (see migration `007`/`029`).
+delegated descendants. The walk follows `parent_jti` at most 50 links down, the
+lineage cap of Section 5.2, so it reaches every token issuance allows.
 Revocation events are observable through the `RevocationNotifier` hook, one event
 per revoked `jti`; ZeroID ships no built-in deny-set transport.
 

@@ -143,7 +143,7 @@ The resulting token carries the full delegation chain:
 - `delegation_depth` -- increments at each hop
 - `scope` -- the intersection of requested and available scopes
 
-Delegation depth is capped by `CredentialPolicy.max_delegation_depth`.
+Delegation depth is capped by `CredentialPolicy.max_delegation_depth` (0 to 15).
 
 Ask the user for the orchestrator token, sub-agent assertion, and desired scope.
 
@@ -190,7 +190,7 @@ Request body fields:
 - `allowed_scopes` (optional) -- array of permitted scopes
 - `required_trust_level` (optional) -- minimum trust level required
 - `required_attestation` (optional) -- minimum attestation level required
-- `max_delegation_depth` (optional) -- maximum delegation chain depth
+- `max_delegation_depth` (optional) -- maximum delegation chain depth, 0 (the default: no delegation) to 15
 
 Other policy endpoints:
 - **GET /credential-policies/{id}** -- get a policy by ID

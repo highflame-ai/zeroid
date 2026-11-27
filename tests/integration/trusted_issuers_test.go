@@ -198,20 +198,26 @@ func newTITenant(t *testing.T) tiTenant {
 }
 
 type tiAgent struct {
-	id, wimse, extID string
-	key              *ecdsa.PrivateKey
+	id, wimse, extID, policyID string
+	key                        *ecdsa.PrivateKey
 }
 
 // agent registers an active agent with a key and a policy allowing both
 // person grants and delegation.
 func (tn tiTenant) agent(t *testing.T) tiAgent {
 	t.Helper()
+	return tn.agentWithDepth(t, 5)
+}
+
+// agentWithDepth is agent with the policy's max_delegation_depth set.
+func (tn tiTenant) agentWithDepth(t *testing.T, maxDepth int) tiAgent {
+	t.Helper()
 	policyID := createRichCredentialPolicy(t, map[string]any{
 		"name":                 uid("ti-policy"),
 		"allowed_grant_types":  []string{"token_exchange", "jwt_bearer"},
 		"allowed_scopes":       []string{"tools:read"},
 		"user_grant_scopes":    []string{"tools:read"},
-		"max_delegation_depth": 5,
+		"max_delegation_depth": maxDepth,
 		"max_ttl_seconds":      3600,
 	}, tn.headers)
 	key := generateKey(t)
@@ -227,7 +233,7 @@ func (tn tiTenant) agent(t *testing.T) tiAgent {
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 	got := decode(t, resp)
 	_ = resp.Body.Close()
-	return tiAgent{id: got["id"].(string), wimse: got["wimse_uri"].(string), extID: extID, key: key}
+	return tiAgent{id: got["id"].(string), wimse: got["wimse_uri"].(string), extID: extID, policyID: policyID, key: key}
 }
 
 // discoveredAgent ingests a discovered (unadopted) agent into the tenant.

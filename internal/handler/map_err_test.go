@@ -53,3 +53,15 @@ func TestExtractOAuthError_PersonGrant(t *testing.T) {
 		t.Errorf("the resolver's error must not reach the client: %q", desc)
 	}
 }
+
+// TestExtractOAuthError_DelegationChainTooLong: a chain past the lineage cap
+// is invalid_grant, described as too long, not as a suspended identity.
+func TestExtractOAuthError_DelegationChainTooLong(t *testing.T) {
+	code, desc, status := extractOAuthError(fmt.Errorf("%w: %w", service.ErrDelegationChainTooLong, errors.New("lineage detail")))
+	if code != "invalid_grant" || status != http.StatusBadRequest {
+		t.Errorf("got %s/%d, want invalid_grant/400", code, status)
+	}
+	if desc != service.ErrDelegationChainTooLong.Error() {
+		t.Errorf("description: got %q, want %q", desc, service.ErrDelegationChainTooLong.Error())
+	}
+}

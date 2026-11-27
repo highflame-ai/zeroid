@@ -118,14 +118,23 @@ func ancestorChain(ctx context.Context, db bun.IDB, fromID, accountID, projectID
 }
 
 // MaxLineageDepth is how many credentials CredentialLineage follows up a
-// delegation chain, the same cap the cascade revocation walk uses
-// (migration 031). A chain longer than that is ErrBrokenLineage, and callers
-// fail closed on it.
+// delegation chain. It must equal the depth bound of the cascade revocation
+// walks (`chain.depth < 50` in the latest migration that defines each
+// revoke_*_cascade / revoke_credentials_by_owner function), so a credential
+// is issued only where revoking its root reaches it.
+// TestMaxLineageDepthMatchesCascadeMigrations (the migration files) and
+// TestCascadeFunctionsWalkToMaxLineageDepth (a migrated database) fail when
+// they differ. A
+// chain longer than that is ErrLineageTooLong, and callers fail closed on it.
 const MaxLineageDepth = 50
 
+// ErrLineageTooLong is returned by CredentialLineage when a delegation chain
+// is longer than MaxLineageDepth credentials.
+var ErrLineageTooLong = fmt.Errorf("the delegation chain above this credential is longer than %d credentials", MaxLineageDepth)
+
 // ErrBrokenLineage is returned by CredentialLineage when a delegation chain
-// is longer than MaxLineageDepth or loops.
-var ErrBrokenLineage = errors.New("the delegation chain above this credential is too long to check")
+// loops.
+var ErrBrokenLineage = errors.New("the delegation chain above this credential loops")
 
 // LineageIdentity is an identity that a credential, or one of the credentials
 // it was delegated from, was issued to, in that credential's own tenant.
@@ -157,8 +166,8 @@ SELECT COALESCE(identity_id::text, '') AS identity_id, account_id, project_id, d
 // credential it was delegated from (parent_jti, up to the root) were issued
 // to, each once, in their own tenant. Credentials issued to no identity (a
 // person's session) contribute nothing. A parent row that no longer exists
-// ends the chain. A chain longer than MaxLineageDepth, or one that loops, is
-// ErrBrokenLineage. An unknown jti returns nothing.
+// ends the chain. A chain longer than MaxLineageDepth is ErrLineageTooLong,
+// and one that loops is ErrBrokenLineage. An unknown jti returns nothing.
 func (r *IdentityRepository) CredentialLineage(ctx context.Context, jti string) ([]LineageIdentity, error) {
 	var rows []LineageIdentity
 	if err := dbOrTx(ctx, r.db).NewRaw(credentialLineageSQL, jti, MaxLineageDepth).Scan(ctx, &rows); err != nil {
@@ -167,8 +176,11 @@ func (r *IdentityRepository) CredentialLineage(ctx context.Context, jti string) 
 	seen := make(map[LineageIdentity]bool, len(rows))
 	out := make([]LineageIdentity, 0, len(rows))
 	for _, row := range rows {
-		if row.IsCycle || row.Depth > MaxLineageDepth {
+		if row.IsCycle {
 			return nil, ErrBrokenLineage
+		}
+		if row.Depth > MaxLineageDepth {
+			return nil, ErrLineageTooLong
 		}
 		if row.IdentityID == "" {
 			continue
