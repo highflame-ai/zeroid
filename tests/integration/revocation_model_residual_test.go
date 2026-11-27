@@ -35,6 +35,24 @@ func mrCred(ctx context.Context, tn hrdTenant, parentJTI, identityID string, dep
 	return jti, postgres.NewCredentialRepository(testDB).Create(ctx, cred)
 }
 
+// mrWaitBlockedBy waits until a cascade is blocked by the backend pid.
+func mrWaitBlockedBy(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		require.NoError(t, testDB.NewRaw(`
+			SELECT count(*) FROM pg_stat_activity a
+			WHERE a.query LIKE '%revoke_credentials_cascade%' AND ? = ANY(pg_blocking_pids(a.pid))`,
+			pid).Scan(context.Background(), &n))
+		if n > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("no cascade was blocked by backend %d within 15s", pid)
+}
+
 // mrRetries returns runCascade's log lines for a cascade aborted as a deadlock
 // victim and run again.
 func mrRetries(t *testing.T, sl *serverLog) []map[string]any {
@@ -58,7 +76,7 @@ func mrRetries(t *testing.T, sl *serverLog) []map[string]any {
 //     for A.
 //  3. The exchange commits. X's first statement locks A and B and waits for S.
 //  4. Y's cascade starts: its snapshot has C. It locks C and waits for S.
-//  5. S is released. X takes S, and its second statement (new snapshot, now
+//  5. S is released. X, first in the queue for S, takes it, and its second statement (new snapshot, now
 //     with C) waits for C, which Y holds; Y waits for S, which X holds.
 //
 // PostgreSQL aborts one of the two, and runCascade runs it again. Both must
@@ -85,6 +103,8 @@ func TestCascadeRetryAbsorbsDeadlockOnTokenStoredDuringFirstStatement(t *testing
 		require.NoError(t, err)
 		hold, err := testDB.BeginTx(ctx, nil)
 		require.NoError(t, err)
+		var holdPID int
+		require.NoError(t, hold.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&holdPID))
 		_, err = hold.ExecContext(ctx, `SELECT 1 FROM issued_credentials WHERE jti = ? FOR SHARE`, sJTI)
 		require.NoError(t, err)
 
@@ -97,7 +117,7 @@ func TestCascadeRetryAbsorbsDeadlockOnTokenStoredDuringFirstStatement(t *testing
 		}()
 		loWaitForWaiters(t, "revoke_credentials_cascade", 1)
 		require.NoError(t, exch.Commit())
-		time.Sleep(100 * time.Millisecond) // X's first statement moves on to S
+		mrWaitBlockedBy(t, holdPID) // X's first statement has A and B, and waits for S
 		go func() {
 			_, err := repo.RevokeAllActiveForIdentity(ctx, identY, "lock_model_test")
 			errs <- err
