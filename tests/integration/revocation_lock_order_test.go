@@ -39,10 +39,16 @@ var loBulkCascades = map[string]func(ctx context.Context, tn hrdTenant, identity
 // loCred stores one credential through the issuance chokepoint's repository
 // call and returns its jti. identityID may be "".
 func loCred(ctx context.Context, tn hrdTenant, parentJTI, identityID string) (string, error) {
+	return loCredIssuedAt(ctx, tn, parentJTI, identityID, time.Time{})
+}
+
+// loCredIssuedAt is loCred with the issuance time the issuing replica's clock
+// read. The zero time leaves issued_at to the database's default.
+func loCredIssuedAt(ctx context.Context, tn hrdTenant, parentJTI, identityID string, issuedAt time.Time) (string, error) {
 	jti := uuid.NewString()
 	cred := &domain.IssuedCredential{
 		ID: uuid.NewString(), AccountID: tn.account, ProjectID: tn.project,
-		JTI: jti, Subject: "lock-order", ExpiresAt: time.Now().Add(time.Hour), TTLSeconds: 3600,
+		JTI: jti, Subject: "lock-order", IssuedAt: issuedAt, ExpiresAt: time.Now().Add(time.Hour), TTLSeconds: 3600,
 		Scopes: []string{}, GrantType: domain.GrantTypeTokenExchange, ParentJTI: parentJTI,
 	}
 	if identityID != "" {
@@ -172,6 +178,71 @@ func TestBulkCascadeDoesNotDeadlockWithDelegatedIssuance(t *testing.T) {
 			}
 			assert.Empty(t, failures, "a bulk cascade and a delegated issuance below it MUST NOT deadlock")
 			assert.Empty(t, live, "and no token is left live below a revoked one")
+		})
+	}
+}
+
+// TestBulkCascadeLocksParentAnchorFirstUnderClockSkew covers a parent and
+// child anchor that the cascade's ordering key cannot tell apart by depth: a
+// re-scoping exchange (or a CIBA grant) issues the child to the same identity
+// at the same delegation_depth. The child was stored by a replica whose clock
+// is a second behind the one that stored the parent, so its issue time is the
+// earlier one. An issuance below the child, holding the parent and waiting
+// for the child, MUST NOT deadlock with a cascade that took the child first
+// and waits for the parent.
+//
+// The test holds the parent locked so that the issuance queues on it first,
+// starts the cascade, waits until it too waits, and then releases the parent.
+func TestBulkCascadeLocksParentAnchorFirstUnderClockSkew(t *testing.T) {
+	for name, cascade := range loBulkCascades {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			tn := newTenant(t, "")
+			wimse := tn.register(t, uid("lock-order-skew"), tn.policy(t, []string{"data:read"}), "", []string{"data:read"})
+			var identityID string
+			require.NoError(t, testDB.NewRaw(`SELECT id FROM identities WHERE wimse_uri = ?`, wimse).Scan(ctx, &identityID))
+			parentJTI, err := loCred(ctx, tn, "", identityID)
+			require.NoError(t, err)
+			var parentIssuedAt time.Time
+			require.NoError(t, testDB.NewRaw(`SELECT issued_at FROM issued_credentials WHERE jti = ?`, parentJTI).
+				Scan(ctx, &parentIssuedAt))
+			childJTI, err := loCredIssuedAt(ctx, tn, parentJTI, identityID, parentIssuedAt.Add(-time.Second))
+			require.NoError(t, err)
+
+			hold, err := testDB.BeginTx(ctx, nil)
+			require.NoError(t, err)
+			defer hold.Rollback() //nolint:errcheck
+			_, err = hold.ExecContext(ctx, `SELECT 1 FROM issued_credentials WHERE jti = ? FOR NO KEY UPDATE`, parentJTI)
+			require.NoError(t, err)
+
+			issued := make(chan error, 1)
+			go func() {
+				_, err := loCred(ctx, tn, childJTI, "")
+				issued <- err
+			}()
+			rlWaitForLockWait(t, "FOR SHARE OF ic", []string{"transactionid", "tuple"}, issued)
+
+			type result struct {
+				rows []postgres.RevokedCredential
+				err  error
+			}
+			done := make(chan result, 1)
+			go func() {
+				rows, err := cascade(ctx, tn, identityID)
+				done <- result{rows, err}
+			}()
+			rlWaitForLockWait(t, "revoke_credentials_", []string{"transactionid", "tuple"}, done)
+			require.NoError(t, hold.Commit())
+
+			issueErr := <-issued
+			r := <-done
+			assert.NoError(t, r.err, "the cascade MUST NOT deadlock with the issuance")
+			if issueErr != nil {
+				assert.ErrorIs(t, issueErr, postgres.ErrRevokedLineage,
+					"the issuance is refused because the cascade won, not aborted")
+			}
+			assert.True(t, rlRowRevoked(t, childJTI))
+			assert.Empty(t, rlLiveBelowRevoked(t, tn), "and no token is left live below a revoked one")
 		})
 	}
 }
