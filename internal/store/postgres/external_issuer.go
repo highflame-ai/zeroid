@@ -202,7 +202,7 @@ func (r *ExternalIssuerRepository) Update(ctx context.Context, row *domain.Exter
 		Column("display_name", "audiences", "algorithms", "claim_mapping", "propagate_claims",
 			"claim_constraints", "constraints_key", "max_token_age_seconds", "jwks_cache_ttl_seconds",
 			"trust_email", "enabled", "first_contact", "first_contact_project_id", "first_contact_owner_user_id",
-			"first_contact_updated_by", "first_contact_updated_at", "updated_by").
+			"first_contact_credential_policy_id", "first_contact_updated_by", "first_contact_updated_at", "updated_by").
 		Set("updated_at = clock_timestamp()").
 		Where("id = ?", row.ID).
 		Where("account_id = ?", row.AccountID).

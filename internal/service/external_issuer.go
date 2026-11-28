@@ -90,6 +90,21 @@ type ExternalIssuerServiceConfig struct {
 	// against. VerifyIDToken uses its JWKS clients, so the ownership proof
 	// verifies with the same keys a grant would; nil refuses that route.
 	Registry *ExternalIssuerRegistry
+	// CredentialPolicies reads the credential policy an adopt row's
+	// first-contact mapping names (*postgres.CredentialPolicyRepository);
+	// nil refuses a write that names one.
+	CredentialPolicies IssuerPolicyReader
+}
+
+// IssuerPolicyReader reads the credential policy an issuer row's first-contact
+// mapping names, in the row's account and first_contact_project_id;
+// *postgres.CredentialPolicyRepository. sql.ErrNoRows (wrapped) when there is
+// none. GetByIDForShare runs in the row write's transaction and holds a share
+// lock on the policy until it ends, so a concurrent delete of the policy
+// either sees the row's reference or commits first and is seen.
+type IssuerPolicyReader interface {
+	GetByID(ctx context.Context, id, accountID, projectID string) (*domain.CredentialPolicy, error)
+	GetByIDForShare(ctx context.Context, id, accountID, projectID string) (*domain.CredentialPolicy, error)
 }
 
 // ExternalIssuerService manages trusted issuers and bindings for the admin
@@ -153,10 +168,12 @@ type IssuerInput struct {
 	Source           domain.IssuerSource
 	SourceRef        string
 	Enabled          *bool
-	// FirstContact and its mapping. Empty FirstContact is off.
-	FirstContact            domain.FirstContactMode
-	FirstContactProjectID   string
-	FirstContactOwnerUserID string
+	// FirstContact and its mapping. Empty FirstContact is off. The credential
+	// policy is for adopt only.
+	FirstContact                   domain.FirstContactMode
+	FirstContactProjectID          string
+	FirstContactOwnerUserID        string
+	FirstContactCredentialPolicyID string
 }
 
 // IssuerPatch is an update. Nil fields are unchanged; issuer, kind, source,
@@ -173,9 +190,12 @@ type IssuerPatch struct {
 	TrustEmail       *bool
 	Enabled          *bool
 	// FirstContact and its mapping. An empty string clears a mapping field.
-	FirstContact            *domain.FirstContactMode
-	FirstContactProjectID   *string
-	FirstContactOwnerUserID *string
+	// Setting FirstContact to anything but adopt also clears the credential
+	// policy, which applies to adopt only.
+	FirstContact                   *domain.FirstContactMode
+	FirstContactProjectID          *string
+	FirstContactOwnerUserID        *string
+	FirstContactCredentialPolicyID *string
 	// IfUpdatedAt, when set, applies the patch only if the row's updated_at
 	// still equals it (409 issuer_changed otherwise). A deployer that checked
 	// the row before enabling it (a workload row's proof of control) enables
@@ -207,11 +227,12 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		Enabled:             in.Enabled == nil || *in.Enabled,
 		// Stored whether or not the row is enabled; it acts only once the
 		// row is.
-		FirstContact:            in.FirstContact,
-		FirstContactProjectID:   in.FirstContactProjectID,
-		FirstContactOwnerUserID: in.FirstContactOwnerUserID,
-		CreatedBy:               actor,
-		UpdatedBy:               actor,
+		FirstContact:                   in.FirstContact,
+		FirstContactProjectID:          in.FirstContactProjectID,
+		FirstContactOwnerUserID:        in.FirstContactOwnerUserID,
+		FirstContactCredentialPolicyID: in.FirstContactCredentialPolicyID,
+		CreatedBy:                      actor,
+		UpdatedBy:                      actor,
 	}
 	if err := domain.ApplyIssuerPreset(row, in.Preset); err != nil {
 		return nil, nil, validationToAPIError(err)
@@ -227,6 +248,11 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 	pin := s.sharedPin(row.Issuer)
 	if err := row.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, PinClaim: pin, JWKSURIPending: true}); err != nil {
 		return nil, nil, validationToAPIError(err)
+	}
+	// Answered before anything is fetched; the transaction below reads the
+	// policy again, locked.
+	if err := s.checkFirstContactPolicy(ctx, row, nil, false); err != nil {
+		return nil, nil, err
 	}
 	row.ConstraintsKey = row.UniquenessKey(pin)
 
@@ -276,6 +302,9 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		if n >= MaxExternalIssuersPerAccount {
 			return issuerErr(http.StatusConflict, "issuer_limit_reached",
 				fmt.Sprintf("an account may trust at most %d issuers", MaxExternalIssuersPerAccount))
+		}
+		if err := s.checkFirstContactPolicy(ctx, row, nil, true); err != nil {
+			return err
 		}
 		if err := s.repo.Insert(ctx, row); err != nil {
 			if isDuplicateKeyError(err) {
@@ -461,6 +490,9 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 				return validationToAPIError(err)
 			}
 		}
+		if err := s.checkFirstContactPolicy(ctx, r, &before, true); err != nil {
+			return err
+		}
 		if err := s.repo.Update(ctx, r); err != nil {
 			if isDuplicateKeyError(err) {
 				return errIssuerAlreadyTrusted
@@ -487,20 +519,69 @@ func (p IssuerPatch) onlyNameFirstContactOrDisable() bool {
 }
 
 // stampFirstContact names actor as the last to change r's first-contact mode
-// or mapping, when the write changes any of them from before (a new row is
-// compared with the defaults, before == nil). A standing adoption records
-// who that was on every identity it activates.
+// or mapping (project, owner, credential policy), when the write changes any
+// of them from before (a new row is compared with the defaults, before ==
+// nil). A standing adoption records who that was on every identity it
+// activates.
 func stampFirstContact(r, before *domain.ExternalIssuer, actor string) {
-	mode, project, owner := domain.FirstContactOff, "", ""
+	mode, project, owner, policy := domain.FirstContactOff, "", "", ""
 	if before != nil {
-		mode, project, owner = before.FirstContact, before.FirstContactProjectID, before.FirstContactOwnerUserID
+		mode, project, owner, policy = before.FirstContact, before.FirstContactProjectID, before.FirstContactOwnerUserID,
+			before.FirstContactCredentialPolicyID
 	}
-	if r.FirstContact == mode && r.FirstContactProjectID == project && r.FirstContactOwnerUserID == owner {
+	if r.FirstContact == mode && r.FirstContactProjectID == project && r.FirstContactOwnerUserID == owner &&
+		r.FirstContactCredentialPolicyID == policy {
 		return
 	}
 	now := time.Now().UTC()
 	r.FirstContactUpdatedBy = actor
 	r.FirstContactUpdatedAt = &now
+}
+
+// checkFirstContactPolicy refuses (400 first_contact_policy_invalid) a write
+// that leaves r naming a first-contact credential policy that does not exist
+// in r's account and first_contact_project_id, or cannot be assigned there
+// (firstContactPolicyProblem). The policy is read only when the write names
+// it or moves the row to another project (before is nil on create): a stored
+// policy that became unusable since then fails closed when an agent is
+// adopted, and must not stop the row from being renamed or disabled. With
+// forShare, in the write's transaction, the policy is read with a share lock
+// (IssuerPolicyReader).
+func (s *ExternalIssuerService) checkFirstContactPolicy(ctx context.Context, r, before *domain.ExternalIssuer, forShare bool) error {
+	id := r.FirstContactCredentialPolicyID
+	if id == "" {
+		return nil
+	}
+	if before != nil && before.FirstContactCredentialPolicyID == id && before.FirstContactProjectID == r.FirstContactProjectID {
+		return nil
+	}
+	if s.cfg.CredentialPolicies == nil {
+		return errors.New("no credential policy store to check first_contact_credential_policy_id against")
+	}
+	refuse := func(format string, args ...any) error {
+		return issuerErr(http.StatusBadRequest, "first_contact_policy_invalid",
+			"first_contact_credential_policy_id "+fmt.Sprintf(format, args...))
+	}
+	missing := refuse("%q names no credential policy in first_contact_project_id %q (a credential policy belongs to one project)",
+		id, r.FirstContactProjectID)
+	if !validUUID(id) {
+		return missing
+	}
+	read := s.cfg.CredentialPolicies.GetByID
+	if forShare {
+		read = s.cfg.CredentialPolicies.GetByIDForShare
+	}
+	policy, err := read(ctx, id, r.AccountID, r.FirstContactProjectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return missing
+	}
+	if err != nil {
+		return err
+	}
+	if problem := firstContactPolicyProblem(policy); problem != "" {
+		return refuse("names credential policy %q, which %s", policy.Name, problem)
+	}
+	return nil
 }
 
 func applyIssuerPatch(r *domain.ExternalIssuer, p IssuerPatch) {
@@ -536,12 +617,21 @@ func applyIssuerPatch(r *domain.ExternalIssuer, p IssuerPatch) {
 	}
 	if p.FirstContact != nil {
 		r.FirstContact = *p.FirstContact
+		// The credential policy applies to adopt only, so moving a row off
+		// adopt clears it. A patch that also names one is refused by
+		// validation instead.
+		if r.FirstContact != domain.FirstContactAdopt {
+			r.FirstContactCredentialPolicyID = ""
+		}
 	}
 	if p.FirstContactProjectID != nil {
 		r.FirstContactProjectID = *p.FirstContactProjectID
 	}
 	if p.FirstContactOwnerUserID != nil {
 		r.FirstContactOwnerUserID = *p.FirstContactOwnerUserID
+	}
+	if p.FirstContactCredentialPolicyID != nil {
+		r.FirstContactCredentialPolicyID = *p.FirstContactCredentialPolicyID
 	}
 }
 

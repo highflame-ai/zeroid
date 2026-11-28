@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -36,7 +37,9 @@ import (
 // to the agent's existing identity (standing adoption) when that identity is
 // still discovered, sits in the mapped project, is no approval channel, and
 // no person disabled the binding; discover leaves it as it is, already in
-// the adoption queue.
+// the adoption queue. An adopt row that names a credential policy assigns it
+// to every agent it adopts, either way, and adopts nothing while that policy
+// is missing or cannot be assigned.
 //
 // It never creates a person or a membership, never trusts an issuer that is
 // not already a row, never acts on a disabled row, and never overrides a
@@ -90,7 +93,11 @@ func reservedFirstContactExternalID(externalID string) bool {
 type FirstContactRegistrar struct {
 	issuers    *postgres.ExternalIssuerRepository
 	identities *IdentityService
-	cfg        FirstContactConfig
+	// policies reads the credential policy an adopt row names, straight from
+	// the database (GetByID): never from the request's policy memo, so the
+	// check under the lock sees the policy as it is.
+	policies IssuerPolicyReader
+	cfg      FirstContactConfig
 }
 
 // NewFirstContactRegistrar builds the registrar. Zero bounds take the
@@ -102,7 +109,11 @@ func NewFirstContactRegistrar(issuers *postgres.ExternalIssuerRepository, identi
 	if cfg.MaxDiscoveredPerAccount <= 0 {
 		cfg.MaxDiscoveredPerAccount = DefaultFirstContactMaxDiscoveredPerAccount
 	}
-	return &FirstContactRegistrar{issuers: issuers, identities: identities, cfg: cfg}
+	r := &FirstContactRegistrar{issuers: issuers, identities: identities, cfg: cfg}
+	if identities != nil && identities.policySvc != nil && identities.policySvc.repo != nil {
+		r.policies = identities.policySvc.repo
+	}
+	return r
 }
 
 // SetFirstContact enables first-contact registration on the grants that
@@ -165,6 +176,14 @@ const (
 	// firstContactApprovalChannel: the bound identity is an approval channel,
 	// which only a person activates.
 	firstContactApprovalChannel firstContactOutcome = "approval_channel"
+
+	// firstContactPolicyUnusable: the adopt row's
+	// first_contact_credential_policy_id names no credential policy in the
+	// row's account and first_contact_project_id, or one that cannot be
+	// assigned (firstContactPolicyProblem): inactive, expired, or listing
+	// ciba:approve. Nothing is registered or adopted, under the lock or
+	// before it; the grant refuses as without first contact.
+	firstContactPolicyUnusable firstContactOutcome = "policy_unusable"
 )
 
 // rereads reports whether the grant reads the subject's bindings again after
@@ -181,6 +200,9 @@ type firstContactResult struct {
 	// candidate is the bound identity a standing adoption declined, when it
 	// got as far as reading one.
 	candidate string
+	// policy is the credential policy the row named, as read under the lock,
+	// when the attempt was declined for it (firstContactPolicyUnusable).
+	policy string
 }
 
 // firstContactArrival is a credential that verified in full and named an
@@ -344,33 +366,16 @@ func (r *FirstContactRegistrar) registerLocked(ctx context.Context, a firstConta
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return firstContactResult{}, err
 	}
+	// Last before the write, so every other bound keeps its own outcome.
+	if res, err := r.policyDeclines(ctx, fresh); err != nil || res.outcome != "" {
+		return res, err
+	}
 
 	labels, metadata, err := firstContactMarkers(a, fresh)
 	if err != nil {
 		return firstContactResult{}, err
 	}
-	req := RegisterIdentityRequest{
-		AccountID:    row.AccountID,
-		ProjectID:    project,
-		ExternalID:   externalID,
-		Name:         firstContactName(a.subjectKey),
-		IdentityType: domain.IdentityTypeAgent,
-		TrustLevel:   domain.TrustLevelUnverified,
-		Origin:       domain.OriginFirstContact,
-		OwnerUserID:  fresh.FirstContactOwnerUserID,
-		Labels:       labels,
-		Metadata:     metadata,
-		CreatedBy:    FirstContactActor,
-		firstContact: true,
-	}
-	if mode == domain.FirstContactAdopt {
-		// The row's standing mapping is the adoption: the agent is adopted
-		// into the mapped project, owned by the mapped user, and vouched for
-		// by an issuer the account trusts.
-		req.adopted = true
-		req.TrustLevel = domain.TrustLevelVerifiedThirdParty
-	}
-	created, err := r.identities.RegisterIdentity(ctx, req)
+	created, err := r.identities.RegisterIdentity(ctx, firstContactRegistration(a, fresh, externalID, labels, metadata))
 	if err != nil {
 		var deactivated *IdentityDeactivatedConflictError
 		if errors.Is(err, ErrIdentityAlreadyExists) || errors.As(err, &deactivated) {
@@ -399,12 +404,42 @@ func (r *FirstContactRegistrar) registerLocked(ctx context.Context, a firstConta
 	return firstContactResult{outcome: firstContactRegistered, identity: created}, nil
 }
 
+// firstContactRegistration is the registration of the agent a names under
+// fresh, the row as read under the lock. Under adopt the row's standing
+// mapping is the adoption: the agent is adopted into the mapped project,
+// owned by the mapped user, governed by the mapped credential policy (the
+// project's default when the row names none, which RegisterIdentity
+// assigns), and vouched for by an issuer the account trusts.
+func firstContactRegistration(a firstContactArrival, fresh *domain.ExternalIssuer, externalID string, labels, metadata json.RawMessage) RegisterIdentityRequest {
+	req := RegisterIdentityRequest{
+		AccountID:    a.row.AccountID,
+		ProjectID:    fresh.FirstContactProjectID,
+		ExternalID:   externalID,
+		Name:         firstContactName(a.subjectKey),
+		IdentityType: domain.IdentityTypeAgent,
+		TrustLevel:   domain.TrustLevelUnverified,
+		Origin:       domain.OriginFirstContact,
+		OwnerUserID:  fresh.FirstContactOwnerUserID,
+		Labels:       labels,
+		Metadata:     metadata,
+		CreatedBy:    FirstContactActor,
+		firstContact: true,
+	}
+	if fresh.FirstContact == domain.FirstContactAdopt {
+		req.adopted = true
+		req.TrustLevel = domain.TrustLevelVerifiedThirdParty
+		req.CredentialPolicyID = fresh.FirstContactCredentialPolicyID
+	}
+	return req
+}
+
 // adoptLocked applies an adopt row's standing mapping to the agent the
 // subject key already names through a disabled binding, in arrive's
 // transaction: the identity goes discovered → active, owned by the mapped
-// user, verified_third_party, with the project's default credential policy
-// if it has none, and its binding is enabled. Through the identity service's
-// lifecycle transition, so its owner rule and audit row apply.
+// user, verified_third_party, with the row's credential policy when it
+// names one (standingAdoptionUpdate), and its binding is enabled. Through
+// the identity service's lifecycle transition, so its owner rule and audit
+// row apply.
 //
 // The identity's row is locked before the binding's, the order in which a
 // purge's cascade takes them, and every guard is checked on the locked rows:
@@ -455,25 +490,19 @@ func (r *FirstContactRegistrar) adoptLocked(ctx context.Context, a firstContactA
 		res.outcome = firstContactRateLimited
 		return res, nil
 	}
+	// Last before the write, so every other guard keeps its own outcome.
+	if declined, err := r.policyDeclines(ctx, fresh); err != nil {
+		return firstContactResult{}, err
+	} else if declined.outcome != "" {
+		res.outcome, res.policy = declined.outcome, declined.policy
+		return res, nil
+	}
 
 	labels, metadata, err := standingAdoptionMarkers(identity, a, fresh)
 	if err != nil {
 		return firstContactResult{}, err
 	}
-	active := domain.IdentityStatusActive
-	update := UpdateIdentityRequest{
-		Status:      &active,
-		OwnerUserID: fresh.FirstContactOwnerUserID,
-		TrustLevel:  domain.TrustLevelVerifiedThirdParty,
-		Labels:      labels,
-		Metadata:    metadata,
-	}
-	if identity.CredentialPolicyID == "" {
-		// No policy of its own: the project's default, as a registered agent
-		// gets.
-		projectDefault := ""
-		update.CredentialPolicyID = &projectDefault
-	}
+	update := standingAdoptionUpdate(identity, fresh, labels, metadata)
 	adopted, err := r.identities.UpdateIdentity(ctx, identity.ID, identity.AccountID, identity.ProjectID, update)
 	if err != nil {
 		return firstContactResult{}, err
@@ -490,6 +519,84 @@ func (r *FirstContactRegistrar) adoptLocked(ctx context.Context, a firstContactA
 	}
 	res.outcome, res.identity = firstContactAdopted, adopted
 	return res, nil
+}
+
+// standingAdoptionUpdate is the change a standing adoption under fresh, the
+// row as read under the lock, makes to identity: discovered → active, owned
+// by the mapped user, verified_third_party, carrying labels and metadata.
+// The row's credential policy, when it names one, becomes the identity's own,
+// replacing what it had (an inventoried agent carries its project's default
+// from birth): the mapping is the adoption decision. With none, the identity
+// keeps its own policy, or takes the project's default when it has none, as
+// a registered agent does.
+func standingAdoptionUpdate(identity *domain.Identity, fresh *domain.ExternalIssuer, labels, metadata json.RawMessage) UpdateIdentityRequest {
+	active := domain.IdentityStatusActive
+	update := UpdateIdentityRequest{
+		Status:      &active,
+		OwnerUserID: fresh.FirstContactOwnerUserID,
+		TrustLevel:  domain.TrustLevelVerifiedThirdParty,
+		Labels:      labels,
+		Metadata:    metadata,
+	}
+	switch policy := fresh.FirstContactCredentialPolicyID; {
+	case policy != "":
+		update.CredentialPolicyID = &policy
+	case identity.CredentialPolicyID == "":
+		projectDefault := ""
+		update.CredentialPolicyID = &projectDefault
+	}
+	return update
+}
+
+// policyDeclines says whether row's first-contact credential policy keeps
+// first contact from registering or adopting anything: a declined result
+// (outcome firstContactPolicyUnusable) when the row names a policy that is
+// missing from the row's account and first_contact_project_id or cannot be
+// assigned (firstContactPolicyProblem), the zero result when it names none or
+// one that can. Read from the database each time, so the check made under
+// the lock sees the policy as it is then. An error only when the policy
+// could not be read.
+func (r *FirstContactRegistrar) policyDeclines(ctx context.Context, row *domain.ExternalIssuer) (firstContactResult, error) {
+	id := row.FirstContactCredentialPolicyID
+	if id == "" {
+		return firstContactResult{}, nil
+	}
+	declined := firstContactResult{outcome: firstContactPolicyUnusable, policy: id}
+	if !validUUID(id) {
+		return declined, nil
+	}
+	if r.policies == nil {
+		return firstContactResult{}, errors.New("first contact: no credential policy store to read the row's policy from")
+	}
+	policy, err := r.policies.GetByID(ctx, id, row.AccountID, row.FirstContactProjectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return declined, nil
+	}
+	if err != nil {
+		return firstContactResult{}, err
+	}
+	if firstContactPolicyProblem(policy) != "" {
+		return declined, nil
+	}
+	return firstContactResult{}, nil
+}
+
+// firstContactPolicyProblem says why policy cannot be the credential policy an
+// adopt row assigns to the agents it adopts, or "" when it can. It must be
+// active and unexpired, as every policy that governs a mint must be. And it
+// must not list ciba:approve: that would make every agent the row adopts an
+// approval channel, which only a person activates, and first contact is no
+// trusted approval-channel write, so registering under it would fail anyway.
+func firstContactPolicyProblem(policy *domain.CredentialPolicy) string {
+	switch {
+	case !policy.IsActive:
+		return "is inactive"
+	case policy.IsExpired():
+		return "has expired"
+	case slices.Contains(policy.AllowedScopes, domain.ScopeCIBAApprove):
+		return "lists ciba:approve, which would make every agent the row adopts an approval channel, and only a person activates one"
+	}
+	return ""
 }
 
 // standingAdoptionBinding returns the one binding a standing adoption may act
@@ -529,9 +636,9 @@ func standingAdoptionRefusal(row *domain.ExternalIssuer, binding *domain.IssuerB
 
 // standingAdoptionCandidate is what a standing adoption would do for the
 // subject's bindings under an adopt row, read without locks: the identity it
-// would activate, or why it would not. The ID-JAG grant reads it before it
-// resolves the person and spends the jti; arrive decides again under the
-// lock.
+// would activate, or why it would not, the row's credential policy included.
+// The ID-JAG grant reads it before it resolves the person and spends the
+// jti; arrive decides again under the lock.
 func (r *FirstContactRegistrar) standingAdoptionCandidate(ctx context.Context, row *domain.ExternalIssuer,
 	existing []*domain.IssuerBinding,
 ) (string, firstContactOutcome, error) {
@@ -556,7 +663,11 @@ func (r *FirstContactRegistrar) standingAdoptionCandidate(ctx context.Context, r
 	if channel {
 		return identity.ID, firstContactApprovalChannel, nil
 	}
-	return identity.ID, "", nil
+	declined, err := r.policyDeclines(ctx, row)
+	if err != nil {
+		return "", "", err
+	}
+	return identity.ID, declined.outcome, nil
 }
 
 // firstContactExternalID is the external_id of the identity first contact
@@ -623,25 +734,28 @@ type firstContactRecord struct {
 
 // standingAdoptionRecord is the metadata, under first_contact_adoption, of an
 // identity an issuer row's standing mapping activated: the row, the subject
-// and grant it was adopted on, and who last set the row's mapping, the person
-// accountable for the adoption.
+// and grant it was adopted on, the credential policy the mapping assigned it
+// (absent when the row names none), and who last set the row's mapping, the
+// person accountable for the adoption.
 type standingAdoptionRecord struct {
-	Issuer           string     `json:"issuer"`
-	IssuerID         string     `json:"issuer_id"`
-	SubjectKey       string     `json:"subject_key"`
-	GrantType        string     `json:"grant_type"`
-	MappingUpdatedBy string     `json:"mapping_updated_by"`
-	MappingUpdatedAt *time.Time `json:"mapping_updated_at,omitempty"`
+	Issuer             string     `json:"issuer"`
+	IssuerID           string     `json:"issuer_id"`
+	SubjectKey         string     `json:"subject_key"`
+	GrantType          string     `json:"grant_type"`
+	CredentialPolicyID string     `json:"credential_policy_id,omitempty"`
+	MappingUpdatedBy   string     `json:"mapping_updated_by"`
+	MappingUpdatedAt   *time.Time `json:"mapping_updated_at,omitempty"`
 }
 
 func newStandingAdoptionRecord(a firstContactArrival, fresh *domain.ExternalIssuer) standingAdoptionRecord {
 	return standingAdoptionRecord{
-		Issuer:           fresh.Issuer,
-		IssuerID:         fresh.ID,
-		SubjectKey:       a.subjectKey,
-		GrantType:        a.grant,
-		MappingUpdatedBy: fresh.FirstContactUpdatedBy,
-		MappingUpdatedAt: fresh.FirstContactUpdatedAt,
+		Issuer:             fresh.Issuer,
+		IssuerID:           fresh.ID,
+		SubjectKey:         a.subjectKey,
+		GrantType:          a.grant,
+		CredentialPolicyID: fresh.FirstContactCredentialPolicyID,
+		MappingUpdatedBy:   fresh.FirstContactUpdatedBy,
+		MappingUpdatedAt:   fresh.FirstContactUpdatedAt,
 	}
 }
 
@@ -788,7 +902,7 @@ func recordFirstContact(ctx context.Context, a firstContactArrival, mode domain.
 	var ev *zerolog.Event
 	switch res.outcome {
 	case firstContactRateLimited, firstContactAccountCap, firstContactExternalIDTaken, firstContactSubjectTooLong,
-		firstContactAmbiguousBinding, firstContactOtherProject, firstContactApprovalChannel:
+		firstContactAmbiguousBinding, firstContactOtherProject, firstContactApprovalChannel, firstContactPolicyUnusable:
 		ev = log.Warn()
 	default:
 		ev = log.Info()
@@ -804,9 +918,19 @@ func recordFirstContact(ctx context.Context, a firstContactArrival, mode domain.
 	case res.identity != nil:
 		ev = ev.Str("identity_id", res.identity.ID).
 			Str("project_id", res.identity.ProjectID).
-			Str("status", string(res.identity.Status))
+			Str("status", string(res.identity.Status)).
+			Str("credential_policy_id", res.identity.CredentialPolicyID)
 	case res.candidate != "":
 		ev = ev.Str("identity_id", res.candidate)
+	}
+	if res.outcome == firstContactPolicyUnusable {
+		// The policy the decision read: under the lock when it got that far,
+		// else the row as the request read it.
+		policy := res.policy
+		if policy == "" {
+			policy = a.row.FirstContactCredentialPolicyID
+		}
+		ev = ev.Str("credential_policy_id", policy)
 	}
 	ev.Msg("federation_first_contact")
 

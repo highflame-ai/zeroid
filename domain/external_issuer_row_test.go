@@ -456,3 +456,47 @@ func TestExternalIssuerValidate_FirstContact(t *testing.T) {
 		})
 	}
 }
+
+// first_contact_credential_policy_id is the credential policy an adopt row
+// assigns to the agents it adopts. Only an adopt row may name one; whether it
+// exists in the row's project is the caller's check, against the database.
+func TestExternalIssuerValidate_FirstContactPolicy(t *testing.T) {
+	const policy = "11111111-2222-4333-8444-555555555555"
+	cases := []struct {
+		name           string
+		mode           FirstContactMode
+		project, owner string
+		policy         string
+		code           string
+	}{
+		{"adopt with a policy", FirstContactAdopt, "proj-1", "user-1", policy, ""},
+		{"adopt without one", FirstContactAdopt, "proj-1", "user-1", "", ""},
+		{"surrounding space is trimmed", FirstContactAdopt, "proj-1", "user-1", "  " + policy + " ", ""},
+		{"discover with a policy", FirstContactDiscover, "proj-1", "", policy, "first_contact_policy_invalid"},
+		{"off with a policy", FirstContactOff, "proj-1", "user-1", policy, "first_contact_policy_invalid"},
+		{"off by default with a policy", "", "", "", policy, "first_contact_policy_invalid"},
+		{"an over-long policy", FirstContactAdopt, "proj-1", "user-1", strings.Repeat("p", 256), "first_contact_policy_invalid"},
+		{"adopt without an owner names the mapping first", FirstContactAdopt, "proj-1", "", policy, "first_contact_mapping_required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := validRow()
+			e.FirstContact, e.FirstContactProjectID, e.FirstContactOwnerUserID = tc.mode, tc.project, tc.owner
+			e.FirstContactCredentialPolicyID = tc.policy
+			e.Normalize()
+			err := e.Validate(IssuerValidation{})
+			if tc.code == "" {
+				if err != nil {
+					t.Fatalf("want valid, got %v", err)
+				}
+				if e.FirstContactCredentialPolicyID != strings.TrimSpace(tc.policy) {
+					t.Fatalf("policy = %q, want it trimmed", e.FirstContactCredentialPolicyID)
+				}
+				return
+			}
+			if got := issuerCode(err); got != tc.code {
+				t.Fatalf("code = %q (%v), want %q", got, err, tc.code)
+			}
+		})
+	}
+}

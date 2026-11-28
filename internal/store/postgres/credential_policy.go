@@ -17,9 +17,16 @@ import (
 // indistinguishable from a truly-absent policy by design).
 var ErrCredentialPolicyNotFound = errors.New("credential policy not found")
 
-// ErrCredentialPolicyInUse is returned by Delete when one or more service keys
-// still reference the policy. The policy is left intact.
-var ErrCredentialPolicyInUse = errors.New("credential policy is still referenced by service keys")
+// ErrCredentialPolicyInUse is returned by Delete when one or more service keys,
+// or the first-contact mapping of a live issuer row, still reference the
+// policy. The policy is left intact.
+var ErrCredentialPolicyInUse = errors.New("credential policy is still referenced")
+
+// ErrCredentialPolicyFirstContactReference is returned by Delete, wrapped with
+// ErrCredentialPolicyInUse, when the reference is an adopt issuer row's
+// first_contact_credential_policy_id: the policy the row assigns to every
+// agent it adopts.
+var ErrCredentialPolicyFirstContactReference = errors.New("credential policy is the first-contact credential policy of an issuer row")
 
 // CredentialPolicyRepository handles database operations for credential policies.
 //
@@ -57,6 +64,28 @@ func (r *CredentialPolicyRepository) GetByID(ctx context.Context, id, accountID,
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get credential policy: %w", err)
+	}
+	return policy, nil
+}
+
+// GetByIDForShare is GetByID holding a share lock on the policy until the
+// transaction ends. A writer that is about to record a reference to the
+// policy reads it this way, so a concurrent Delete either waits for that
+// writer and then sees the reference, or commits first and is seen here
+// (sql.ErrNoRows, wrapped).
+func (r *CredentialPolicyRepository) GetByIDForShare(ctx context.Context, id, accountID, projectID string) (*domain.CredentialPolicy, error) {
+	if !hasTx(ctx) {
+		return nil, errors.New("GetByIDForShare requires a transaction")
+	}
+	policy := &domain.CredentialPolicy{}
+	err := dbOrTx(ctx, r.db).NewSelect().Model(policy).
+		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		For("SHARE").
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get credential policy: %w", err)
@@ -144,17 +173,49 @@ func (r *CredentialPolicyRepository) GetDefaultByTenant(ctx context.Context, acc
 }
 
 // Delete removes a credential policy, scoped to tenant. It refuses to delete a
-// policy that is still referenced by any service key (returns
-// ErrCredentialPolicyInUse) and reports ErrCredentialPolicyNotFound when no
-// policy matches the id within the tenant.
+// policy that is still referenced (returns ErrCredentialPolicyInUse): by any
+// service key, or as the first_contact_credential_policy_id of a live adopt
+// issuer row in the policy's tenant, the row's account and
+// first_contact_project_id (wrapped with
+// ErrCredentialPolicyFirstContactReference too). It reports
+// ErrCredentialPolicyNotFound when no policy matches the id within the tenant.
+//
+// The policy is locked before the references are counted, in a transaction
+// of its own when the caller has none. An issuer row's first-contact mapping
+// is no foreign key, so its writer reads the policy with GetByIDForShare
+// before recording it: either that writer waits for this delete and then
+// finds no policy, or this delete waits for the writer and then counts its
+// reference.
 func (r *CredentialPolicyRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
+	if !hasTx(ctx) {
+		return r.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+			return r.Delete(WithTx(ctx, tx), id, accountID, projectID)
+		})
+	}
+	db := dbOrTx(ctx, r.db)
+	var lockedID string
+	err := db.NewSelect().
+		Model((*domain.CredentialPolicy)(nil)).
+		Column("id").
+		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		For("UPDATE").
+		Scan(ctx, &lockedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrCredentialPolicyNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("failed to lock credential policy: %w", err)
+	}
+
 	// Check whether any service key still references this policy. Use the
 	// strongly-typed Bun model (domain.APIKey is bun:"table:service_keys",
 	// migration 006) rather than a string literal: the original bug was a
 	// hardcoded table-name typo, and Model() makes that class of error
 	// impossible. credential_policy_id plus the account_id/project_id tenant
 	// scope all live on service_keys.
-	count, err := dbOrTx(ctx, r.db).NewSelect().
+	count, err := db.NewSelect().
 		Model((*domain.APIKey)(nil)).
 		Where("credential_policy_id = ?", id).
 		Where("account_id = ?", accountID).
@@ -167,7 +228,26 @@ func (r *CredentialPolicyRepository) Delete(ctx context.Context, id, accountID, 
 		return fmt.Errorf("%w: referenced by %d service key(s)", ErrCredentialPolicyInUse, count)
 	}
 
-	res, err := dbOrTx(ctx, r.db).NewDelete().
+	// An adopt issuer row assigns its first-contact policy to every agent it
+	// adopts from now on, so the policy must outlive the mapping. Disabled
+	// rows count: enabling one needs no new policy check.
+	rows, err := db.NewSelect().
+		Model((*domain.ExternalIssuer)(nil)).
+		Where("first_contact = ?", domain.FirstContactAdopt).
+		Where("first_contact_credential_policy_id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("first_contact_project_id = ?", projectID).
+		Where("deleted_at IS NULL").
+		Count(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check policy references: %w", err)
+	}
+	if rows > 0 {
+		return fmt.Errorf("%w: %w: named by the first-contact mapping of %d issuer row(s)",
+			ErrCredentialPolicyInUse, ErrCredentialPolicyFirstContactReference, rows)
+	}
+
+	res, err := db.NewDelete().
 		Model((*domain.CredentialPolicy)(nil)).
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).

@@ -53,7 +53,8 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 | `first_contact` | `off` (default), `discover` or `adopt`: what a credential that verified under this row does when no enabled binding maps its subject key. See [First contact](#first-contact). Stored on a disabled row, but acts only once the row is enabled. |
 | `first_contact_project_id` | The project first contact registers agents into, and the only project whose agents an `adopt` row adopts. Required for `discover` and `adopt`. ZeroID checks its shape (a WIMSE URI path segment, at most 255 bytes), not that the project exists: the caller does. |
 | `first_contact_owner_user_id` | The owner of the agents first contact adopts. Required for `adopt`, optional for `discover`. At most 255 bytes. |
-| `first_contact_updated_by`, `first_contact_updated_at` | Read-only: who last changed any of the three fields above, and when (on create or PATCH; empty until one is set). Every identity an `adopt` row adopts records them. |
+| `first_contact_credential_policy_id` | `adopt` only, optional: the credential policy every agent the row adopts is assigned as its own, whether first contact registers it or a [standing adoption](#standing-adoption) activates it. Empty (the default, and always returned) assigns none, so the project's default credential policy governs the agents. It must name an active, unexpired credential policy in the row's account and `first_contact_project_id` that does not list `ciba:approve` (otherwise `first_contact_policy_invalid`). Setting `first_contact` to `off` or `discover` clears it. While a live row names a policy, that policy cannot be deleted (409). |
+| `first_contact_updated_by`, `first_contact_updated_at` | Read-only: who last changed any of the four fields above, and when (on create or PATCH; empty until one is set). Every identity an `adopt` row adopts records them. |
 
 ### Who may hold an issuer
 
@@ -256,9 +257,13 @@ An issuer row's `first_contact` says what a credential does when it has verified
 |---|---|---|
 | `off` (default) | The refusal above: `invalid_grant`, "no enabled binding", and the unmatched-agent event. | The refusal above: "agent identity is discovered; ..." (the not-adopted event) for an agent that is not `active`, else "no enabled binding". |
 | `discover` | ZeroID registers a `discovered` identity in `first_contact_project_id`, with a **disabled** binding on the subject key, then refuses the request as it refuses any unadopted agent: `invalid_grant`, "agent identity is discovered; ...". The unmatched-agent event names the new identity (`reason` `first_contact_registered`, `identity_id`), and the not-adopted event follows. Adoption later enables the binding as for any discovered agent (its `explicitly_disabled` is false). | As `off`: the agent is in the adoption queue already. |
-| `adopt` | ZeroID registers an **active** identity in `first_contact_project_id`, owned by `first_contact_owner_user_id`, with trust level `verified_third_party` and an **enabled** binding, and the request goes on to mint for it. | ZeroID adopts the agent's existing identity under the same mapping, enables its binding, and the request goes on to mint: [standing adoption](#standing-adoption), with the guards it lists. |
+| `adopt` | ZeroID registers an **active** identity in `first_contact_project_id`, owned by `first_contact_owner_user_id`, governed by `first_contact_credential_policy_id` when the row names one, with trust level `verified_third_party` and an **enabled** binding, and the request goes on to mint for it. | ZeroID adopts the agent's existing identity under the same mapping, enables its binding, and the request goes on to mint: [standing adoption](#standing-adoption), with the guards it lists. |
 
 Setting `adopt` on a row is the adoption decision for every agent the row's issuer vouches for, whether ZeroID first hears of the agent from its call or from an inventory sync, so set it only where the account means that.
+
+**The credential policy.** An `adopt` row's `first_contact_credential_policy_id` is part of that decision: every agent the row adopts is assigned that policy as its own `credential_policy_id`, the reference `PATCH /identities/{id}` sets, so it governs the agent's mints in place of the project's default. Without one the project's default governs, and a default that sets no `allowed_scopes` refuses the first call of every workload agent the row adopts (`invalid_scope`, "the agent has no scope limit"; see the scope rule above): name a policy that allows the grant and the scopes the agents need. The policy is assigned when an agent is adopted. Changing it later changes nothing for agents adopted before, and an agent's own policy can still be changed afterwards like any identity's.
+If the policy is missing, inactive, expired, or lists `ciba:approve` when an agent arrives, first contact fails closed: nothing is registered or adopted, and the request is refused exactly as with `first_contact` `off`, logged with outcome `policy_unusable` and the policy's id. On the ID-JAG this is decided before the person is resolved and the `jti` is spent, so the ID-JAG stays redeemable once the policy is usable again. A row write checks the policy (it must exist and be usable in the row's account and `first_contact_project_id`, 400 `first_contact_policy_invalid` otherwise) only when it names the policy or moves the row to another project, so a row whose policy became unusable later can still be renamed or disabled.
+`DELETE /credential-policies/{id}` refuses (409) a policy that a live `adopt` row in its tenant (the row's account and `first_contact_project_id`) names, disabled rows included, with a detail naming the first-contact mapping, as it refuses one a service key holds: clear `first_contact_credential_policy_id` on the row, or move it off `adopt`, first.
 
 **Triggers.** Two, each only once the credential has verified in full against an enabled row of the right kind:
 
@@ -282,7 +287,7 @@ The ID-token exchange (P1c) never registers or adopts an agent: its presenting c
 | `status`, `trust_level`, `owner_user_id` | `discover`: `discovered`, `unverified`, the mapped owner if set. `adopt`: `active` (with `adopted_at`), `verified_third_party`, the mapped owner. |
 | `account_id`, `project_id` | The row's account, `first_contact_project_id`. |
 | `identity_type`, `sub_type` | `agent`, `tool_agent`. |
-| `credential_policy_id` | The project's default credential policy. For `adopt` to mint, that policy must allow the grant (`client_credentials` or `jwt_bearer`) and, on the workload path, set `allowed_scopes` (see the scope rule above). |
+| `credential_policy_id` | Under `adopt`, the row's `first_contact_credential_policy_id` when it names one; otherwise, and under `discover`, the project's default credential policy. For `adopt` to mint, that policy must allow the grant (`client_credentials` or `jwt_bearer`) and, on the workload path, set `allowed_scopes` (see the scope rule above). |
 | `name` | The subject key (cut to 255 bytes). |
 | `external_id` | `first_contact.` followed by the subject key when that is a valid WIMSE URI path segment (letters, digits, `.`, `-`, `_`) of at most 128 bytes, as an opaque IdP client id is. Otherwise (an AWS role ARN, a Kubernetes service account, a SPIFFE ID, a URL) `first_contact.` followed by its last 160 bytes with every other byte replaced by `_`, then `-` and 20 hex digits of SHA-256(issuer row id, subject key). The `first_contact.` prefix is reserved: no other caller can create an identity whose `external_id` starts with it, and a discovered-identity ingest that sends one is refused with 400. So an inventory record whose own id is the agent's subject key (an IdP app the agent uses as its OAuth client, say) never lands on the agent: it is a separate identity, and an ingest reaches the agent only through `metadata.issuer_binding` (below). The subject key itself is always in the binding and in the metadata below. If the project already has an identity with that `external_id`, nothing is registered: the request gets the plain refusal, logged with outcome `external_id_taken`. |
 | `labels` | `{"discovered_via": "first_contact"}`, so `GET /identities?label=discovered_via:first_contact` lists them (add `status=discovered` for the unadopted ones: a list leaves those out unless asked). Under `adopt`, also `"adopted_via": "first_contact"`, as on every identity a standing mapping activated. |
@@ -302,11 +307,12 @@ Under an `adopt` row, that agent's first verified call adopts it under the row's
 4. The identity is in the row's account **and in `first_contact_project_id`**. An identity in another project is refused as before, and logged (outcome `other_project`): the row's mapping names one project, and adopting into another is not what anyone set. This is the conservative choice; a row that should adopt across its account's projects is not built.
 5. The identity is not an **approval channel** (sub-type `approval_channel`, or `ciba:approve` on the identity or its credential policy). Only a person activates an approval channel.
 6. The row is enabled, its `first_contact` is `adopt`, and its mapping is complete.
+7. The row's `first_contact_credential_policy_id`, when it names one, can be assigned: it exists in the row's account and `first_contact_project_id`, is active and unexpired, and does not list `ciba:approve` (outcome `policy_unusable` otherwise).
 
 Then, in one transaction under the same per-account lock as a registration, with the row, the bindings, the identity and the binding re-read (the last two locked):
 
-- the identity takes the lifecycle transition `discovered → active` (the direct activation of [identity-lifecycle.md](identity-lifecycle.md)), owned by `first_contact_owner_user_id`, with trust level `verified_third_party` and `adopted_at`. It keeps its credential policy, or takes the project's default when it has none, as a registered agent does. Its `origin`, `external_id`, name and the rest are unchanged;
-- it gets the label `"adopted_via": "first_contact"` and `metadata.first_contact_adoption`: `issuer`, `issuer_id`, `subject_key`, `grant_type`, and `mapping_updated_by` and `mapping_updated_at`, the row's `first_contact_updated_by` and `first_contact_updated_at`, so the record names the person whose mapping adopted it;
+- the identity takes the lifecycle transition `discovered → active` (the direct activation of [identity-lifecycle.md](identity-lifecycle.md)), owned by `first_contact_owner_user_id`, with trust level `verified_third_party` and `adopted_at`. When the row names a `first_contact_credential_policy_id`, that policy becomes the identity's own `credential_policy_id`, replacing the one it had (an inventoried agent carries its project's default from birth); otherwise it keeps its credential policy, or takes the project's default when it has none, as a registered agent does. Its `origin`, `external_id`, name and the rest are unchanged;
+- it gets the label `"adopted_via": "first_contact"` and `metadata.first_contact_adoption`: `issuer`, `issuer_id`, `subject_key`, `grant_type`, `credential_policy_id` (the row's `first_contact_credential_policy_id`, absent when it names none), and `mapping_updated_by` and `mapping_updated_at`, the row's `first_contact_updated_by` and `first_contact_updated_at`, so the record names the person whose mapping adopted it;
 - the binding the credential arrived through is enabled, with `updated_by` `system:first_contact`. The identity's bindings under other rows are left as they are.
 
 The request then mints for the adopted agent. If any guard fails, nothing is written and the request is refused as without first contact. An agent first contact registered under a `discover` row is adopted the same way once its row is switched to `adopt`; its `metadata.first_contact` keeps the mode it first arrived under.
@@ -324,7 +330,7 @@ Past either, nothing is written, and the credential is refused as without first 
 
 **Concurrency.** Registration and standing adoption run in one transaction under a per-account lock, and re-read the row (still enabled, still on, same project) and the subject's bindings under it. Concurrent first contacts for one subject therefore register one identity and one binding, or adopt the agent once; the later ones read the first one's binding and are answered as for any bound agent.
 
-**Events.** Every attempt is logged as `federation_first_contact` (account, issuer row, subject key, grant, mode, `outcome`, and the identity registered, adopted or considered) and counted in `zeroid.federation.first_contact{account_id, grant_type, mode, outcome}`. Outcomes: `registered`, `adopted`, `already_bound`, `row_changed` (disabled, deleted, switched off or re-mapped since the request read it), `rate_limited`, `account_cap`, `external_id_taken`, `subject_too_long`, `registered_client`, and the standing adoption's guards: `explicitly_disabled`, `ambiguous_binding`, `not_discovered`, `other_project`, `approval_channel`. A `discover` row logs nothing for an agent that is bound already.
+**Events.** Every attempt is logged as `federation_first_contact` (account, issuer row, subject key, grant, mode, `outcome`, and the identity registered, adopted or considered; for one registered or adopted, also its `credential_policy_id`) and counted in `zeroid.federation.first_contact{account_id, grant_type, mode, outcome}`. Outcomes: `registered`, `adopted`, `already_bound`, `row_changed` (disabled, deleted, switched off or re-mapped since the request read it), `rate_limited`, `account_cap`, `external_id_taken`, `subject_too_long`, `registered_client`, `policy_unusable` (the row's credential policy is missing or cannot be assigned; logged with its `credential_policy_id`), and the standing adoption's guards: `explicitly_disabled`, `ambiguous_binding`, `not_discovered`, `other_project`, `approval_channel`. A `discover` row logs nothing for an agent that is bound already.
 
 **Merging with an inventory sync.** An agent first contact registered may later be found by a discovery connector. A `POST /identities/discovered` (or the batch) whose `external_id` matches no identity, and whose `metadata.issuer_binding` names the same subject, updates the first-contact identity instead of creating a second one:
 
@@ -413,6 +419,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 400 | `invalid_identity_id`, `invalid_kind`, `invalid_audiences` (a workload row with none), `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_trust_email` (on a workload row), `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
 | 400 | `first_contact_mapping_required` | `first_contact` is `discover` without `first_contact_project_id`, or `adopt` without `first_contact_project_id` and `first_contact_owner_user_id`; on PATCH, checked against the stored fields the patch leaves unchanged |
 | 400 | `invalid_first_contact` | `first_contact_project_id` is not a WIMSE URI path segment, or either mapping field is over 255 bytes. A `first_contact` other than `off`, `discover` or `adopt` is refused by the body schema first (huma's 422) |
+| 400 | `first_contact_policy_invalid` | `first_contact_credential_policy_id` is set while the row's resulting `first_contact` is not `adopt` (on PATCH, including a patch that sets `off` or `discover` and names a policy), is over 255 bytes, names no credential policy in the row's account and `first_contact_project_id` (also when a PATCH moves the row to a project the kept policy does not belong to), or names one that is inactive, expired or lists `ciba:approve`. Checked on create, and on a PATCH that names the policy or changes the project |
 | 400 | `claim_mapping_reserved` | `claim_mapping` names `role` or `privilege_scope`, on create or on any PATCH that is not only a rename or a disable (a row stored with one must drop it to be edited) |
 | 401 | `unauthorized` | No tenant context |
 | 404 | `not_found` | No such row or binding in this account |
@@ -476,7 +483,8 @@ On a `config` server the items are the static entries that admit the account, wi
   "enabled": true,
   "first_contact": "off",
   "first_contact_project_id": "",
-  "first_contact_owner_user_id": ""
+  "first_contact_owner_user_id": "",
+  "first_contact_credential_policy_id": ""
 }
 ```
 
@@ -507,6 +515,7 @@ The response is the issuer:
   "first_contact": "off",
   "first_contact_project_id": "",
   "first_contact_owner_user_id": "",
+  "first_contact_credential_policy_id": "",
   "first_contact_updated_by": "",
   "created_by": "user_abc",
   "updated_by": "user_abc",
@@ -522,9 +531,9 @@ The issuer, without `jwks_check`.
 
 ### `PATCH /external-issuers/{id}` → 200
 
-Any of `display_name`, `audiences`, `algorithms`, `claim_mapping`, `propagate_claims`, `claim_constraints`, `max_token_age_seconds`, `jwks_cache_ttl_seconds`, `trust_email`, `enabled`, `first_contact`, `first_contact_project_id`, `first_contact_owner_user_id`; absent fields are unchanged.
-An empty `first_contact_project_id` or `first_contact_owner_user_id` clears it; switching `first_contact` to `off` keeps the mapping.
-A patch that changes any of the three records its caller in `first_contact_updated_by`, which is read-only.
+Any of `display_name`, `audiences`, `algorithms`, `claim_mapping`, `propagate_claims`, `claim_constraints`, `max_token_age_seconds`, `jwks_cache_ttl_seconds`, `trust_email`, `enabled`, `first_contact`, `first_contact_project_id`, `first_contact_owner_user_id`, `first_contact_credential_policy_id`; absent fields are unchanged.
+An empty `first_contact_project_id`, `first_contact_owner_user_id` or `first_contact_credential_policy_id` clears it. Switching `first_contact` to `off` keeps the project and the owner, and switching it to `off` or `discover` clears `first_contact_credential_policy_id`, which applies to `adopt` only; switching back to `adopt` does not restore it. A row that keeps its policy moves only to a project that policy belongs to: name a policy of the new project in the same patch, or clear it.
+A patch that changes any of the four records its caller in `first_contact_updated_by`, which is read-only.
 `issuer`, `kind`, `source` and `jwks_uri` never change through PATCH (an unknown field is a 422).
 Neither do `claim_mapping.user_id`, `claim_mapping.email` and `claim_mapping.email_verified`: they decide who a token's person is, and remapping one to a claim an IdP user can set (`upn`, `preferred_username`) would let that user take over an existing link (nOAuth).
 A `claim_mapping` patch replaces the whole map, so it must repeat those three unchanged; otherwise it is 422 `claim_mapping_immutable`. Delete and re-create the issuer to change them.
@@ -748,16 +757,16 @@ Clients that an older release left unlinked when their identity was hard-deleted
 
 ## Migration ordering
 
-The tables are migration 056. The first-contact columns and their CHECK constraint are migration 069; `first_contact_updated_by`, `first_contact_updated_at` and the binding index the rate limit reads are migration 070.
+The tables are migration 056. The first-contact columns and their CHECK constraint are migration 069; `first_contact_updated_by`, `first_contact_updated_at` and the binding index the rate limit reads are migration 070; `first_contact_credential_policy_id`, the CHECK that allows it on `adopt` rows only, and its place in the issuer audit documents are migration 075.
 Migration 055 (the refresh-token family, PRs #421 to #423) must be applied before it: golang-migrate never applies a version below the database's current one, so a database that reached 056 first would silently skip 055.
 If this change merges before 055, renumber it at merge.
 
 ## Audit
 
 Every insert, update and delete of a row or binding writes `identity_audit_logs` (`table_name` `external_issuers` or `external_issuer_bindings`, actions `INSERT_EXTERNAL_ISSUER`, `UPDATE_EXTERNAL_ISSUER`, `DELETE_EXTERNAL_ISSUER`, `INSERT_ISSUER_BINDING`, ...), with the actor from `X-User-ID` and the binding's identity as `identity_id`.
-An issuer row's audit documents include `first_contact`, `first_contact_project_id` and `first_contact_owner_user_id` (migration 069), so who set `adopt`, and with which mapping, is kept.
+An issuer row's audit documents include `first_contact`, `first_contact_project_id` and `first_contact_owner_user_id` (migration 069) and `first_contact_credential_policy_id` (migration 075), so who set `adopt`, and with which mapping, is kept.
 The row also carries the last of those changes as `first_contact_updated_by` and `first_contact_updated_at`.
-What first contact writes names `system:first_contact` as the actor: a registration's identity and binding, and a standing adoption's `discovered → active` transition and binding enable. The transition's audit row carries `metadata.first_contact_adoption`, naming the row and who last set its mapping.
+What first contact writes names `system:first_contact` as the actor: a registration's identity and binding, and a standing adoption's `discovered → active` transition and binding enable. The transition's audit row carries `metadata.first_contact_adoption`, naming the row, the credential policy it assigned and who last set its mapping, and the identity's new `credential_policy_id`.
 
 ## Running it locally
 
@@ -770,5 +779,5 @@ What first contact writes names `system:first_contact` as the actor: a registrat
 - The connector "Trust for agent access" toggle (ADR 0042 open question 7) is not built; `source: connector` rows can be written through the API.
 - Proof of issuer control (open question 8): the first account to add a customer-unique issuer holds it. For `person` rows the deployer gates person resolution on an ownership proof (`/discovery` and `/verify-id-token` above); for `workload` rows, including a shared issuer's pinning value, it enables a row only after a challenge token verifies under it (`/verify-workload-token` above). ZeroID does not enforce either itself: a row written enabled through this API mints.
 - Account lifecycle (D4a follow-up a): deleting an account in Admin does not yet remove its rows.
-- First contact maps a row to one project, one owner and the project's default credential policy. A per-row credential policy, labels or tags from the mapping are not built. Nor is first contact on the ID-token exchange, or an inventory sync naming a subject by anything but `metadata.issuer_binding`. A standing adoption adopts only into the row's own project, and enables only the binding the credential arrived through.
+- First contact maps a row to one project, one owner and, optionally, one credential policy. Labels or tags from the mapping are not built, and changing a row's policy does not reach agents it adopted before. Nor is first contact on the ID-token exchange, or an inventory sync naming a subject by anything but `metadata.issuer_binding`. A standing adoption adopts only into the row's own project, and enables only the binding the credential arrived through.
 - JWKS refreshes on an unknown `kid` are rate-limited per key set (one every 10 seconds), and rows that share a `jwks_uri` share the key set. Tokens with made-up `kid`s, presented on the ID-token exchange or on `/verify-id-token`, can hold that slot, so a real key rotation at the IdP is picked up up to 10 seconds late for every account on the key set.

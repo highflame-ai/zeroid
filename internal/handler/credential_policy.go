@@ -243,7 +243,7 @@ func (a *API) deletePolicyOp(ctx context.Context, input *PolicyIDInput) (*struct
 			// Safe to surface: the delete dialog already tells the operator
 			// the policy is still attached to keys. Tenant-scoped query means
 			// no cross-tenant information leaks.
-			return nil, huma.Error409Conflict("credential policy is still in use by one or more service keys")
+			return nil, huma.Error409Conflict(policyInUseDetail(err))
 		}
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error404NotFound("credential policy not found")
@@ -253,4 +253,14 @@ func (a *API) deletePolicyOp(ctx context.Context, input *PolicyIDInput) (*struct
 	}
 
 	return nil, nil
+}
+
+// policyInUseDetail is the 409 detail of a refused policy delete: what still
+// references the policy.
+func policyInUseDetail(err error) string {
+	if errors.Is(err, service.ErrPolicyInUseByFirstContact) {
+		return "credential policy is still in use by the first-contact mapping of one or more trusted issuers " +
+			"(first_contact_credential_policy_id); clear it on those issuers first"
+	}
+	return "credential policy is still in use by one or more service keys"
 }

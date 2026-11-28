@@ -274,7 +274,8 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		req.AccountID, req.ProjectID = row.AccountID, row.FirstContactProjectID
 	case entry.Row != nil:
 		// With first contact on, a registered client's ID-JAG still registers
-		// and adopts nothing, nor does one a standing adoption declined;
+		// and adopts nothing, nor does one a standing adoption declined, nor
+		// one under a row whose credential policy cannot be assigned;
 		// firstContactFor's step only logs why.
 		var declined firstContactFunc
 		if outcome := fc.declined; outcome != "" || !authedClient.SelfAsserted() {
@@ -646,7 +647,9 @@ type idJAGFirstContact struct {
 // (read here without locks; decided again under them). Only a CIMD client,
 // whose registration is the IdP-signed ID-JAG itself: a registered client
 // must be linked to the agent it redeems for, and first contact neither
-// creates nor links clients.
+// creates nor links clients. An adopt row whose credential policy cannot be
+// assigned declines either way, before the person is resolved or the jti
+// spent, so the ID-JAG is refused as without first contact.
 func (s *OAuthService) firstContactIDJAGPending(ctx context.Context, row *domain.ExternalIssuer, agentKey string, client *domain.OAuthClient) (idJAGFirstContact, error) {
 	if s.firstContactFor(row, agentKey, federatedGrantIDJAG, nil, nil) == nil || agentKey == "" || s.issuerBindings == nil {
 		return idJAGFirstContact{}, nil
@@ -657,7 +660,17 @@ func (s *OAuthService) firstContactIDJAGPending(ctx context.Context, row *domain
 	}
 	switch {
 	case len(existing) == 0:
-		return idJAGFirstContact{pending: client.SelfAsserted()}, nil
+		if !client.SelfAsserted() {
+			return idJAGFirstContact{}, nil
+		}
+		declined, err := s.firstContact.policyDeclines(ctx, row)
+		if err != nil {
+			return idJAGFirstContact{}, oauthServerError("failed to read the issuer's first-contact credential policy", err)
+		}
+		if declined.outcome != "" {
+			return idJAGFirstContact{declined: declined.outcome}, nil
+		}
+		return idJAGFirstContact{pending: true}, nil
 	case existing[0].Enabled || row.FirstContact != domain.FirstContactAdopt || !client.SelfAsserted():
 		return idJAGFirstContact{}, nil
 	}
