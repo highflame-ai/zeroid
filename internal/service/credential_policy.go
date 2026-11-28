@@ -41,9 +41,16 @@ func isPolicyScopeViolation(err error) bool {
 var ErrPolicyNameConflict = errors.New("credential policy with this name already exists")
 
 // ErrPolicyInUse is returned by DeletePolicy when the policy is still
-// referenced by one or more service keys. Maps to 409 Conflict at the HTTP
-// boundary — the delete is refused, the policy is left intact.
+// referenced by one or more service keys, or by the first-contact mapping of
+// an issuer row. Maps to 409 Conflict at the HTTP boundary — the delete is
+// refused, the policy is left intact.
 var ErrPolicyInUse = errors.New("credential policy is still in use")
+
+// ErrPolicyInUseByFirstContact is returned by DeletePolicy, wrapped with
+// ErrPolicyInUse, when the reference is an adopt issuer row's
+// first_contact_credential_policy_id in the policy's tenant: the policy the
+// row assigns to every agent it adopts (docs/external-issuers.md).
+var ErrPolicyInUseByFirstContact = errors.New("credential policy is the first-contact credential policy of a trusted issuer")
 
 // ErrInvalidPolicyField marks caller-fixable input errors emitted by
 // UpdatePolicy when the tri-state expires_at PATCH string fails to parse
@@ -396,19 +403,29 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 	return policy, nil
 }
 
-// DeletePolicy deletes a credential policy if no service keys reference it.
+// DeletePolicy deletes a credential policy if nothing references it: no
+// service key, and no adopt issuer row's first-contact mapping.
 // It translates the store-layer sentinels into the service-layer sentinels the
 // handler maps to HTTP status codes:
-//   - ErrPolicyInUse     → still referenced by at least one service key (409)
+//   - ErrPolicyInUse     → still referenced by at least one service key, or
+//     (also wrapping ErrPolicyInUseByFirstContact) by the first-contact
+//     mapping of an issuer row (409)
 //   - ErrPolicyNotFound  → no policy with this id in the tenant (404)
 func (s *CredentialPolicyService) DeletePolicy(ctx context.Context, id, accountID, projectID string) error {
 	defer memoForget(ctx)
 	err := s.repo.Audited(ctx, middleware.GetCallerName(ctx), func(ctx context.Context) error {
 		return s.repo.Delete(ctx, id, accountID, projectID)
 	})
+	return policyDeleteError(err)
+}
+
+// policyDeleteError maps the store's delete result onto the service sentinels.
+func policyDeleteError(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, postgres.ErrCredentialPolicyFirstContactReference):
+		return fmt.Errorf("%w: %w: %w", ErrPolicyInUse, ErrPolicyInUseByFirstContact, err)
 	case errors.Is(err, postgres.ErrCredentialPolicyInUse):
 		return fmt.Errorf("%w: %w", ErrPolicyInUse, err)
 	case errors.Is(err, postgres.ErrCredentialPolicyNotFound):

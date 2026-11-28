@@ -623,6 +623,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 			SelfIssuer:            cfg.Token.Issuer,
 			HTTPClient:            options.externalIssuerHTTPClient,
 			Registry:              externalIssuerRegistry, // VerifyIDToken needs db mode; EntryForRow refuses a static registry
+			CredentialPolicies:    credentialPolicyRepo,   // an adopt row's first-contact credential policy
 		}))
 	// An allow-list is the deployer vetting which hosts may publish a metadata
 	// document, which is what lets a CIMD client be redirected to at all. The

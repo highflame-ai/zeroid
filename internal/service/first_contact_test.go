@@ -338,6 +338,7 @@ func TestFirstContactOutcomeRereads(t *testing.T) {
 		firstContactRowChanged, firstContactRateLimited, firstContactAccountCap, firstContactExternalIDTaken,
 		firstContactSubjectTooLong, firstContactRegisteredClient, firstContactExplicitlyDisabled,
 		firstContactAmbiguousBinding, firstContactNotDiscovered, firstContactOtherProject, firstContactApprovalChannel,
+		firstContactPolicyUnusable,
 	} {
 		assert.False(t, o.rereads(), o)
 	}
@@ -482,6 +483,9 @@ func TestStampFirstContact(t *testing.T) {
 		"the mode":    func(r *domain.ExternalIssuer) { r.FirstContact = domain.FirstContactDiscover },
 		"the project": func(r *domain.ExternalIssuer) { r.FirstContactProjectID = "q" },
 		"the owner":   func(r *domain.ExternalIssuer) { r.FirstContactOwnerUserID = "o2" },
+		"the credential policy": func(r *domain.ExternalIssuer) {
+			r.FirstContactCredentialPolicyID = "11111111-2222-4333-8444-555555555555"
+		},
 	} {
 		t.Run("an update of "+name+" names its author", func(t *testing.T) {
 			r := stored

@@ -1003,6 +1003,7 @@ only when `Server.EnsureClient` is called with a marked context.
 | POST | `/credential-policies` | Create credential policy |
 | GET | `/credential-policies/{id}` | Get credential policy |
 | PATCH | `/credential-policies/{id}` | Update credential policy |
+| DELETE | `/credential-policies/{id}` | Delete credential policy. 409 while a service key holds it, or while a trusted issuer's first-contact mapping names it (`first_contact_credential_policy_id`, see [docs/external-issuers.md](docs/external-issuers.md#first-contact)) |
 | POST | `/credentials/{id}/revoke` | Revoke credential |
 | POST | `/attestation/submit` | Submit attestation proof |
 | POST | `/attestation/verify` | Verify proof + promote trust + issue credential |

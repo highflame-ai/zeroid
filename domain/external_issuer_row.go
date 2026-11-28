@@ -52,7 +52,8 @@ const (
 	// A subject that already has a binding is left as it is.
 	FirstContactDiscover FirstContactMode = "discover"
 	// FirstContactAdopt registers an active identity under the row's mapping
-	// (project and owner), with an enabled binding, and serves the request.
+	// (project, owner and, when the row names one, credential policy), with
+	// an enabled binding, and serves the request.
 	// An agent that already has a discovered identity in the mapped project,
 	// bound under the row but not enabled, is adopted under the same mapping
 	// instead (standing adoption). Setting it on a row is the adoption
@@ -103,21 +104,23 @@ type ExternalIssuer struct {
 	SourceRef           string       `bun:"source_ref,notnull"                        json:"source_ref"`
 	Enabled             bool         `bun:"enabled,notnull"                           json:"enabled"`
 	// FirstContact and its mapping: the project an agent first seen through
-	// this row is registered into, and, for adopt, its owner. A disabled row
-	// registers nothing, whatever the mode. FirstContactUpdatedBy and
-	// FirstContactUpdatedAt say who last changed any of the three, and when:
-	// the person accountable for what the row's standing adoption does
-	// (empty and nil until then).
-	FirstContact            FirstContactMode `bun:"first_contact,notnull"               json:"first_contact"`
-	FirstContactProjectID   string           `bun:"first_contact_project_id,notnull"    json:"first_contact_project_id"`
-	FirstContactOwnerUserID string           `bun:"first_contact_owner_user_id,notnull" json:"first_contact_owner_user_id"`
-	FirstContactUpdatedBy   string           `bun:"first_contact_updated_by,notnull"    json:"first_contact_updated_by"`
-	FirstContactUpdatedAt   *time.Time       `bun:"first_contact_updated_at"            json:"first_contact_updated_at,omitempty"`
-	CreatedBy               string           `bun:"created_by,notnull"                        json:"created_by"`
-	UpdatedBy               string           `bun:"updated_by,notnull"                        json:"updated_by"`
-	CreatedAt               time.Time        `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt               time.Time        `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
-	DeletedAt               *time.Time       `bun:"deleted_at"                                json:"-"`
+	// this row is registered into and, for adopt, its owner and the
+	// credential policy it is assigned (empty: none, so the project's default
+	// policy governs it). A disabled row registers nothing, whatever the
+	// mode. FirstContactUpdatedBy and FirstContactUpdatedAt say who last
+	// changed any of the four, and when: the person accountable for what the
+	// row's standing adoption does (empty and nil until then).
+	FirstContact                   FirstContactMode `bun:"first_contact,notnull"                      json:"first_contact"`
+	FirstContactProjectID          string           `bun:"first_contact_project_id,notnull"           json:"first_contact_project_id"`
+	FirstContactOwnerUserID        string           `bun:"first_contact_owner_user_id,notnull"        json:"first_contact_owner_user_id"`
+	FirstContactCredentialPolicyID string           `bun:"first_contact_credential_policy_id,notnull" json:"first_contact_credential_policy_id"`
+	FirstContactUpdatedBy          string           `bun:"first_contact_updated_by,notnull"           json:"first_contact_updated_by"`
+	FirstContactUpdatedAt          *time.Time       `bun:"first_contact_updated_at"                   json:"first_contact_updated_at,omitempty"`
+	CreatedBy                      string           `bun:"created_by,notnull"                        json:"created_by"`
+	UpdatedBy                      string           `bun:"updated_by,notnull"                        json:"updated_by"`
+	CreatedAt                      time.Time        `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt                      time.Time        `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
+	DeletedAt                      *time.Time       `bun:"deleted_at"                                json:"-"`
 }
 
 // IssuerBinding maps a credential's runtime subject key, under one issuer
@@ -254,12 +257,15 @@ func (e *ExternalIssuer) Normalize() {
 	}
 	e.FirstContactProjectID = strings.TrimSpace(e.FirstContactProjectID)
 	e.FirstContactOwnerUserID = strings.TrimSpace(e.FirstContactOwnerUserID)
+	e.FirstContactCredentialPolicyID = strings.TrimSpace(e.FirstContactCredentialPolicyID)
 }
 
 // ValidateFirstContact checks the first-contact mode and its mapping. Validate
 // calls it; an update that changes nothing else calls it alone. The project
 // is checked for shape only: ZeroID does not know which projects exist, so the
-// caller checks that.
+// caller checks that. So is the credential policy: whether it exists, and can
+// be assigned, in the row's account and project is read from the database by
+// the caller.
 func (e *ExternalIssuer) ValidateFirstContact() error {
 	if !e.FirstContact.Valid() {
 		return issuerInvalid("invalid_first_contact", "first_contact must be off, discover or adopt")
@@ -286,6 +292,15 @@ func (e *ExternalIssuer) ValidateFirstContact() error {
 		if e.FirstContactProjectID == "" || e.FirstContactOwnerUserID == "" {
 			return issuerInvalid("first_contact_mapping_required",
 				"first_contact adopt needs first_contact_project_id and first_contact_owner_user_id: the agents it registers are adopted into that project, owned by that user")
+		}
+	}
+	if p := e.FirstContactCredentialPolicyID; p != "" {
+		if e.FirstContact != FirstContactAdopt {
+			return issuerInvalid("first_contact_policy_invalid",
+				"first_contact_credential_policy_id applies to first_contact adopt only: it is the credential policy the agents the row adopts are assigned")
+		}
+		if len(p) > 255 {
+			return issuerInvalid("first_contact_policy_invalid", "first_contact_credential_policy_id is at most 255 bytes")
 		}
 	}
 	return nil
